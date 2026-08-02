@@ -1,0 +1,14 @@
+# Docker 构建上下文排除（减小镜像体积、避免泄漏）
+**/__pycache__/
+*.pyc
+frontend/node_modules/
+frontend/src/
+frontend/public/
+frontend/vite.config.js
+frontend/package.json
+frontend/package-lock.json
+frontend/index.html
+data/
+_e2e_test.py
+_sse_test.py
+*.log

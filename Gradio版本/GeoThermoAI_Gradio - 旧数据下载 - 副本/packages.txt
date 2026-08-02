@@ -1,0 +1,6 @@
+# ModelScope Studio 系统包（apt-get install）
+# 用于 Linux/Ubuntu 环境（如 ModelScope Studio 容器）下安装 GDAL 等系统依赖
+gdal-bin
+libgdal-dev
+libproj-dev
+libgeos-dev

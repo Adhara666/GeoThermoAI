@@ -1,0 +1,48 @@
+import { defineStore } from 'pinia'
+import { api } from '../api'
+import { useToast } from '../composables/useToast'
+
+export const useSettingsStore = defineStore('settings', {
+  state: () => ({
+    settings: null,
+    modelParams: {},
+  }),
+
+  getters: {
+    displayName: (s) => s.settings?.display_name || s.settings?.model_id || '',
+    configured: (s) => !!(s.settings && (s.settings.api_key || s.settings.base_url)),
+  },
+
+  actions: {
+    async load() {
+      try {
+        this.settings = await api.get('/api/settings')
+      } catch (_) {
+        this.settings = {}
+      }
+      try {
+        this.modelParams = await api.get('/api/model-params')
+      } catch (_) {
+        this.modelParams = {}
+      }
+    },
+
+    async saveSettings(payload) {
+      const t = useToast()
+      const r = await api.post('/api/settings', payload)
+      if (!r.ok) { t.error(r.message); return false }
+      this.settings = { ...(this.settings || {}), ...payload }
+      t.success(r.message)
+      return true
+    },
+
+    async saveModelParams(params) {
+      const t = useToast()
+      const r = await api.post('/api/model-params', params)
+      if (!r.ok) { t.error(r.message); return false }
+      this.modelParams = { ...params }
+      t.success(r.message)
+      return true
+    },
+  },
+})

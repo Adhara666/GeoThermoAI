@@ -1,0 +1,22 @@
+# ── 依赖与构建产物 ──────────────────────────────
+node_modules/
+frontend/dist/
+dist/
+
+# ── 本地运行数据（对话/研究区/下载文件） ─────────
+data/
+config/study_areas/*.geojson
+
+# ── 实验输出数据（体积巨大，不入库） ─────────────
+**/output/
+**/wheels/
+**/*.whl
+**/*.pkl
+**/*.enp
+
+# ── 系统与临时 ─────────────────────────────────
+__pycache__/
+*.pyc
+*.log
+.DS_Store
+Thumbs.db
