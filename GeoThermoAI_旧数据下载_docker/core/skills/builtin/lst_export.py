@@ -3,13 +3,14 @@
 
 调用 compute_lst_final() 和 export_geotiff()：
     1. 计算 LST_final = LST_pred + TCR
-    2. 将结果导出为带地理参考的GeoTIFF影像
+    2. 将结果导出为带地理参考的GeoTIFF影像（B-07：严格按CSV的row,col写入）
 """
 
 import os
 from typing import Any, Dict, List
 
 from ..base_skill import BaseSkill, SkillParameter, SkillResult
+from ... import manifest as run_manifest
 
 
 class LSTExportSkill(BaseSkill):
@@ -25,36 +26,15 @@ class LSTExportSkill(BaseSkill):
 
     @property
     def description(self) -> str:
-        return "计算 LST_final = LST_pred + TCR，并将10m地表温度结果导出为带地理参考的GeoTIFF栅格影像。"
+        return "计算 LST_final = LST_pred + TCR，并严格按CSV的row,col将10m地表温度结果导出为带地理参考的GeoTIFF栅格影像。"
 
     @property
     def parameters(self) -> List[SkillParameter]:
         return [
-            SkillParameter(
-                name="input_csv",
-                type="file_path",
-                description="含LST_pred和TCR列的CSV路径",
-                required=True,
-            ),
-            SkillParameter(
-                name="meta_10m_json",
-                type="file_path",
-                description="10m元数据JSON路径（含height, width, transform, crs）",
-                required=True,
-            ),
-            SkillParameter(
-                name="output_dir",
-                type="file_path",
-                description="输出目录路径",
-                required=True,
-            ),
-            SkillParameter(
-                name="chunk_size",
-                type="number",
-                description="批处理大小，默认 500000",
-                required=False,
-                default=500000,
-            ),
+            SkillParameter(name="input_csv", type="file_path", description="含LST_pred和TCR列的CSV路径", required=True),
+            SkillParameter(name="meta_10m_json", type="file_path", description="10m元数据JSON路径（含height, width, transform, crs）", required=True),
+            SkillParameter(name="output_dir", type="file_path", description="输出目录路径", required=True),
+            SkillParameter(name="chunk_size", type="number", description="批处理大小，默认 500000", required=False, default=500000),
         ]
 
     @property
@@ -86,9 +66,7 @@ class LSTExportSkill(BaseSkill):
         chunk_size = params.get("chunk_size", 500000)
 
         for name, val in [
-            ("input_csv", input_csv),
-            ("meta_10m_json", meta_10m_json),
-            ("output_dir", output_dir),
+            ("input_csv", input_csv), ("meta_10m_json", meta_10m_json), ("output_dir", output_dir),
         ]:
             if not val:
                 return SkillResult(success=False, message=f"参数 {name} 不能为空")
@@ -109,9 +87,7 @@ class LSTExportSkill(BaseSkill):
 
         try:
             lst_result = compute_lst_final(
-                input_csv=input_csv,
-                output_path=lst_final_csv,
-                chunk_size=chunk_size,
+                input_csv=input_csv, output_path=lst_final_csv, chunk_size=chunk_size,
                 progress_callback=lambda sn, pct, msg: (
                     progress_callback(sn, pct * 0.5, f"[LST计算] {msg}") if progress_callback else None
                 ),
@@ -119,10 +95,13 @@ class LSTExportSkill(BaseSkill):
         except Exception as e:
             return SkillResult(success=False, message=f"LST最终计算失败: {e}")
 
+        if lst_result.get("total_valid", 0) == 0:
+            return SkillResult(success=False, message="LST_final 全部为空，拒绝导出（A-02：禁止假成功）")
+
         if log_callback:
             log_callback("INFO", f"LST计算完成: {lst_result.get('total_rows', 0):,} 行")
 
-        # ── 步骤2: 导出GeoTIFF ──────────────────────────────────────
+        # ── 步骤2: 导出GeoTIFF（B-07：严格按row,col写入）─────────────
         if log_callback:
             log_callback("INFO", "开始导出GeoTIFF...")
 
@@ -130,9 +109,7 @@ class LSTExportSkill(BaseSkill):
 
         try:
             tif_result = export_geotiff(
-                lst_final_csv=lst_final_csv,
-                meta_10m_json=meta_10m_json,
-                output_path=tif_path,
+                lst_final_csv=lst_final_csv, meta_10m_json=meta_10m_json, output_path=tif_path,
                 progress_callback=lambda sn, pct, msg: (
                     progress_callback(sn, 0.5 + pct * 0.5, f"[导出] {msg}") if progress_callback else None
                 ),
@@ -153,6 +130,14 @@ class LSTExportSkill(BaseSkill):
         }
 
         artifacts = [tif_path, lst_final_csv]
+
+        project_root = run_manifest.project_root_from_stage_output_dir(output_dir)
+        if project_root:
+            run_manifest.record_stage(
+                project_root, "lst_export", run_manifest.STATUS_COMPLETED,
+                artifacts={"tif_path": tif_path, "csv_path": lst_final_csv},
+                stats={"stats": stats, "image_size": tif_result.get("image_size", {})},
+            )
 
         if progress_callback:
             progress_callback("lst_export", 1.0, "LST计算+导出完成")

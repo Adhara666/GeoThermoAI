@@ -58,6 +58,8 @@ def compute_lst_final(
 
     return {
         "output_path": output_path if output_path != input_csv else input_csv,
-        "total_rows": total_rows,
-        "total_valid": total_valid,
+        # 显式转 Python 原生 int：pandas .sum() 返回 numpy.int64，不做转换会在下游
+        # json.dumps()（如 run_manifest.json 写入）时抛 TypeError（本轮联调发现）。
+        "total_rows": int(total_rows),
+        "total_valid": int(total_valid),
     }

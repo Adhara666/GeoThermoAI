@@ -39,7 +39,7 @@ async function testGdal() {
       {{ testing === 'planetary' ? '测试中…' : '🔌 测试 Planetary Computer 连接' }}
     </button>
     <button class="btn btn--block" :disabled="!!testing" @click="testGdal">
-      {{ testing === 'gdal' ? '测试中…' : '🧪 测试 GDAL 环境' }}
+      {{ testing === 'gdal' ? '测试中…' : '🧪 测试地理处理环境' }}
     </button>
     <pre v-if="result" class="result-box">{{ result }}</pre>
   </div>

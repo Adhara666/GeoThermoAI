@@ -35,6 +35,12 @@ from core.ai_assistant import GeoThermoAI_Assistant
 from core.skills.skill_registry import SkillRegistry
 from core.agent.geo_thermo_agent import GeoThermoAgent
 from core.visualization import LayerVisualizer
+from core.geo_transform import (
+    enable_gdal_osr_exceptions,
+    bbox_wgs84_to_utm_bounds,
+    utm_epsg_for_lonlat,
+)
+from core import manifest as run_manifest
 
 # ── 常量（与旧版 ui/api.py 保持一致） ──────────────────────────
 
@@ -101,6 +107,9 @@ def strip_thinking(text: str) -> str:
 
 class AppBackend:
     def __init__(self):
+        # 启动期启用 GDAL/OSR 异常模式（A-01）：把静默返回 None/错误码的契约问题
+        # 尽早转成可捕获的异常，而不是等到某次下载中途才发现坐标是 inf。
+        enable_gdal_osr_exceptions()
         settings = self._load_settings()
         api_config = settings.get("api", {})
 
@@ -297,11 +306,13 @@ class AppBackend:
             return {"ok": False, "message": "项目已存在"}
         normalized = ""
         if path:
-            try:
-                os.makedirs(path, exist_ok=True)
-            except Exception as e:
-                return {"ok": False, "message": f"无法创建目录：{path}（{e}）"}
+            # C-05：先规范化路径分隔符再创建目录，避免 Linux 收到 Windows 风格
+            # 路径（含反斜杠/冒号）时先建出字面量目录，随后存储的字符串却是另一形式。
             normalized = path.replace("\\", "/")
+            try:
+                os.makedirs(normalized, exist_ok=True)
+            except Exception as e:
+                return {"ok": False, "message": f"无法创建目录：{normalized}（{e}）"}
         projects = self._load_projects()
         if not any(p["name"] == name for p in projects):
             projects.append({"name": name, "dir": normalized})
@@ -407,12 +418,13 @@ class AppBackend:
         if pid not in convs:
             return {"ok": False, "message": "请先选择项目"}
         path = (path or "").strip()
-        if path:
-            try:
-                os.makedirs(path, exist_ok=True)
-            except Exception as e:
-                return {"ok": False, "message": f"无法创建目录：{path}（{e}）"}
+        # C-05：先规范化路径分隔符再创建目录（理由同 create_project）。
         normalized = path.replace("\\", "/")
+        if normalized:
+            try:
+                os.makedirs(normalized, exist_ok=True)
+            except Exception as e:
+                return {"ok": False, "message": f"无法创建目录：{normalized}（{e}）"}
         # 同步 _projects.json 中的项目目录（空项目也能记住路径）
         projects = self._load_projects()
         for p in projects:
@@ -561,68 +573,70 @@ class AppBackend:
     # ── 工作流 / 精度 ──────────────────────────────────────────
 
     def get_workflow_status(self, cid: Optional[str]) -> List[dict]:
+        """返回各 stage 状态；与固定 run_manifest.json 交叉核对（A-08 前端联动）。
+
+        Agent 的内存态回调（wp/steps_map）反映"是否尝试执行过"，是乐观状态；
+        run_manifest.json 由各 Skill 在产物通过校验后才写 completed，或在失败时
+        写 failed 并把下游标记为 skipped_upstream。当 manifest 给出更明确的
+        failed/skipped_upstream/completed 状态时，以 manifest 为准，避免把
+        "失败后仍继续尝试下游"误显示成"完成"。不修改 Agent 本身的执行行为，
+        只影响前端展示的状态来源。
+        """
         if not cid:
             return [{"id": s, "label": _WORKFLOW_LABELS.get(s, s), "status": "pending"} for s in WORKFLOW_STEPS]
         state = self._get_conv_state(cid)
         wp = state["workflow_progress"]
         steps_map = {s["name"]: s["status"] for s in wp.get("steps", [])}
+
+        manifest_stages: Dict[str, dict] = {}
+        project_dir = self._get_project_dir(cid)
+        if project_dir:
+            try:
+                manifest_stages = run_manifest.load_manifest(project_dir).get("stages", {})
+            except Exception:
+                manifest_stages = {}
+
         rows = []
         for s in WORKFLOW_STEPS:
-            st = steps_map.get(s, "pending") if wp.get("status") != "idle" else "pending"
-            rows.append({"id": s, "label": _WORKFLOW_LABELS.get(s, s), "status": st})
+            agent_status = steps_map.get(s, "pending") if wp.get("status") != "idle" else "pending"
+            manifest_status = manifest_stages.get(s, {}).get("status")
+            if manifest_status in (
+                run_manifest.STATUS_FAILED,
+                run_manifest.STATUS_SKIPPED_UPSTREAM,
+                run_manifest.STATUS_COMPLETED,
+            ):
+                final_status = manifest_status
+            else:
+                final_status = agent_status
+            rows.append({"id": s, "label": _WORKFLOW_LABELS.get(s, s), "status": final_status})
         return rows
 
-    def get_accuracy_summary(self, cid: Optional[str]) -> List[dict]:
-        empty = [
-            {"key": "测试 R²", "value": "—"},
-            {"key": "测试 RMSE", "value": "—"},
-            {"key": "测试 MAE", "value": "—"},
-            {"key": "空间一致性 MB", "value": "—"},
-            {"key": "空间一致性 MAE", "value": "—"},
-            {"key": "空间一致性 RMSE", "value": "—"},
-            {"key": "最大绝对偏差", "value": "—"},
-            {"key": "通过验证", "value": "—"},
-            {"key": "匹配样本数", "value": "—"},
-        ]
+    def _read_eval_json(self, path: str) -> dict:
+        """读取评估 JSON，区分 missing（未生成）/ error（存在但损坏）/ ok（正常），
+        不把缺失或损坏都填成 0（B-08：禁止把缺数据伪装成完美零误差）。"""
+        if not os.path.isfile(path):
+            return {"status": "missing"}
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return {"status": "ok", "data": json.load(f)}
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+    def get_accuracy_summary(self, cid: Optional[str]) -> dict:
+        """返回两套独立协议（A-07）：independent_prediction 与
+        coarse_constraint_closure，不再混成一张表，也不再输出 5K 阈值/
+        passed 等字段（用户确认第4/5条）。"""
+        empty = {"independent_prediction": {"status": "missing"}, "coarse_constraint_closure": {"status": "missing"}}
         if not cid:
             return empty
         project_dir = self._get_project_dir(cid)
         if not project_dir:
             return empty
-        import glob
         results_dir = os.path.join(project_dir, "results")
-        files = sorted(glob.glob(os.path.join(results_dir, "spatial_consistency_*.json")))
-        if not files:
-            return empty
-        try:
-            with open(files[-1], encoding="utf-8") as f:
-                data = json.load(f)
-            sc = data.get("spatial_consistency", {})
-            vr = data.get("value_range", {})
-            dev = vr.get("deviation", {})
-            test_r2 = test_rmse = test_mae = 0
-            metrics_files = sorted(glob.glob(os.path.join(results_dir, "test", "rf_ttri_predict_*.json")))
-            if metrics_files:
-                with open(metrics_files[-1], encoding="utf-8") as f2:
-                    mdata = json.load(f2)
-                m = mdata.get("metrics", {})
-                test_r2 = m.get("R2", 0)
-                test_rmse = m.get("RMSE", 0)
-                test_mae = m.get("MAE", 0)
-            m_metrics = sc.get("metrics", {})
-            return [
-                {"key": "测试 R²", "value": f"{test_r2:.4f}" if test_r2 else "—"},
-                {"key": "测试 RMSE", "value": f"{test_rmse:.4f}" if test_rmse else "—"},
-                {"key": "测试 MAE", "value": f"{test_mae:.4f}" if test_mae else "—"},
-                {"key": "空间一致性 MB", "value": f"{m_metrics.get('MB', 0):.4f}"},
-                {"key": "空间一致性 MAE", "value": f"{m_metrics.get('MAE', 0):.4f}"},
-                {"key": "空间一致性 RMSE", "value": f"{m_metrics.get('RMSE', 0):.4f}"},
-                {"key": "最大绝对偏差", "value": f"{dev.get('max_abs_deviation', 0):.4f}"},
-                {"key": "通过验证", "value": "✅ 是" if dev.get("passed", False) else "❌ 否"},
-                {"key": "匹配样本数", "value": str(sc.get("n_matched", 0))},
-            ]
-        except Exception:
-            return empty
+        return {
+            "independent_prediction": self._read_eval_json(os.path.join(results_dir, "independent_prediction.json")),
+            "coarse_constraint_closure": self._read_eval_json(os.path.join(results_dir, "coarse_constraint_closure.json")),
+        }
 
     # ── 地图 ──────────────────────────────────────────────────
 
@@ -742,6 +756,14 @@ class AppBackend:
         return "\n".join(lines)
 
     def test_gdal_status(self) -> str:
+        """GDAL 与投影链路自检（A-01 升级版）。
+
+        不再只做"能 import"这类导入级检查：按 Server 实际使用顺序导入
+        osgeo/rasterio/geopandas/pyogrio，对武汉/北京/南半球三个真实 bbox 做
+        显式传统 GIS 轴序坐标变换（core.geo_transform，与实际下载路径同一套
+        实现），并分别验证 rasterio/GeoPandas 的最小 CRS 读写；不再把"坐标轴序/
+        投影契约错误"笼统归因为"GDAL 环境问题"。
+        """
         lines = []
         try:
             from osgeo import gdal, osr
@@ -750,20 +772,28 @@ class AppBackend:
         except Exception as e:
             lines.append(f"❌ 1. osgeo 导入失败：{e}")
             return "\n".join(lines)
-        try:
-            import math as _math
-            srs_wgs = osr.SpatialReference()
-            srs_wgs.ImportFromEPSG(4326)
-            srs_utm = osr.SpatialReference()
-            srs_utm.ImportFromEPSG(32650)
-            ct = osr.CoordinateTransformation(srs_wgs, srs_utm)
-            x, y, _z = ct.TransformPoint(114.3, 30.59)
-            if _math.isfinite(x) and _math.isfinite(y):
-                lines.append(f"✅ 2. 坐标转换正常（WGS84→UTM50N: ({x:.1f}, {y:.1f})）")
-            else:
-                lines.append(f"❌ 2. 坐标转换返回异常值（({x}, {y})）")
-        except Exception as e:
-            lines.append(f"❌ 2. 坐标转换失败：{e}")
+
+        enable_gdal_osr_exceptions()
+
+        # 2. 坐标轴序/投影链路：与 data_acquisition.py 实际下载路径同一实现，
+        #    覆盖北半球、南半球，不只测两个对角点（四角加密取样）
+        test_bboxes = {
+            "武汉": [113.7, 29.9, 114.9, 31.3],
+            "北京": [115.4, 39.4, 117.5, 41.1],
+            "南半球示例(悉尼)": [150.5, -34.2, 151.5, -33.5],
+        }
+        for name, bbox in test_bboxes.items():
+            try:
+                utm_epsg = utm_epsg_for_lonlat((bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2)
+                x1, y1, x2, y2 = bbox_wgs84_to_utm_bounds(bbox, utm_epsg)
+                lines.append(
+                    f"✅ 2.{name}: 坐标轴序/投影链路正常 → UTM(EPSG:{utm_epsg}) "
+                    f"=({x1:.1f},{y1:.1f})-({x2:.1f},{y2:.1f})"
+                )
+            except Exception as e:
+                lines.append(f"❌ 2.{name}: 坐标轴序/投影链路失败：{e}（bbox={bbox}）")
+
+        # 3. /vsimem 栅格创建/读写
         try:
             path = "/vsimem/gdal_selftest.tif"
             drv = gdal.GetDriverByName("GTiff")
@@ -777,9 +807,11 @@ class AppBackend:
             ok = arr is not None and float(arr.sum()) == 2.0 * 16
             ds2 = None
             gdal.Unlink(path)
-            lines.append(f"✅ 3. 栅格创建/读写正常（{'回读校验通过' if ok else '回读数值异常'}）")
+            lines.append(f"✅ 3. /vsimem 栅格创建/读写正常（{'回读校验通过' if ok else '回读数值异常'}）")
         except Exception as e:
-            lines.append(f"❌ 3. 栅格创建/读写失败：{e}")
+            lines.append(f"❌ 3. /vsimem 栅格创建/读写失败：{e}")
+
+        # 4. gdal.Warp 重投影（与实际下载路径一致：WGS84 → UTM）
         try:
             src = "/vsimem/warp_src.tif"
             dst = "/vsimem/warp_dst.tif"
@@ -803,8 +835,47 @@ class AppBackend:
             lines.append("✅ 4. gdal.Warp 重投影正常（输出含 UTM 投影）")
         except Exception as e:
             lines.append(f"❌ 4. gdal.Warp 重投影失败：{e}")
+
+        # 5. rasterio CRS 读写（Server 实际数据处理链路也会用到）
+        try:
+            import rasterio
+            from rasterio.crs import CRS as RioCRS
+            crs = RioCRS.from_epsg(4326)
+            _ = crs.to_epsg()
+            lines.append(f"✅ 5. rasterio 导入与 CRS 读写正常（rasterio {rasterio.__version__}）")
+        except Exception as e:
+            lines.append(f"❌ 5. rasterio CRS 读写失败：{e}")
+
+        # 6. GeoPandas 最小 CRS 转换（用于研究区 Shapefile/GeoJSON 解析）
+        try:
+            import geopandas as gpd
+            from shapely.geometry import Point
+            import math as _math
+            gdf = gpd.GeoDataFrame({"geometry": [Point(114.3, 30.59)]}, crs="EPSG:4326")
+            gdf_utm = gdf.to_crs("EPSG:32650")
+            gx, gy = gdf_utm.geometry.iloc[0].x, gdf_utm.geometry.iloc[0].y
+            if _math.isfinite(gx) and _math.isfinite(gy):
+                lines.append(f"✅ 6. GeoPandas CRS 转换正常（({gx:.1f},{gy:.1f})）")
+            else:
+                lines.append(f"❌ 6. GeoPandas CRS 转换返回非有限值（({gx},{gy})）")
+        except Exception as e:
+            lines.append(f"❌ 6. GeoPandas CRS 转换失败：{e}")
+
+        # 7. pyogrio（geopandas 常用的矢量 IO 引擎，不可用不阻断，只提示）
+        try:
+            import pyogrio
+            lines.append(f"✅ 7. pyogrio 导入成功（{pyogrio.__version__}）")
+        except Exception as e:
+            lines.append(f"⚠️ 7. pyogrio 不可用（不阻断，GeoPandas 可能退回 fiona）：{e}")
+
         _failed = sum(1 for _l in lines if _l.startswith("❌"))
-        lines.append(f"\n---\n{'共 %d 项失败：GDAL 环境有问题。' % _failed if _failed else '1-4 全部通过：GDAL 环境正常。'}")
+        if _failed:
+            lines.append(
+                f"\n---\n共 {_failed} 项失败：GDAL 与投影链路存在问题，"
+                f"请看上方具体失败项的错误类型与坐标，不要笼统归因为'GDAL 环境问题'。"
+            )
+        else:
+            lines.append("\n---\n1-7 全部通过（或仅 pyogrio 提示）：GDAL 与投影链路正常。")
         return "\n".join(lines)
 
     # ── 聊天流式（线程 + 队列，复刻旧版语义） ─────────────────
@@ -1220,7 +1291,7 @@ def workflow(conv: str = ""):
 
 @app.get("/api/accuracy")
 def accuracy(conv: str = ""):
-    return {"rows": backend.get_accuracy_summary(conv or None)}
+    return backend.get_accuracy_summary(conv or None)
 
 
 @app.get("/api/layers")
