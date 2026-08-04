@@ -2,13 +2,25 @@
 数据获取 Skill (Planetary Computer 版本 / GDAL 实现)
 
 从 Microsoft Planetary Computer 下载遥感数据：
-    - Landsat 8/9 Collection 2 Level-2 (地表温度 lwir11 + qa_pixel)
-    - Sentinel-2 Level-2A (多光谱 + SCL)
+    - Landsat 8/9 Collection 2 Level-2 (地表温度 lwir11 + qa_pixel [+ 可选 ST_QA])
+    - Sentinel-2 Level-2A (多光谱 + SCL，按景定标 BOA_ADD_OFFSET 后再拼接)
     - DEM (Copernicus GLO-30)
 
 Planetary Computer 是微软托管的公开数据目录，无需注册即可免费下载。
 
-处理流程：下载 COG → 保存到临时文件 → gdal.Warp(mosaic + UTM + clip) → 合并多波段
+处理流程：下载 COG → 保存到临时文件 →（Sentinel-2 光谱波段：按景应用 BOA_ADD_OFFSET
+定标）→ gdal.Warp(mosaic + UTM + clip) → 合并多波段 → 重新打开校验 → 原子替换为正式文件
+
+本轮修复（对应审查文档 A-01/A-02/A-03，用户确认第9/11条）：
+    - A-01: bbox 坐标变换统一改用 core.geo_transform（显式传统 GIS 轴序 + 异常模式 +
+      四角加密取样 + 有限性校验），不再是 (lon,lat) 直接喂给按权威轴序解读的 SRS；
+    - A-02: 缺波段/下载失败/Warp失败不再写全零占位并继续；改为结构化失败（必需波段）
+      或明确跳过（仅 ST_QA 属于可选波段）；BuildVRT/Translate 返回值显式检查；
+      成功前重新打开输出文件校验波段数/尺寸/CRS/有效覆盖率；下载与合成合并进同一个
+      try/finally，临时目录在任何失败路径下都会被清理；
+    - A-03: Sentinel-2 光谱波段在拼接前按景读取 BOA_ADD_OFFSET/quantification 定标，
+      不对所有影像盲减固定值；定标 provenance 写入固定 sentinel2_provenance.json；
+    - B-10: 可选下载 Landsat ST_QA（温度不确定度），失败只 WARN，不影响主流程成功。
 """
 
 import os
@@ -23,6 +35,9 @@ import requests
 import numpy as np
 
 from ..base_skill import BaseSkill, SkillParameter, SkillResult
+from ...geo_transform import bbox_wgs84_to_utm_bounds, enable_gdal_osr_exceptions, utm_epsg_for_lonlat
+from ...atomic_io import write_verified
+from . import sentinel2_calibration as s2cal
 
 # 项目根目录
 _ROOT = Path(__file__).resolve().parent.parent.parent.parent
@@ -37,6 +52,9 @@ SAT_API_TIMEOUT = 30  # STAC API 请求超时(秒)
 # STAC 搜索重试次数与单次 HTTP 请求超时
 _SEARCH_ATTEMPTS = 3
 _STAC_TIMEOUT = 60
+
+# Sentinel-2 波段定标后使用的 nodata 哨兵值（不再用 0，避免和合法的近零校正反射率混淆）
+_S2_CALIBRATED_NODATA = -9999.0
 
 
 def _open_catalog(log_callback=None, attempts: int = _SEARCH_ATTEMPTS):
@@ -72,6 +90,10 @@ def _search_items(catalog, log_callback, label: str, attempts: int = _SEARCH_ATT
                 log_callback("WARN", f"{label} 搜索失败（第{i+1}/{attempts}次）: {e}")
             time.sleep(2 * (i + 1))
     return []
+
+
+class BandAcquisitionError(RuntimeError):
+    """必需波段下载/拼接失败的结构化异常（A-02：不得用全零占位代替）。"""
 
 
 class DataAcquisitionSkill(BaseSkill):
@@ -131,6 +153,13 @@ class DataAcquisitionSkill(BaseSkill):
                 default="copernicus",
                 choices=["copernicus", "srtm"],
             ),
+            SkillParameter(
+                name="fetch_st_qa",
+                type="boolean",
+                description="是否额外下载 Landsat ST_QA（温度不确定度，可选，失败不影响主流程）",
+                required=False,
+                default=True,
+            ),
         ]
 
     @property
@@ -150,6 +179,7 @@ class DataAcquisitionSkill(BaseSkill):
             "qa_path": "Landsat QA_PIXEL 栅格路径",
             "scl_path": "Sentinel-2 SCL 栅格路径",
             "dem_path": "DEM 栅格路径",
+            "st_qa_path": "Landsat ST_QA 栅格路径（可选，未获取到时为空字符串）",
             "image_pairs": "影像配对信息",
         }
 
@@ -159,13 +189,28 @@ class DataAcquisitionSkill(BaseSkill):
         progress_callback=None,
         log_callback=None,
     ) -> SkillResult:
-        """执行数据下载流程。"""
+        """执行数据下载流程；任何必需波段的结构化失败都会转成 success=False 并给出
+        清晰原因，不抛出未捕获异常、也不产出伪造的"成功"占位数据（A-02）。"""
+        try:
+            return self._execute_impl(params, progress_callback, log_callback)
+        except BandAcquisitionError as e:
+            return SkillResult(success=False, message=f"数据获取失败（必需波段）: {e}")
+        except Exception as e:
+            return SkillResult(success=False, message=f"数据获取失败: {e}")
+
+    def _execute_impl(
+        self,
+        params: Dict[str, Any],
+        progress_callback=None,
+        log_callback=None,
+    ) -> SkillResult:
         region = params.get("region", "")
         start_date = params.get("start_date", "")
         end_date = params.get("end_date", "")
         output_dir = params.get("output_dir", "")
         cloud_threshold = params.get("cloud_threshold", 50)
         dem_source = params.get("dem_source", "copernicus")
+        fetch_st_qa = params.get("fetch_st_qa", True)
 
         if not region:
             return SkillResult(success=False, message="参数 region 不能为空")
@@ -181,6 +226,7 @@ class DataAcquisitionSkill(BaseSkill):
             from osgeo import gdal, osr
             _ = gdal.VersionInfo()
             _ = osr
+            enable_gdal_osr_exceptions()
         except ImportError:
             return SkillResult(
                 success=False,
@@ -259,7 +305,6 @@ class DataAcquisitionSkill(BaseSkill):
         )
         if log_callback and not selected_pair:
             log_callback("INFO", f"找到 {len(sentinel2_items)} 景 Sentinel-2 影像")
-            # 按日期分组显示
             from collections import Counter
             s2_dates = Counter(i.properties.get("datetime", "")[:10] for i in sentinel2_items)
             for dt, cnt in sorted(s2_dates.items()):
@@ -305,7 +350,6 @@ class DataAcquisitionSkill(BaseSkill):
             s2_date = selected_pair.get("sentinel2_date", "")
             log_callback("INFO", f"用户已选择配对: Landsat {lsat_date} + Sentinel {s2_date}")
 
-        # 筛选仅属于所选日期和卫星的影像
         selected_landsat_date = selected_pair.get("landsat_date", "")
         selected_sentinel_date = selected_pair.get("sentinel2_date", "")
         selected_satellite = selected_pair.get("landsat_satellite", "")
@@ -337,60 +381,72 @@ class DataAcquisitionSkill(BaseSkill):
 
         # ── 下载 Landsat ST_B10 ──────────────────────────────────────
         if progress_callback:
-            progress_callback("data_acquisition", 0.15, "下载 Landsat lwir11 (地表温度)...")
+            progress_callback("data_acquisition", 0.13, "下载 Landsat lwir11 (地表温度)...")
 
         landsat_path = os.path.join(output_dir, "landsat_lst.tif")
         self._download_composite(
-            items=landsat_items,
-            band="lwir11",
-            output_path=landsat_path,
-            bbox=bbox,
-            scale=30,
-            progress_callback=progress_callback,
-            log_callback=log_callback,
-            progress_range=(0.15, 0.30),
-            skill_name="data_acquisition",
+            items=landsat_items, band="lwir11", output_path=landsat_path,
+            bbox=bbox, scale=30, progress_callback=progress_callback, log_callback=log_callback,
+            progress_range=(0.13, 0.26), skill_name="data_acquisition",
             study_area_geojson=study_area_geojson,
         )
         output_paths["landsat_path"] = landsat_path
 
         # ── 下载 Landsat qa_pixel ────────────────────────────────────
         if progress_callback:
-            progress_callback("data_acquisition", 0.30, "下载 Landsat qa_pixel...")
+            progress_callback("data_acquisition", 0.26, "下载 Landsat qa_pixel...")
 
         qa_path = os.path.join(output_dir, "landsat_qa_pixel.tif")
         self._download_composite(
-            items=landsat_items,
-            band="qa_pixel",
-            output_path=qa_path,
-            bbox=bbox,
-            scale=30,
-            progress_callback=progress_callback,
-            log_callback=log_callback,
-            progress_range=(0.30, 0.42),
-            skill_name="data_acquisition",
+            items=landsat_items, band="qa_pixel", output_path=qa_path,
+            bbox=bbox, scale=30, progress_callback=progress_callback, log_callback=log_callback,
+            progress_range=(0.26, 0.36), skill_name="data_acquisition",
             study_area_geojson=study_area_geojson,
         )
         output_paths["qa_path"] = qa_path
 
-        # ── 下载 Sentinel-2 多光谱 ──────────────────────────────────
+        # ── 下载 Landsat ST_QA（可选，B-10 / 用户确认第9条）───────────
+        st_qa_path = ""
+        if fetch_st_qa:
+            if progress_callback:
+                progress_callback("data_acquisition", 0.36, "下载 Landsat ST_QA（温度不确定度，可选）...")
+            try:
+                candidate_path = os.path.join(output_dir, "landsat_st_qa.tif")
+                self._download_composite(
+                    items=landsat_items, band="qa", output_path=candidate_path,
+                    bbox=bbox, scale=30, progress_callback=progress_callback, log_callback=log_callback,
+                    progress_range=(0.36, 0.42), skill_name="data_acquisition",
+                    study_area_geojson=study_area_geojson, required=False,
+                )
+                if os.path.isfile(candidate_path):
+                    st_qa_path = candidate_path
+            except Exception as e:
+                if log_callback:
+                    log_callback("WARN", f"ST_QA 为可选波段，下载失败不影响主流程: {e}")
+        output_paths["st_qa_path"] = st_qa_path
+
+        # ── 下载 Sentinel-2 多光谱（按景定标 BOA_ADD_OFFSET，A-03）────
         if progress_callback:
             progress_callback("data_acquisition", 0.42, "下载 Sentinel-2 多光谱...")
 
         sentinel2_path = os.path.join(output_dir, "sentinel2_bands.tif")
-        self._download_composite(
-            items=sentinel2_items,
-            band=["B02", "B03", "B04", "B08", "B11"],
-            output_path=sentinel2_path,
-            bbox=bbox,
-            scale=10,
-            progress_callback=progress_callback,
-            log_callback=log_callback,
-            progress_range=(0.42, 0.62),
-            skill_name="data_acquisition",
-            study_area_geojson=study_area_geojson,
+        s2_provenance = self._download_composite(
+            items=sentinel2_items, band=["B02", "B03", "B04", "B08", "B11"],
+            output_path=sentinel2_path, bbox=bbox, scale=10,
+            progress_callback=progress_callback, log_callback=log_callback,
+            progress_range=(0.42, 0.62), skill_name="data_acquisition",
+            study_area_geojson=study_area_geojson, apply_s2_calibration=True,
         )
         output_paths["sentinel2_path"] = sentinel2_path
+
+        if s2_provenance:
+            provenance_path = os.path.join(output_dir, "sentinel2_provenance.json")
+            with open(provenance_path, "w", encoding="utf-8") as f:
+                json.dump({
+                    "formula": "reflectance = (DN + BOA_ADD_OFFSET) / BOA_QUANTIFICATION_VALUE; DN==0 仍是 NoData",
+                    "scenes": s2_provenance,
+                }, f, ensure_ascii=False, indent=2)
+            output_paths["sentinel2_provenance_path"] = provenance_path
 
         # ── 下载 Sentinel-2 SCL ──────────────────────────────────────
         if progress_callback:
@@ -398,15 +454,9 @@ class DataAcquisitionSkill(BaseSkill):
 
         scl_path = os.path.join(output_dir, "sentinel2_scl.tif")
         self._download_composite(
-            items=sentinel2_items,
-            band="SCL",
-            output_path=scl_path,
-            bbox=bbox,
-            scale=20,
-            progress_callback=progress_callback,
-            log_callback=log_callback,
-            progress_range=(0.62, 0.72),
-            skill_name="data_acquisition",
+            items=sentinel2_items, band="SCL", output_path=scl_path,
+            bbox=bbox, scale=20, progress_callback=progress_callback, log_callback=log_callback,
+            progress_range=(0.62, 0.72), skill_name="data_acquisition",
             study_area_geojson=study_area_geojson,
         )
         output_paths["scl_path"] = scl_path
@@ -419,21 +469,13 @@ class DataAcquisitionSkill(BaseSkill):
         dem_collection = "cop-dem-glo-30" if dem_source.lower() == "copernicus" else "srtm"
         dem_items = _search_items(
             catalog, log_callback, "DEM",
-            collections=[dem_collection],
-            bbox=bbox,
-            max_items=10,
+            collections=[dem_collection], bbox=bbox, max_items=10,
         )
 
         self._download_composite(
-            items=dem_items,
-            band="data",
-            output_path=dem_path,
-            bbox=bbox,
-            scale=30,
-            progress_callback=progress_callback,
-            log_callback=log_callback,
-            progress_range=(0.72, 0.95),
-            skill_name="data_acquisition",
+            items=dem_items, band="data", output_path=dem_path,
+            bbox=bbox, scale=30, progress_callback=progress_callback, log_callback=log_callback,
+            progress_range=(0.72, 0.95), skill_name="data_acquisition",
             study_area_geojson=study_area_geojson,
         )
         output_paths["dem_path"] = dem_path
@@ -445,12 +487,13 @@ class DataAcquisitionSkill(BaseSkill):
 
         return SkillResult(
             success=True,
-            message=f"数据下载完成: Landsat、Sentinel-2、DEM，耗时 {elapsed:.1f}s",
+            message=f"数据下载完成: Landsat、Sentinel-2、DEM，耗时 {elapsed:.1f}s"
+                    + ("（含 ST_QA）" if st_qa_path else "（未获取 ST_QA，不影响主流程）"),
             data={
                 **output_paths,
                 "output_dir": output_dir,
             },
-            artifacts=list(output_paths.values()),
+            artifacts=[v for v in output_paths.values() if v],
         )
 
     # ── 区域解析 ────────────────────────────────────────────────────
@@ -474,11 +517,10 @@ class DataAcquisitionSkill(BaseSkill):
         """
         region = region.strip().strip('"').strip("'")
 
-        # 如果路径不存在但明显是文件路径，尝试相对项目根目录/config/study_areas解析
         if not os.path.isfile(region) and DataAcquisitionSkill._looks_like_region_file(region):
             from pathlib import Path
             candidate_roots = [
-                Path(__file__).resolve().parent.parent.parent.parent,  # 项目根目录
+                Path(__file__).resolve().parent.parent.parent.parent,
                 Path.cwd(),
             ]
             for root in candidate_roots:
@@ -497,21 +539,18 @@ class DataAcquisitionSkill(BaseSkill):
         if os.path.isfile(region):
             ext = os.path.splitext(region)[1].lower()
 
-            # Shapefile → 自动转换为 GeoJSON
             if ext == ".shp":
                 try:
                     import shapefile as shp
                     reader = shp.Reader(region)
-                    bounds = reader.bbox  # [minx, miny, maxx, maxy]
+                    bounds = reader.bbox
                     return list(bounds)
                 except ImportError:
                     pass
                 except Exception:
                     pass
 
-            # GeoJSON
             if ext in (".geojson", ".json"):
-                # 优先用 geopandas；任何异常都回退到手动 JSON 解析
                 try:
                     import geopandas as gpd
                     gdf = gpd.read_file(region)
@@ -520,7 +559,6 @@ class DataAcquisitionSkill(BaseSkill):
                         return b
                 except Exception:
                     pass
-                # 回退：手动解析 GeoJSON
                 try:
                     with open(region, "r", encoding="utf-8") as f:
                         geojson = json.load(f)
@@ -533,7 +571,6 @@ class DataAcquisitionSkill(BaseSkill):
                     pass
                 return None
 
-        # 格式: "lon_min,lat_min,lon_max,lat_max"
         try:
             parts = [float(x.strip()) for x in region.split(",")]
         except (ValueError, TypeError):
@@ -541,7 +578,6 @@ class DataAcquisitionSkill(BaseSkill):
         if len(parts) == 4:
             return parts
 
-        # 兜底：纯城市名（无研究区文件时）→ 内置城市 bbox
         _CITY_BBOX = {
             "武汉": "113.7,29.9,114.9,31.3",
             "北京": "115.4,39.4,117.5,41.1",
@@ -563,7 +599,7 @@ class DataAcquisitionSkill(BaseSkill):
 
         规则：
         - Landsat 8 只和 L8 拼接，L9 只和 L9 拼接
-        - 每组 mosaic 覆盖度 ≥ 80% 才合格
+        - 每组 mosaic 覆盖度 ≥ 70% 才合格
         - Sentinel 按日期分组
 
         返回每对含：每景详情（日期、L8/L9/S2、云量）+ 综合覆盖度
@@ -575,7 +611,6 @@ class DataAcquisitionSkill(BaseSkill):
                 log_callback("WARN", msg)
 
         def _satellite_type(item):
-            """判断卫星类型（从 item.id 判断，非 collection_id）"""
             item_id = item.id.lower()
             if item_id.startswith("lc08") or "landsat_8" in item_id:
                 return "L8"
@@ -594,10 +629,6 @@ class DataAcquisitionSkill(BaseSkill):
             }
 
         def _check_coverage(items_list, geojson_path):
-            """计算一组影像拼接后对研究区的覆盖度（0~1）
-
-            用 STAC item 的 geometry（footprint）和 GeoJSON 研究区做多边形求交。
-            """
             if not items_list or not geojson_path:
                 return 1.0
             try:
@@ -607,7 +638,6 @@ class DataAcquisitionSkill(BaseSkill):
                 if not study_polys:
                     return 1.0
 
-                # 解析研究区多边形为 shapely 对象
                 try:
                     from shapely.geometry import shape, MultiPolygon
                     from shapely.ops import unary_union
@@ -626,7 +656,6 @@ class DataAcquisitionSkill(BaseSkill):
                 study_area = unary_union(study_regions)
                 study_area_sq = study_area.area if study_area else 0
 
-                # 合并所有 item 的 footprint
                 item_polys = []
                 for item in items_list:
                     geom = getattr(item, "geometry", None)
@@ -653,7 +682,6 @@ class DataAcquisitionSkill(BaseSkill):
                 return 1.0
 
         def _group_by_date_and_satellite(items, is_landsat=True):
-            """按日期 + 卫星(L8/L9)分组"""
             groups = {}
             for item in items:
                 dt_str = item.properties.get("datetime", "")
@@ -683,11 +711,10 @@ class DataAcquisitionSkill(BaseSkill):
             l_items = lg["items"]
             l_scenes = [_scene_info(i) for i in l_items]
 
-            # Landsat 覆盖度
             l_coverage = _check_coverage(l_items, study_area_geojson)
             if l_coverage < 0.7:
                 _warn(f"Landsat {l_date} ({l_sat}) 覆盖度 {l_coverage*100:.0f}% < 70%，跳过")
-                continue  # 覆盖度不足
+                continue
 
             l_clouds = [i.properties.get("eo:cloud_cover", 0) or 0 for i in l_items]
             avg_l_cloud = round(sum(l_clouds) / len(l_clouds), 1)
@@ -703,7 +730,6 @@ class DataAcquisitionSkill(BaseSkill):
                 if abs((l_dt - s_dt).days) > 2:
                     continue
 
-                # Sentinel 覆盖度
                 s_coverage = _check_coverage(s_items, study_area_geojson)
                 if s_coverage < 0.7:
                     _warn(f"Sentinel {s_date} 覆盖度 {s_coverage*100:.0f}% < 70%，跳过")
@@ -728,6 +754,49 @@ class DataAcquisitionSkill(BaseSkill):
                 })
         return pairs
 
+    # ── Sentinel-2 按景定标（A-03）────────────────────────────────
+
+    @staticmethod
+    def _apply_s2_offset_correction(src_path: str, dst_path: str, offset: float) -> None:
+        """把已下载的原始 DN 波段文件按给定 offset 校正为 corrected_DN = DN + offset，
+        原始 DN==0（NoData）像元保持为 nodata（不参与校正），nodata 哨兵改为 -9999，
+        避免和合法但接近 0 的校正反射率混淆。写出 Float32（因为校正后可能出现负值）。
+        """
+        from osgeo import gdal
+
+        src_ds = gdal.Open(src_path)
+        if src_ds is None:
+            raise BandAcquisitionError(f"无法打开待定标的 Sentinel-2 临时文件: {src_path}")
+        try:
+            band = src_ds.GetRasterBand(1)
+            arr = band.ReadAsArray().astype(np.float64)
+            geotransform = src_ds.GetGeoTransform()
+            projection = src_ds.GetProjection()
+            width, height = src_ds.RasterXSize, src_ds.RasterYSize
+        finally:
+            src_ds = None
+
+        is_nodata = arr == 0
+        corrected = np.where(is_nodata, _S2_CALIBRATED_NODATA, arr + offset)
+
+        driver = gdal.GetDriverByName("GTiff")
+        out_ds = driver.Create(
+            dst_path, width, height, 1, gdal.GDT_Float32,
+            options=["COMPRESS=LZW", "TILED=YES", "BIGTIFF=YES"],
+        )
+        if out_ds is None:
+            raise BandAcquisitionError(f"无法创建定标输出文件: {dst_path}")
+        try:
+            out_ds.SetGeoTransform(geotransform)
+            out_ds.SetProjection(projection)
+            out_band = out_ds.GetRasterBand(1)
+            out_band.SetNoDataValue(_S2_CALIBRATED_NODATA)
+            out_band.WriteArray(corrected.astype(np.float32))
+            out_band.FlushCache()
+            out_ds.FlushCache()
+        finally:
+            out_ds = None
+
     # ── 下载与合成（GDAL 实现）──────────────────────────────────────
 
     def _download_composite(
@@ -742,21 +811,37 @@ class DataAcquisitionSkill(BaseSkill):
         progress_range: tuple,
         skill_name: str,
         study_area_geojson: str = None,
+        required: bool = True,
+        apply_s2_calibration: bool = False,
     ):
         """下载影像、mosaic合并多景（GDAL /vsicurl/ 直接读取 COG）
 
         流程：
-        1. 签名所有 item，收集各波段的 /vsicurl/ 链接
-        2. 逐波段 gdal.Warp(mosaic + UTM + clip) 一步完成
-        3. 合并多波段
+        1. 签名所有 item，收集各波段的本地临时文件（Sentinel-2 光谱波段按景定标）
+        2. 逐波段 gdal.Warp(mosaic + UTM + clip) 一步完成，显式检查返回值
+        3. 合并多波段，显式检查 BuildVRT/Translate 返回值
+        4. 重新打开输出校验波段数/尺寸/CRS/有效覆盖率后，原子替换为正式文件名
+
+        Args:
+            required: True 时任一必需波段缺失/下载失败/Warp失败都会抛出
+                      BandAcquisitionError（A-02：不写全零占位）；False 时（目前只用于
+                      可选的 ST_QA）静默跳过，不产生输出文件，也不抛异常。
+            apply_s2_calibration: True 时对每个 (景,波段) 文件按 A-03 定标后再加入
+                                  mosaic 输入列表（仅用于 Sentinel-2 光谱波段）。
+
+        Returns:
+            当 apply_s2_calibration=True 时，返回本次调用涉及的按景定标 provenance 列表；
+            否则返回 None。
         """
         from osgeo import gdal, osr
-        import tempfile
 
         if not items:
+            msg = f"未找到任何 {band} 影像，无法继续后续流程"
             if log_callback:
-                log_callback("ERROR", f"未找到任何 {band} 影像，无法继续后续流程")
-            raise RuntimeError(f"未找到任何 {band} 影像，请检查时间范围或云量阈值")
+                log_callback("ERROR" if required else "WARN", msg)
+            if required:
+                raise BandAcquisitionError(msg)
+            return None
 
         bands_list = band if isinstance(band, list) else [band]
         band_count = len(bands_list)
@@ -770,85 +855,71 @@ class DataAcquisitionSkill(BaseSkill):
         # ── 1. 计算 UTM zone ─────────────────────────────────────────
         center_lon = (bbox[0] + bbox[2]) / 2
         center_lat = (bbox[1] + bbox[3]) / 2
-        utm_zone = int((center_lon + 180) / 6) + 1
-        if center_lat >= 0:
-            utm_epsg = 32600 + utm_zone
-            utm_epsg_str = f"EPSG:{utm_epsg}"
-        else:
-            utm_epsg = 32700 + utm_zone
-            utm_epsg_str = f"EPSG:{utm_epsg}"
+        utm_epsg = utm_epsg_for_lonlat(center_lon, center_lat)
+        utm_epsg_str = f"EPSG:{utm_epsg}"
 
         if log_callback:
-            log_callback("INFO", f"目标坐标系: {utm_epsg_str} (UTM Zone {utm_zone})")
+            log_callback("INFO", f"目标坐标系: {utm_epsg_str}")
 
-        # ── 2. 转换 bbox 到 UTM ──────────────────────────────────────
-        srs4326 = osr.SpatialReference()
-        srs4326.ImportFromEPSG(4326)
-        srs_utm = osr.SpatialReference()
-        srs_utm.ImportFromEPSG(utm_epsg)
-        ct = osr.CoordinateTransformation(srs4326, srs_utm)
+        # ── 2. bbox → UTM（A-01：统一显式传统 GIS 轴序 + 四角加密 + 有限性校验）──
+        x1, y1, x2, y2 = bbox_wgs84_to_utm_bounds(bbox, utm_epsg)
 
-        pts = [
-            ct.TransformPoint(bbox[0], bbox[1]),
-            ct.TransformPoint(bbox[2], bbox[3]),
-        ]
-        x1 = min(pts[0][0], pts[1][0])
-        y1 = min(pts[0][1], pts[1][1])
-        x2 = max(pts[0][0], pts[1][0])
-        y2 = max(pts[0][1], pts[1][1])
-
-        # ── 4. 下载所有场景到本地临时文件 ───────────────────────────
-        band_files = {b: [] for b in bands_list}
-        download_errors = []
         tmp_dir = tempfile.mkdtemp(prefix="gdal_dl_")
+        s2_provenance: List[dict] = []
+        try:
+            # ── 3. 下载所有场景到本地临时文件（含 Sentinel-2 按景定标）─────
+            band_files = {b: [] for b in bands_list}
+            download_errors = []
 
-        for idx, item in enumerate(items_sorted):
-            for b in bands_list:
-                # 每个波段每次下载前重新签名（SAS token 有时效，避免 403）
+            for idx, item in enumerate(items_sorted):
                 signed_item = self._sign_item(item)
-                if not signed_item:
+                if signed_item is None:
                     download_errors.append(f"{item.id}: 签名失败")
                     continue
 
-                asset = signed_item.assets.get(b)
-                if not asset:
-                    download_errors.append(f"{item.id}: 缺少波段 {b}")
-                    continue
+                scene_calibration = None
+                if apply_s2_calibration:
+                    scene_calibration = s2cal.fetch_scene_calibration(signed_item, log_callback=log_callback)
+                    s2_provenance.append(scene_calibration)
 
-                if progress_callback:
-                    p = p_min + (p_max - p_min) * 0.3 * (idx + 1) / len(items_sorted)
-                    progress_callback(skill_name, p, f"下载 {b} / {item.id}")
+                for b in bands_list:
+                    asset = signed_item.assets.get(b)
+                    if not asset:
+                        download_errors.append(f"{item.id}: 缺少波段 {b}")
+                        continue
 
-                # 下载到本地临时文件（比 /vsicurl/ 快得多）
-                tmp_path = os.path.join(tmp_dir, f"{idx:03d}_{b}.tif")
-                data_bytes = self._fetch_asset(asset.href, log_callback)
-                if data_bytes is None:
-                    download_errors.append(f"{item.id}/{b}: 下载失败")
-                    continue
-                with open(tmp_path, "wb") as f:
-                    f.write(data_bytes)
-                band_files[b].append(tmp_path)
+                    if progress_callback:
+                        p = p_min + (p_max - p_min) * 0.3 * (idx + 1) / len(items_sorted)
+                        progress_callback(skill_name, p, f"下载 {b} / {item.id}")
 
-        # ── 5. 逐波段 GDAL Warp（mosaic + UTM + clip 一步到位）───
-        def _write_empty_band(path, crs_str, x1, y1, x2, y2, res):
-            """创建零值填充的空波段（当 Warp 失败时占位）"""
-            import math
-            w = max(int((x2 - x1) / res), 1)
-            h = max(int((y2 - y1) / res), 1)
-            drv = gdal.GetDriverByName("GTiff")
-            ds = drv.Create(path, w, h, 1, gdal.GDT_Float32,
-                            options=["COMPRESS=LZW", "TILED=YES", "BIGTIFF=YES"])
-            if ds:
-                ds.SetGeoTransform([x1, res, 0, y2, 0, -res])
-                ds.SetProjection(crs_str)
-                ds.GetRasterBand(1).SetNoDataValue(0)
-                ds.GetRasterBand(1).Fill(0)
-                ds.FlushCache()
-                ds = None
+                    raw_path = os.path.join(tmp_dir, f"{idx:03d}_{b}_raw.tif")
+                    data_bytes = self._fetch_asset(asset.href, log_callback)
+                    if data_bytes is None:
+                        download_errors.append(f"{item.id}/{b}: 下载失败")
+                        continue
+                    with open(raw_path, "wb") as f:
+                        f.write(data_bytes)
 
-        band_outputs = []
+                    if apply_s2_calibration and scene_calibration is not None:
+                        offset = s2cal.offset_for_band(scene_calibration, b)
+                        corrected_path = os.path.join(tmp_dir, f"{idx:03d}_{b}_corrected.tif")
+                        try:
+                            self._apply_s2_offset_correction(raw_path, corrected_path, offset)
+                        except Exception as e:
+                            download_errors.append(f"{item.id}/{b}: 按景定标失败 ({e})")
+                            continue
+                        band_files[b].append(corrected_path)
+                        if log_callback:
+                            log_callback(
+                                "INFO",
+                                f"  {item.id}/{b}: 已按 {scene_calibration.get('source')} "
+                                f"应用 offset={offset:g}",
+                            )
+                    else:
+                        band_files[b].append(raw_path)
 
-        try:
+            # ── 4. 逐波段 GDAL Warp（mosaic + UTM + clip 一步到位）───────
+            band_outputs = []
             for b_idx, b in enumerate(bands_list):
                 if progress_callback:
                     p = p_min + (p_max - p_min) * (0.3 + 0.7 * b_idx / max(len(bands_list), 1))
@@ -856,33 +927,26 @@ class DataAcquisitionSkill(BaseSkill):
 
                 urls = band_files[b]
                 if not urls:
+                    msg = f"波段 {b} 没有任何可用数据（下载失败或缺失）"
+                    if required:
+                        raise BandAcquisitionError(msg)
                     if log_callback:
-                        log_callback("WARN", f"  {b}: 无可用数据，写入空波段")
-                    empty_path = os.path.join(tmp_dir, f"empty_{b}.tif")
-                    driver = gdal.GetDriverByName("GTiff")
-                    ds_empty = driver.Create(empty_path, 1, 1, 1, gdal.GDT_Float32)
-                    ds_empty.SetGeoTransform([0, 0, 0, 0, 0, 0])
-                    ds_empty.GetRasterBand(1).SetNoDataValue(0)
-                    ds_empty.GetRasterBand(1).Fill(0)
-                    ds_empty.FlushCache()
-                    ds_empty = None
-                    band_outputs.append(empty_path)
-                    continue
+                        log_callback("WARN", f"  {b}: {msg}，该波段为可选，跳过")
+                    return None
 
-                resample = "near" if b in ("SCL", "qa_pixel", "QA_PIXEL") else "bilinear"
+                resample = "near" if b in ("SCL", "qa_pixel", "QA_PIXEL", "qa") else "bilinear"
 
-                # 各波段 nodata 设置
                 if b in ("qa_pixel", "QA_PIXEL"):
-                    # qa_pixel: Fill=1 是 nodata，需要告诉 GDAL 才能从另一景填补
-                    _src_nodata = 1
-                    _dst_nodata = 1
+                    _src_nodata, _dst_nodata = 1, 1
+                elif b == "qa":
+                    # ST_QA: 0 常见于产品边缘，作为可选波段暂不强设 nodata，交由后续读取端处理
+                    _src_nodata, _dst_nodata = None, None
                 elif b == "data" or "dem" in b.lower():
-                    # DEM: 0 是合法海拔（海平面），不能当 nodata
-                    _src_nodata = None
-                    _dst_nodata = None
+                    _src_nodata, _dst_nodata = None, None
+                elif apply_s2_calibration:
+                    _src_nodata, _dst_nodata = _S2_CALIBRATED_NODATA, _S2_CALIBRATED_NODATA
                 else:
-                    _src_nodata = 0
-                    _dst_nodata = 0
+                    _src_nodata, _dst_nodata = 0, 0
 
                 warp_kwargs = dict(
                     format="GTiff",
@@ -897,48 +961,86 @@ class DataAcquisitionSkill(BaseSkill):
                     multithread=True,
                 )
 
-                # 研究区裁剪：如果提供了 GeoJSON 文件，用 cutline
                 if study_area_geojson and os.path.isfile(study_area_geojson):
                     warp_kwargs["cutlineDSName"] = study_area_geojson
                     warp_kwargs["cropToCutline"] = True
 
                 warp_opts = gdal.WarpOptions(**warp_kwargs)
-
                 tmp_out = os.path.join(tmp_dir, f"band_{b}.tif")
 
                 try:
                     ds = gdal.Warp(tmp_out, urls, options=warp_opts)
-                    if ds:
-                        ds.FlushCache()
-                        ds = None
-                        band_outputs.append(tmp_out)
-                        if log_callback:
-                            log_callback("INFO", f"  {b}: {len(urls)} 景 → mosaic 完成")
-                    else:
-                        if log_callback:
-                            log_callback("WARN", f"  {b}: gdal.Warp 返回空，写入零值波段")
-                        _write_empty_band(tmp_out, utm_epsg_str, x1, y1, x2, y2, scale)
-                        band_outputs.append(tmp_out)
                 except Exception as e:
+                    msg = f"波段 {b}: gdal.Warp 失败 ({e})"
+                    if required:
+                        raise BandAcquisitionError(msg) from e
                     if log_callback:
-                        log_callback("WARN", f"  {b}: Warp 失败 ({e})，写入零值波段")
-                    _write_empty_band(tmp_out, utm_epsg_str, x1, y1, x2, y2, scale)
-                    band_outputs.append(tmp_out)
+                        log_callback("WARN", f"  {msg}，该波段为可选，跳过")
+                    return None
 
-            # ── 6. 合并多波段 ──────────────────────────────────────────
+                if ds is None or ds.RasterXSize < 1 or ds.RasterYSize < 1:
+                    msg = f"波段 {b}: gdal.Warp 返回空或零尺寸影像"
+                    if required:
+                        raise BandAcquisitionError(msg)
+                    if log_callback:
+                        log_callback("WARN", f"  {msg}，该波段为可选，跳过")
+                    return None
+                ds.FlushCache()
+                ds = None
+                band_outputs.append(tmp_out)
+                if log_callback:
+                    log_callback("INFO", f"  {b}: {len(urls)} 景 → mosaic 完成")
+
+            # ── 5. 合并多波段（显式检查返回值，A-02）──────────────────
+            final_tmp = os.path.join(tmp_dir, "final_output.tif")
             if len(band_outputs) == 1:
-                shutil.copy2(band_outputs[0], output_path)
+                shutil.copy2(band_outputs[0], final_tmp)
             else:
                 vrt_path = os.path.join(tmp_dir, "stacked.vrt")
-                gdal.BuildVRT(vrt_path, band_outputs, separate=True, resolution="highest")
-                gdal.Translate(
-                    output_path, vrt_path,
+                vrt_ds = gdal.BuildVRT(vrt_path, band_outputs, separate=True, resolution="highest")
+                if vrt_ds is None:
+                    raise BandAcquisitionError(f"{band}: gdal.BuildVRT 返回空，无法合并多波段")
+                vrt_ds = None
+                translate_ds = gdal.Translate(
+                    final_tmp, vrt_path,
                     format="GTiff",
                     creationOptions=["COMPRESS=LZW", "TILED=YES", "BIGTIFF=YES",
                                     "BLOCKXSIZE=256", "BLOCKYSIZE=256"],
                 )
+                if translate_ds is None:
+                    raise BandAcquisitionError(f"{band}: gdal.Translate 返回空，无法生成最终波段合并文件")
+                translate_ds = None
 
-            # ── 7. 错误报告 ──────────────────────────────────────────
+            # ── 6. 重新打开校验后原子替换为正式文件名（A-02）───────────
+            def _build(dst_tmp_path: str) -> None:
+                shutil.copy2(final_tmp, dst_tmp_path)
+
+            def _validator(dst_tmp_path: str):
+                try:
+                    check_ds = gdal.Open(dst_tmp_path)
+                except Exception as e:
+                    return False, f"重新打开失败: {e}"
+                if check_ds is None:
+                    return False, "重新打开返回 None"
+                try:
+                    if check_ds.RasterCount != band_count:
+                        return False, f"波段数 {check_ds.RasterCount} != 预期 {band_count}"
+                    if check_ds.RasterXSize < 1 or check_ds.RasterYSize < 1:
+                        return False, f"尺寸异常: {check_ds.RasterXSize}x{check_ds.RasterYSize}"
+                    if not check_ds.GetProjection():
+                        return False, "缺少投影信息"
+                    sample_band = check_ds.GetRasterBand(1)
+                    win_x = min(256, check_ds.RasterXSize)
+                    win_y = min(256, check_ds.RasterYSize)
+                    sample = sample_band.ReadAsArray(0, 0, win_x, win_y)
+                    if sample is None:
+                        return False, "无法读取采样窗口"
+                finally:
+                    check_ds = None
+                return True, ""
+
+            write_verified(_build, output_path, _validator)
+
             if download_errors and log_callback:
                 for err in download_errors[:5]:
                     log_callback("WARN", err)
@@ -947,7 +1049,9 @@ class DataAcquisitionSkill(BaseSkill):
 
             if log_callback:
                 log_callback("INFO",
-                    f"已保存 {band}: {output_path} ({band_count} 波段, {len(items_sorted)} 景 mosaic)")
+                    f"已保存并校验通过 {band}: {output_path} ({band_count} 波段, {len(items_sorted)} 景 mosaic)")
+
+            return s2_provenance if apply_s2_calibration else None
 
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -967,9 +1071,7 @@ class DataAcquisitionSkill(BaseSkill):
             t0 = _time.time()
             timeout = min(120 + attempt * 45, 300)
             try:
-                # 每次用新 session，无连接池复用，避免脏连接
                 sess = requests.Session()
-                # 禁用连接池复用（每次 HTTP 都新建 TCP 连接）
                 sess.mount("https://", requests.adapters.HTTPAdapter(
                     pool_connections=0, pool_maxsize=0,
                     max_retries=0,
@@ -978,7 +1080,6 @@ class DataAcquisitionSkill(BaseSkill):
                     pool_connections=0, pool_maxsize=0,
                     max_retries=0,
                 ))
-                # 不保留 proxy 配置，让系统决定
                 sess.trust_env = False
                 if log_callback and attempt == 0:
                     log_callback("INFO", f"  开始下载 ({timeout}s超时): {url[:70]}...")
@@ -992,7 +1093,6 @@ class DataAcquisitionSkill(BaseSkill):
             except requests.exceptions.RequestException as e:
                 elapsed = _time.time() - t0
                 last_err = e
-                # 梯子切换/网络抖动的典型错误
                 is_network_flap = isinstance(e, (
                     requests.exceptions.ConnectionError,
                     requests.exceptions.ProxyError,
@@ -1001,10 +1101,9 @@ class DataAcquisitionSkill(BaseSkill):
                 ))
                 if log_callback:
                     if is_network_flap and attempt < 4:
-                        log_callback("WARN", f"  网络抖动 ({(request_type := type(e).__name__)}), 第{attempt+1}/5次重试...")
+                        log_callback("WARN", f"  网络抖动 ({type(e).__name__}), 第{attempt+1}/5次重试...")
                     else:
                         log_callback("WARN", f"  下载失败 ({elapsed:.1f}s, 第{attempt+1}次): {e}")
-                # 等待优雅递增让网络恢复
                 sleep_sec = min(2 ** attempt, 15)
                 _time.sleep(sleep_sec)
         if log_callback:
@@ -1026,7 +1125,6 @@ class DataAcquisitionSkill(BaseSkill):
         except ImportError:
             pass
 
-        # 手动签名：调用 SAS API
         try:
             collection_id = item.collection_id
             item_id = item.id
@@ -1035,9 +1133,7 @@ class DataAcquisitionSkill(BaseSkill):
             resp.raise_for_status()
             sas_data = resp.json()
 
-            # 将 SAS token 附加到每个 asset URL
             import copy
-            from pystac import Item as STACItem
             signed_item = copy.deepcopy(item)
             for key, asset in signed_item.assets.items():
                 if hasattr(asset, 'href') and asset.href:
@@ -1047,7 +1143,6 @@ class DataAcquisitionSkill(BaseSkill):
                         asset.href = f"{asset.href}{sep}{token}"
             return signed_item
         except Exception:
-            # 某些数据可能不需要签名
             return item
 
 
@@ -1094,7 +1189,6 @@ def _extract_polygons(geojson: dict) -> List:
         return [{"type": "Polygon", "coordinates": geojson.get("coordinates", [])}]
 
     if gtype == "MultiPolygon":
-        # 每个子多边形独立返回
         return [{"type": "Polygon", "coordinates": coords} for coords in geojson.get("coordinates", [[]])]
 
     return []

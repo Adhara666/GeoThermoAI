@@ -1,20 +1,31 @@
 """
-TTRI 计算 Skill
+TTRI 计算 Skill（A-04/A-05/A-06/A-08 重写）
 
-计算地形热响应指数（Terrain Thermal Response Index）：
-    - 对训练/验证/测试集各自独立拟合多元线性回归 TTRI = a*DEM + b*Slope + c*cos(Aspect)
-    - 对10m预测数据通过30m规则网格双线性插值计算TTRI
+    - 仅用固定 train split 拟合一次 TTRI 回归系数，固定保存 ttri_coefficients.json；
+      validate/test 用同一组系数做无标签变换（A-04，不再各自重新拟合）；
+    - 10m 预测数据的空间化插值改为基于完整30m约束层 + 统一仿射映射（A-05/A-06），
+      不再是 step2 抽样 CSV 的稀疏"unique row/col"网格 + row/3.0 假设；
+    - 去除旧版"抽查前1000行有一个有限TTRI就跳过重算"的不可靠判断：本版本每次都
+      完整重算并原子替换，不再有"成功但下游产物契约为空"的路径（A-08）；
+    - 10m TTRI 计算失败会直接返回 success=False，不再只记 WARN 后仍返回成功。
+
+Agent 的 SKILL_PATHS（core/agent/geo_thermo_agent.py，未修改）只会注入
+output_dir/data_30m_csv/predict_10m_csv/train_csv/val_csv/test_csv，不包含
+A-05 新增的 constraint_csv/constraint_meta/predict_10m_meta；本 Skill 按固定
+命名约定从 output_dir（即预处理阶段的 processed_dir）自动推导这些路径，
+不需要 Agent 额外注入。
 """
 
 import os
-import pandas as pd
 from typing import Any, Dict, List
 
 from ..base_skill import BaseSkill, SkillParameter, SkillResult
+from ...atomic_io import atomic_replace
+from ... import manifest as run_manifest
 
 
 class TTRIComputeSkill(BaseSkill):
-    """计算TTRI（地形热响应指数）"""
+    """计算TTRI（地形热响应指数）：仅 train 拟合一次 + 统一仿射映射空间化"""
 
     @property
     def name(self) -> str:
@@ -26,54 +37,18 @@ class TTRIComputeSkill(BaseSkill):
 
     @property
     def description(self) -> str:
-        return "对训练/验证/测试集拟合TTRI多元线性回归系数（DEM, Slope, cos(Aspect) → LST），并计算TTRI列；对10m预测数据通过双线性插值计算TTRI。"
+        return "仅用训练集拟合一次TTRI多元线性回归系数（DEM, Slope, cos(Aspect) → LST），固定保存系数；validate/test/完整30m约束层/10m预测格网复用同一组系数做无标签变换。"
 
     @property
     def parameters(self) -> List[SkillParameter]:
         return [
-            SkillParameter(
-                name="train_csv",
-                type="file_path",
-                description="训练集CSV路径（需包含DEM, Slope, cos(Aspect), LST列）",
-                required=True,
-            ),
-            SkillParameter(
-                name="val_csv",
-                type="file_path",
-                description="验证集CSV路径",
-                required=True,
-            ),
-            SkillParameter(
-                name="test_csv",
-                type="file_path",
-                description="测试集CSV路径",
-                required=True,
-            ),
-            SkillParameter(
-                name="data_30m_csv",
-                type="file_path",
-                description="30m全量特征CSV路径（用于构建TTRI网格），默认 output_dir/../processed/30m_features_step2.csv",
-                required=False,
-            ),
-            SkillParameter(
-                name="predict_10m_csv",
-                type="file_path",
-                description="10m预测特征CSV路径，默认 output_dir/../processed/10m_predict_features.csv",
-                required=False,
-            ),
-            SkillParameter(
-                name="output_dir",
-                type="file_path",
-                description="输出目录路径",
-                required=True,
-            ),
-            SkillParameter(
-                name="batch_size",
-                type="number",
-                description="批处理大小（10m预测数据插值时使用），默认 500000",
-                required=False,
-                default=500000,
-            ),
+            SkillParameter(name="train_csv", type="file_path", description="训练集CSV路径（需包含DEM, Slope, cos(Aspect), LST列）", required=True),
+            SkillParameter(name="val_csv", type="file_path", description="验证集CSV路径", required=True),
+            SkillParameter(name="test_csv", type="file_path", description="测试集CSV路径", required=True),
+            SkillParameter(name="output_dir", type="file_path", description="输出目录路径（预处理阶段的processed目录）", required=True),
+            SkillParameter(name="constraint_csv", type="file_path", description="完整30m约束层CSV路径，默认 output_dir/30m_constraint_grid.csv", required=False),
+            SkillParameter(name="predict_10m_csv", type="file_path", description="10m预测特征CSV路径，默认 output_dir/10m_predict_features.csv", required=False),
+            SkillParameter(name="batch_size", type="number", description="批处理大小（10m预测数据插值时使用），默认 500000", required=False, default=500000),
         ]
 
     @property
@@ -92,7 +67,7 @@ class TTRIComputeSkill(BaseSkill):
             "val_with_ttri": "验证集含TTRI的CSV路径",
             "test_with_ttri": "测试集含TTRI的CSV路径",
             "predict_with_ttri": "10m预测数据含TTRI的CSV路径",
-            "coefficients": "TTRI回归系数",
+            "coefficients_path": "固定 ttri_coefficients.json 路径",
         }
 
     def execute(
@@ -108,131 +83,125 @@ class TTRIComputeSkill(BaseSkill):
         output_dir = params.get("output_dir", "")
         batch_size = params.get("batch_size", 500000)
 
-        # 默认路径：和 data_pipeline 输出路径一致
-        data_30m_csv = params.get("data_30m_csv",
-                                   os.path.join(output_dir, "30m_features_step2.csv"))
-        predict_10m_csv = params.get("predict_10m_csv",
-                                     os.path.join(output_dir, "10m_predict_features.csv"))
-
         for name, val in [
-            ("train_csv", train_csv),
-            ("val_csv", val_csv),
-            ("test_csv", test_csv),
-            ("output_dir", output_dir),
+            ("train_csv", train_csv), ("val_csv", val_csv),
+            ("test_csv", test_csv), ("output_dir", output_dir),
         ]:
             if not val:
                 return SkillResult(success=False, message=f"参数 {name} 不能为空")
 
+        # 固定命名推导（A-05 新增产物，Agent 不会显式注入，见模块顶部说明）
+        constraint_csv = params.get("constraint_csv") or os.path.join(output_dir, "30m_constraint_grid.csv")
+        constraint_meta = params.get("constraint_meta") or os.path.join(output_dir, "30m_constraint_grid_meta.json")
+        predict_10m_csv = params.get("predict_10m_csv") or os.path.join(output_dir, "10m_predict_features.csv")
+        predict_10m_meta = params.get("predict_10m_meta") or os.path.join(output_dir, "10m_predict_features_meta.json")
+
+        for label, path in [
+            ("完整30m约束层", constraint_csv), ("完整30m约束层元数据", constraint_meta),
+            ("10m预测特征", predict_10m_csv), ("10m预测元数据", predict_10m_meta),
+        ]:
+            if not os.path.isfile(path):
+                return SkillResult(
+                    success=False,
+                    message=f"缺少必需输入文件（{label}）: {path}；请确认已成功完成 data_pipeline 阶段（fail-fast，不复用旧产物）",
+                )
+
         try:
-            from ...ttri import compute_ttri_train, compute_ttri_predict
+            from ...ttri import compute_ttri_for_splits, compute_ttri_predict, compute_ttri_for_constraint_grid
         except ImportError:
             return SkillResult(success=False, message="无法导入TTRI计算模块")
 
-        # ── 训练/验证/测试集TTRI ────────────────────────────────────
+        # ── 步骤1: 仅 train 拟合一次，train/validate/test 复用同一组系数 ────
         if log_callback:
-            log_callback("INFO", "开始计算训练/验证/测试集 TTRI...")
+            log_callback("INFO", "开始计算 TTRI（仅 train 拟合一次，validate/test 无标签复用）...")
 
         try:
-            train_result = compute_ttri_train(
-                train_csv=train_csv,
-                val_csv=val_csv,
-                test_csv=test_csv,
-                output_dir=output_dir,
-                progress_callback=progress_callback,
+            train_result = compute_ttri_for_splits(
+                train_csv=train_csv, val_csv=val_csv, test_csv=test_csv,
+                output_dir=output_dir, progress_callback=progress_callback,
             )
         except Exception as e:
             return SkillResult(success=False, message=f"TTRI训练集计算失败: {e}")
 
+        coefficients_path = train_result["coefficients_path"]
         output_files = train_result.get("output_files", {})
-        train_coef = train_result.get("train", {})
+        coef_summary = train_result.get("coefficients", {})
+
+        # ── 步骤2: 完整30m约束层上应用同一组系数（供 TCR/调试使用）──────────
+        try:
+            compute_ttri_for_constraint_grid(constraint_csv, coefficients_path)
+        except Exception as e:
+            return SkillResult(success=False, message=f"完整30m约束层 TTRI 计算失败: {e}")
+
+        # ── 步骤3: 10m预测数据TTRI（完整约束层 + 统一仿射映射插值，A-05/A-06）──
+        if log_callback:
+            log_callback("INFO", "开始计算10m预测数据 TTRI（统一仿射映射双线性插值）...")
+
+        tmp_output = predict_10m_csv + ".ttri_tmp"
+        try:
+            predict_result = compute_ttri_predict(
+                constraint_csv=constraint_csv,
+                constraint_meta_json=constraint_meta,
+                predict_10m_csv=predict_10m_csv,
+                predict_10m_meta_json=predict_10m_meta,
+                coefficients=coefficients_path,
+                output_path=tmp_output,
+                batch_size=batch_size,
+                progress_callback=progress_callback,
+            )
+        except Exception as e:
+            if os.path.exists(tmp_output):
+                os.remove(tmp_output)
+            # A-08 修复：10m TTRI 失败必须使依赖链失败，不能只 WARN 后仍返回 success=True
+            return SkillResult(success=False, message=f"10m预测数据 TTRI 计算失败: {e}")
+
+        if predict_result.get("total_valid", 0) == 0:
+            if os.path.exists(tmp_output):
+                os.remove(tmp_output)
+            return SkillResult(
+                success=False,
+                message="10m预测数据 TTRI 计算完成但有效行数为0，可能约束层与预测格网完全不重叠，拒绝返回成功",
+            )
+
+        # 校验通过后原子替换（避免读写同一文件的竞态；A-02/A-08）
+        atomic_replace(tmp_output, predict_10m_csv)
 
         result_data = {
             "train_with_ttri": output_files.get("train", ""),
             "val_with_ttri": output_files.get("validate", ""),
             "test_with_ttri": output_files.get("test", ""),
-            "predict_with_ttri": "",
-            "coefficients": {
-                "train": train_coef,
-                "validate": train_result.get("validate", {}),
-                "test": train_result.get("test", {}),
+            "predict_with_ttri": predict_10m_csv,
+            "coefficients_path": coefficients_path,
+            "coefficients": coef_summary,
+            "constraint_csv": constraint_csv,
+            "constraint_meta": constraint_meta,
+            "ttri_predict_stats": {
+                "total_valid": predict_result.get("total_valid", 0),
+                "total_invalid": predict_result.get("total_invalid", 0),
+                "out_of_grid": predict_result.get("out_of_grid", 0),
             },
         }
 
-        artifacts = [v for v in output_files.values() if v]
+        artifacts = [v for v in output_files.values() if v] + [coefficients_path, predict_10m_csv]
 
-        # ── 10m预测数据TTRI ──────────────────────────────────────────
-        if log_callback:
-            log_callback("INFO", "开始计算10m预测数据 TTRI...")
-
-        if not os.path.isfile(data_30m_csv):
-            if log_callback:
-                log_callback("WARN", f"30m全量数据不存在，跳过10m TTRI计算: {data_30m_csv}")
-        elif not os.path.isfile(predict_10m_csv):
-            if log_callback:
-                log_callback("WARN", f"10m预测数据不存在，跳过10m TTRI计算: {predict_10m_csv}")
-        else:
-            # 检查是否已有有效 TTRI 列
-            _has_ttri = False
-            try:
-                _head = pd.read_csv(predict_10m_csv, nrows=1)
-                _has_ttri = "TTRI" in _head.columns
-                if _has_ttri:
-                    # 验证 TTRI 值是否有效（不全为 NaN）
-                    _sample = pd.read_csv(predict_10m_csv, usecols=["TTRI"], nrows=1000)
-                    _has_ttri = _sample["TTRI"].notna().any() > 0
-            except Exception:
-                pass
-
-            if _has_ttri:
-                if log_callback:
-                    log_callback("INFO", "10m预测数据已含有效TTRI，跳过计算")
-            else:
-                # 清理可能残留的旧 TTRI 列
-                try:
-                    _sample_cols = pd.read_csv(predict_10m_csv, nrows=1).columns.tolist()
-                    if "TTRI" in _sample_cols:
-                        _tmp_clean = predict_10m_csv + ".clean_tmp"
-                        _keep_cols = [c for c in _sample_cols if c != "TTRI"]
-                        _chunks = pd.read_csv(predict_10m_csv, chunksize=500000, usecols=_keep_cols)
-                        for i, c in enumerate(_chunks):
-                            c.to_csv(_tmp_clean, mode="w" if i == 0 else "a", header=i == 0, index=False)
-                        import shutil
-                        shutil.move(_tmp_clean, predict_10m_csv)
-                        if log_callback:
-                            log_callback("INFO", "已清理残留TTRI列")
-                except Exception:
-                    pass
-                try:
-                    _temp_output = predict_10m_csv + ".ttri_tmp"
-                    predict_result = compute_ttri_predict(
-                        data_30m_csv=data_30m_csv,
-                        predict_10m_csv=predict_10m_csv,
-                        output_path=_temp_output,
-                        train_csv=train_csv,
-                        batch_size=batch_size,
-                        progress_callback=progress_callback,
-                    )
-                    # 完成后替换原始文件
-                    import shutil
-                    shutil.move(_temp_output, predict_10m_csv)
-                    result_data["predict_with_ttri"] = predict_10m_csv
-                    artifacts.append(predict_10m_csv)
-                    if log_callback:
-                        log_callback("INFO",
-                            f"10m TTRI计算完成: {predict_result['total_valid']:,} 有效行"
-                            f"（耗时 {predict_result['elapsed_seconds']}s）")
-                except Exception as e:
-                    if log_callback:
-                        log_callback("WARN", f"10m TTRI计算失败（不影响训练）: {e}")
+        project_root = run_manifest.project_root_from_stage_output_dir(output_dir)
+        if project_root:
+            run_manifest.record_stage(
+                project_root, "ttri_compute", run_manifest.STATUS_COMPLETED,
+                artifacts={k: v for k, v in result_data.items() if isinstance(v, str) and v},
+                stats={"coefficients": coef_summary, "predict": result_data["ttri_predict_stats"]},
+            )
 
         if progress_callback:
             progress_callback("ttri_compute", 1.0, "TTRI计算完成")
 
+        coef_list = coef_summary.get("coefficients", [0, 0, 0])
         return SkillResult(
             success=True,
             message=(
-                f"TTRI计算完成: 训练集 R²={train_coef.get('r2', 'N/A')}, "
-                f"系数 a(DEM)={train_coef.get('coefficients', [0])[0]:.6f}"
+                f"TTRI计算完成（仅train拟合一次）: R²={coef_summary.get('r2', 'N/A')}, "
+                f"系数 a(DEM)={coef_list[0]:.6f}；10m有效 {predict_result.get('total_valid', 0):,} 行，"
+                f"约束层覆盖范围外 {predict_result.get('out_of_grid', 0):,} 行"
             ),
             data=result_data,
             artifacts=artifacts,
