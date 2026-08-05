@@ -1,79 +1,74 @@
 # GeoThermoAI → ModelScope Studio 升级规划 v2
 
-> **目标**: 将 GeoThermoAI 从单任务 LST 降尺度工具升级为"LLM-Orchestrated Workflow 驱动的热红外遥感 GeoAI Agent 平台"。
->
-> **现状**: 当前软件（`GeoThermoAI_新数据下载_docker`）已完成 Web 化迁移——前端 Vue 3 + Vite + Pinia，后端 FastAPI（`server.py`），Docker 部署于 ModelScope Studio（监听 7860 端口），核心算法零改动。本文档中"已实现"章节反映当前软件实际状态，"待实现"章节保留后续升级计划。
+> **目标**: 将 GeoThermoAI 从桌面 PyWebView 应用迁移至 ModelScope Studio（Gradio + Ant Design X），完成从"LST 降尺度单任务工具"到"LLM-Orchestrated Workflow 驱动的热红外遥感 GeoAI Agent 平台"的升级。
 >
 > **架构定位**: LLM-Orchestrated Workflow — LLM 在最需要灵活性的地方（理解意图、推荐参数、分析结果）做智能增强，核心科学计算保持确定性工作流，确保可复现性和可调试性。
 >
 > 基于 v1 规划 + 多轮技术讨论的最终整合版。
 
-***
+---
 
 ## 一、现状概要
 
 ### 1.1 当前技术栈
 
-| 层级       | 技术                                                        | 备注                                     |
-| -------- | --------------------------------------------------------- | -------------------------------------- |
-| UI 容器    | ModelScope Studio（Docker 部署，监听 7860）                      | 已迁移完成（`ms_deploy.json` + `Dockerfile`） |
-| 前端       | Vue 3 + Vite + Pinia（SPA，`frontend/`）                     | 三栏布局：侧边栏 / 对话区 / 工作面板                  |
-| API 桥    | FastAPI REST + SSE（`server.py`）                           | 聊天流式、项目/对话管理、文件下载、地图瓦片                 |
-| AI 引擎    | OpenAI 兼容 API（DeepSeek）                                   | 保留，运行时在「API 设置」面板配置并持久化到 settings.json |
-| Agent    | 单 Agent + JSON 计划 + Skill 编排                              | 保留并增强                                  |
-| Skill 系统 | 注册表模式，8 个内置 Skill                                         | 保留，扩展更多模型 Skill                        |
-| 核心算法     | scikit-learn RF / rasterio / GDAL                         | 保留，零改动                                 |
-| 数据源      | Microsoft Planetary Computer STAC + Copernicus Data Space | 保留（Landsat / Sentinel-2 / DEM）         |
+| 层级 | 技术 | 备注 |
+|---|---|---|
+| UI 容器 | PyWebView（桌面原生窗口） | 迁移目标：废弃 |
+| 前端 | 原生 HTML + CSS + JS | 迁移目标：废弃 |
+| API 桥 | `window.pywebview.api.xxx()` | 迁移目标：改为 Gradio 事件 |
+| AI 引擎 | OpenAI 兼容 API（DeepSeek） | 保留，配置方式改为运行时输入 |
+| Agent | 单 Agent + JSON 计划 + Skill 编排 | 保留并增强 |
+| Skill 系统 | 注册表模式，8 个内置 Skill | 保留，扩展更多模型 Skill |
+| 核心算法 | scikit-learn RF / rasterio / GDAL | 保留，零改动 |
+| 数据源 | Microsoft Planetary Computer STAC | 保留 |
 
 ### 1.2 当前内置 Skill
 
-| Group                 | Skill 名称                            | 说明         |
-| --------------------- | ----------------------------------- | ---------- |
-| `data_process`        | `data_acquisition`, `data_pipeline` | 数据获取与预处理   |
-| `ttri_compute`        | `ttri_compute`                      | 地形热响应指数计算  |
-| `model_train_predict` | `rf_model`（唯一）                      | 模型训练与预测    |
-| `tcr_compute`         | `tcr_compute`                       | 热约束残差修正    |
-| `lst_export`          | `lst_export`                        | LST 最终结果导出 |
-| `accuracy_eval`       | `accuracy_eval`                     | 空间一致性评估    |
-| `ai_assist`           | `ai_assistant`                      | 纯 LLM 对话交互 |
+| Group | Skill 名称 | 说明 |
+|---|---|---|
+| `data_process` | `data_acquisition`, `data_pipeline` | 数据获取与预处理 |
+| `ttri_compute` | `ttri_compute` | 地形热响应指数计算 |
+| `model_train_predict` | `rf_model`（唯一） | 模型训练与预测 |
+| `tcr_compute` | `tcr_compute` | 热约束残差修正 |
+| `lst_export` | `lst_export` | LST 最终结果导出 |
+| `accuracy_eval` | `accuracy_eval` | 空间一致性评估 |
+| `ai_assistant` | `ai_assistant` | 纯 LLM 对话交互 |
 
-***
+---
 
 ## 二、技术选型总览
 
 ### 2.1 前端
 
-| 组件       | 选型                                                          | 版本要求                 | 说明                                                                                                                |
-| -------- | ----------------------------------------------------------- | -------------------- | ----------------------------------------------------------------------------------------------------------------- |
-| 应用框架     | **Vue 3 + Vite + Pinia**（`frontend/`）                       | vue ^3.4 / vite ^5.2 | 主 UI 容器，三栏布局（侧边栏 / 对话区 / 工作面板）                                                                                    |
-| 对话组件     | **ChatMessages.vue** + **MarkdownRender.vue**（marked）       | npm：marked ^12       | 气泡式对话（用户右 / AI 左），Markdown 渲染                                                                                     |
-| 思考链展示    | **`<details>/<summary>`** **HTML**（后端 `format_bubble()` 生成） | 已有                   | AI 思考过程以可折叠小字区置于气泡正文上方，默认折叠（DeepSeek“已深度思考”样式）                                                                    |
-| 侧边栏      | **Sidebar.vue**（`stores/project.js` 状态）                     | 已有                   | 项目→对话两级结构：项目卡片可展开/收起、行内重命名、页面内弹窗删除                                                                                |
-| API 设置面板 | **ApiSettings.vue**（select / input / number）                | 已有                   | 兼容 OpenAI / Anthropic 双格式，真实流式调用 LLM，保存后热更新                                                                       |
-| 交互地图     | **Leaflet**（`panels/MapView.vue`）+ 后端瓦片金字塔渲染                | npm：leaflet ^1.9     | 多图层交互式地图（30m LST / S2 RGB / DEM / 10m LST），每层可独立勾选/取消、调不透明度、切换底图；后端 `/api/layer/{id}/tile/...` 输出 Web Mercator 瓦片 |
-| 可视化图表    | **Matplotlib**                                              | 已有依赖                 | Benchmark 柱状图、UHI 图、时序图（配置中文字体）                                                                                   |
-| 进度/状态    | **Workflow\.vue**（7 步状态表）                                   | 已有                   | 状态与 `run_manifest.json`（`core/manifest.py`）交叉核对，失败/跳过/完成以 manifest 为准                                             |
-| LLM 调用   | **requests**（SSE 流式，后端 `core/ai_assistant.py`）              | 已有依赖                 | OpenAI `/chat/completions` 与 Anthropic `/v1/messages` 双格式流式请求                                                     |
-| 后端通信     | **FastAPI REST + SSE**（`server.py`）                         | fastapi>=0.110       | 替代 Gradio 事件：聊天流式、项目/对话管理、文件下载、地图瓦片接口                                                                             |
+| 组件 | 选型 | 版本要求 | 说明 |
+|---|---|---|---|
+| 应用框架 | **Gradio Blocks** | ≥ 6.0.0, ≤ 6.8.0（ModelScope 约束） | 主 UI 容器，三栏布局（25%/45%/30%） |
+| 对话组件 | **gr.Chatbot** + **gr.Textbox** | Gradio 内置 | 气泡式对话（用户/AI 分左右）。注：原计划的 antdx.Bubble/Sender 是 React/npm 库，非 pip 包，Gradio 中对应的标准组件即 gr.Chatbot |
+| 思考链展示 | **`<details>/<summary>` HTML** + 自定义 CSS | Gradio 内置渲染 | AI 思考过程以可折叠小字区置于气泡正文上方，默认折叠（DeepSeek“已深度思考”样式） |
+| 侧边栏 | **gr.Accordion** + **gr.Radio** | Gradio 内置 | 项目→对话两级结构：项目可折叠，对话隶属项目，体现记忆隔离 |
+| API 设置面板 | **gr.Dropdown / gr.Textbox / gr.Number** | Gradio 内置 | 兼容 OpenAI / Anthropic 双格式，真实流式调用 LLM |
+| 交互地图 | **Folium** + `LayerControl` | ≥ 0.16.0 | 多图层交互式地图（LST/NDVI/DEM/真彩色等），每层可独立勾选/取消、调不透明度，类似 GEE 图层管理器，需将 UTM 坐标转为 WGS84 经纬度 |
+| 可视化图表 | **Matplotlib** | 已有依赖 | Benchmark 柱状图、UHI 图、时序图（配置中文字体） |
+| 进度/状态 | Gradio 原生 `gr.Progress` + `gr.Dataframe` | 内置 | 工作流 7 步进度状态表 |
+| LLM 调用 | **requests**（SSE 流式） | 已有依赖 | OpenAI `/chat/completions` 与 Anthropic `/v1/messages` 双格式流式请求 |
 
 ### 2.2 后端
 
-| 组件        | 选型                                                          | 说明                                                                        |
-| --------- | ----------------------------------------------------------- | ------------------------------------------------------------------------- |
-| 核心语言      | Python 3.10+                                                | 已有                                                                        |
-| AI 引擎     | OpenAI 兼容 API（DeepSeek / Kimi / OpenAI）                     | 运行时传入 API Key，不硬编码                                                        |
-| 遥感处理      | GDAL + rasterio + numpy                                     | 已有，保留                                                                     |
-| 机器学习      | scikit-learn → 扩展 xgboost, lightgbm, catboost, extra\_trees | 5 个模型：RF / XGBoost / LightGBM / CatBoost / ExtraTrees                     |
-| **向量数据库** | **ChromaDB**（PersistentClient）                              | 本地持久化，零运维，每个项目一个 Collection + 全局共享 Collection                             |
-| **文本嵌入**  | **sentence-transformers/all-MiniLM-L6-v2**                  | \~80MB，本地离线运行，无需 GPU                                                      |
-| 记忆管理      | 自定义 `MemoryManager` + ChromaDB + JSON                       | 双重查询：RAG 语义检索（global\_knowledge + project经验）+ JSON 精确查询（实验记录/偏好），LLM 自主融合 |
-| 数据生命周期    | `MemoryManager` 级联删除                                        | 删除对话或项目时同步清理 JSON 文件 + ChromaDB Collection，前端弹框确认                         |
-| **并发下载**  | **concurrent.futures.ThreadPoolExecutor**                   | max\_workers=3，IO 密集型                                                     |
-| 后端框架      | **FastAPI + uvicorn**（`server.py`）                          | 已实现：REST + SSE 接口，静态托管 Vue 构建产物（`dist/`）                                  |
-| 工作流状态     | **`core/manifest.py`**（`run_manifest.json`）                 | 已实现：各 Skill 产物校验后写 completed/failed，前端进度表交叉核对                             |
-| 文件下载      | **`/api/download`**（FileResponse）                           | 已实现：自建下载路由，规避平台 allowed\_paths/iframe 限制                                  |
-| 可视化       | 自定义 `LayerVisualizer`（`core/visualization.py`）              | 已实现：瓦片金字塔渲染（`render_layer_tile`）+ Leaflet 前端叠加；保留 folium iframe 兼容        |
-| 系统依赖      | OSGeo GDAL 基础镜像 `ghcr.io/osgeo/gdal:ubuntu-small-3.9.3`     | 已实现：GDAL/PROJ 预装（无需 packages.txt），`requirements.txt` 锁 numpy<2            |
+| 组件 | 选型 | 说明 |
+|---|---|---|
+| 核心语言 | Python 3.10+ | 已有 |
+| AI 引擎 | OpenAI 兼容 API（DeepSeek / Kimi / OpenAI） | 运行时传入 API Key，不硬编码 |
+| 遥感处理 | GDAL + rasterio + numpy | 已有，保留 |
+| 机器学习 | scikit-learn → 扩展 xgboost, lightgbm, catboost, extra_trees | 5 个模型：RF / XGBoost / LightGBM / CatBoost / ExtraTrees |
+| **向量数据库** | **ChromaDB**（PersistentClient） | 本地持久化，零运维，每个项目一个 Collection + 全局共享 Collection |
+| **文本嵌入** | **sentence-transformers/all-MiniLM-L6-v2** | ~80MB，本地离线运行，无需 GPU |
+| 记忆管理 | 自定义 `MemoryManager` + ChromaDB + JSON | 双重查询：RAG 语义检索（global_knowledge + project经验）+ JSON 精确查询（实验记录/偏好），LLM 自主融合 |
+| 数据生命周期 | `MemoryManager` 级联删除 | 删除对话或项目时同步清理 JSON 文件 + ChromaDB Collection，前端弹框确认 |
+| **并发下载** | **concurrent.futures.ThreadPoolExecutor** | max_workers=3，IO 密集型 |
+| 可视化 | 自定义 `LayerVisualizer`（`core/visualization.py`） | Folium 多图层管理，色带渲染，UTM→WGS84 坐标转换 |
+| 报告生成 | Jinja2（可选） | 实验报告模板 |
+| 系统依赖 | gdal-bin, libgdal-dev, libproj-dev | 通过 ModelScope `packages.txt` 安装 |
 
 ### 2.3 架构总览
 
@@ -81,11 +76,10 @@
 ┌─────────────────────────────────────────────────────────┐
 │                 ModelScope Studio 容器                    │
 │  ┌───────────────────────────────────────────────────┐  │
-│  │          Vue 3 SPA（UI 层, FastAPI 托管）         │  │
+│  │              Gradio Blocks (UI 层)                 │  │
 │  │  ┌─────────────┐  ┌──────────┐  ┌──────────────┐ │  │
-│  │  │ 对话区        │  │ 侧边栏    │  │ 工作面板      │ │  │
-│  │  │ (ChatMessages│  │ (项目/   │  │ (API设置/参数/ │ │  │
-│  │  │  + 思考链)   │  │  对话管理) │  │  Leaflet地图) │ │  │
+│  │  │ 对话面板      │  │ 工作面板  │  │ 可视化面板    │ │  │
+│  │  │ (antdx)     │  │(参数表单)│  │ (folium地图) │ │  │
 │  │  └──────┬──────┘  └────┬─────┘  └──────┬───────┘ │  │
 │  └─────────┼──────────────┼───────────────┼─────────┘  │
 │            │              │               │            │
@@ -130,145 +124,150 @@
 │                                                         │
 │  ┌───────────────────────────────────────────────────┐  │
 │  │        可视化模块（core/visualization.py）          │  │
-│  │  LayerVisualizer / 瓦片金字塔渲染 / UTM→WGS84坐标  │  │
-│  │  Leaflet 图层控制器 / folium iframe 兼容           │  │
+│  │  LayerVisualizer / Folium多图层 / UTM→WGS84坐标   │  │
+│  │  GEE风格图层控制器 / 色带渲染                      │  │
 │  └───────────────────────────────────────────────────┘  │
 │                                                         │
 │  ┌───────────────────────────────────────────────────┐  │
 │  │           核心算法模块（零改动）                    │  │
 │  │  rf_model.py / ttri.py / tcr.py / lst_final.py   │  │
-│  │  export_geotiff.py / evaluation.py / manifest.py │  │
+│  │  export_geotiff.py / evaluation.py / ...          │  │
 │  └───────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────┘
 ```
 
-***
+---
 
 ## 三、升级维度（按优先级排序）
 
-### 3.1 \[P0] 最小可行迁移 — ModelScope Studio UI（✅ 已实现）
+### 3.1 [P0] 最小可行迁移 — ModelScope Studio UI
 
-已完成 Web 化迁移：FastAPI + Vue 3 + Docker 部署 ModelScope Studio（`ms_deploy.json` + `Dockerfile`），核心算法零改动。
-本节描述当前实际实现。
+将 PyWebView 替换为 Gradio，核心算法零改动。
 
 #### UI 布局
 
 ```
-Vue 3 SPA（App.vue，Vite 构建 → dist/ 由 FastAPI 静态托管）
-├── Sidebar.vue (侧边栏 - 项目管理)
-│   ├── 品牌区 (Logo + 系统名)
-│   ├── 「＋ 新建项目」按钮 → 页面内弹窗 (项目名称 + 项目保存路径)
-│   ├── 项目卡片列表 (Codex 式：展开/收起、行内重命名、删除、新建对话)
-│   │   └── 对话列表 (点击切换 / ✕ 删除，页面内弹窗确认)
-│   └── 底部版权区
-├── 对话区 (中间)
-│   ├── 顶栏 (菜单按钮 + 当前对话标题 + 当前模型展示标签)
-│   ├── ChatMessages.vue (气泡对话，用户右 / AI 左，Markdown 渲染)
-│   │   └── AI 气泡内含 <details> 可折叠思考链 (后端 format_bubble 生成)
-│   ├── PairSelectCard.vue (多组影像配对选择卡片，暂停时弹出)
-│   └── ChatInput.vue (输入框 + 发送)
-└── Workbench.vue (右侧工作面板，宽度可拖拽 320–560px)
-    ├── Tab 栏：API设置 / 数据源 / 测试 / 研究区 / 参数 / 下载 / 地图 / 进度 / 日志 / 精度
-    │   ├── ApiSettings.vue (OpenAI/Anthropic 双格式)
-    │   ├── DataSources.vue (Planetary Computer + Copernicus Data Space)
-    │   ├── DataSource.vue (Planetary 连通性 / GDAL 环境自检)
-    │   ├── StudyArea.vue (研究区 GeoJSON/Shapefile 上传)
-    │   ├── ModelParams.vue (RF 超参数滑条)
-    │   ├── FileDownload.vue (项目文件列表 + 下载)
-    │   ├── MapView.vue (Leaflet 多图层地图)
-    │   ├── Workflow.vue (7 步进度状态表)
-    │   ├── LogPanel.vue (实时过程日志)
-    │   └── Accuracy.vue (精度评估：两套独立协议)
-    └── 底部 (当前模型 + 收起面板)
+Gradio Blocks
+├── gr.Row (header + Logo + 标题 + 技术标识)
+├── gr.Row (main content)
+│   ├── gr.Column (侧边栏 - 项目管理, 25%)
+│   │   ├── gr.Button("＋ 新建项目")
+│   │   ├── gr.Accordion("新建项目", 默认隐藏)
+│   │   │   ├── gr.Textbox (项目名称输入)
+│   │   │   └── gr.Button ("创建" / "取消")
+│   │   ├── gr.Dropdown (选择项目 - 动态填充)
+│   │   ├── gr.Radio (对话列表 - 动态填充)
+│   │   ├── gr.Button("＋ 新建对话")
+│   │   ├── gr.Accordion("新建对话", 默认隐藏)
+│   │   │   ├── gr.Textbox (对话标题输入)
+│   │   │   └── gr.Button ("创建" / "取消")
+│   │   ├── gr.Textbox (项目目录路径)
+│   │   ├── gr.Button ("保存目录")
+│   │   └── gr.File (上传研究区域 GeoJSON/Shapefile)
+│   ├── gr.Column (对话面板, 45%)
+│   │   ├── gr.Markdown (当前对话标题 + 当前模型展示名称)
+│   │   ├── gr.Chatbot (气泡对话，用户/AI 分左右)
+│   │   │   └── AI 气泡内含 <details> 可折叠思考链
+│   │   ├── gr.Textbox (输入框，placeholder 显示当前模型)
+│   │   └── gr.Row (上传研究区 / 选择目录 / 清空对话)
+│   └── gr.Column (工作面板, 30%)
+│       ├── gr.Tabs
+│       │   ├── Tab: 🔑 API 设置 (OpenAI/Anthropic 双格式)
+│       │   ├── Tab: ⚙️ 参数设置 (机器学习方法 + 超参数)
+│       │   ├── Tab: 🌍 地图浏览 (folium 多图层)
+│       │   ├── Tab: 精度评估 (指标表格)
+│       │   ├── Tab: 实验对比 (Benchmark 图表)
+│       │   └── Tab: 工作流进度 (7 步状态表)
+└── gr.Row (状态栏)
 ```
 
 #### 侧边栏：动态项目管理
 
-完全动态的项目管理模式（`Sidebar.vue` + `stores/project.js`）：
+移除预置示例项目，改为完全动态的项目管理模式：
 
-- **新建项目**：点击「＋ 新建项目」弹出页面内弹窗，输入项目名称与保存路径后创建，项目以卡片形式加入列表（后端 `POST /api/projects`）
-- **选择项目**：点击项目卡片切换；项目卡片可展开/收起，名称点击后行内重命名（`POST /api/projects/{pid}/rename`）
-- **对话管理**：项目卡片内展示对话列表（Codex 式层级）；点击切换对话，`＋` 新建对话，✕ 删除（删除均用页面内弹窗确认，不使用浏览器原生 confirm）
-- **项目目录**：新建项目时填写，或 `POST /api/project/{pid}/dir` 持久化到 `data/conversations/_projects.json`
-- **研究区域**：`POST /api/study-area` 上传 GeoJSON/Shapefile（Shapefile 自动转为 GeoJSON），Agent 执行时强制以研究区文件为 region
-- **初始状态**：项目列表为空时提示"还没有项目，点击上方「新建项目」开始"
+- **新建项目**：点击按钮展开隐藏输入区，输入项目名称后创建，项目添加到下拉列表
+- **选择项目**：`gr.Dropdown` 动态填充已创建的项目列表
+- **对话管理**：选中项目后，`gr.Radio` 显示该项目的对话列表；支持新建对话
+- **项目目录**：`gr.Textbox` 输入路径，"保存目录"按钮持久化到项目状态
+- **研究区域**：`gr.File` 上传 GeoJSON/Shapefile 文件
+- **初始状态**：项目列表为空，对话列表为空，提示用户"请先新建项目"
 
 #### 对话区：气泡 + 可折叠思考链
 
-- **气泡形式**：`ChatMessages.vue` 将用户消息置右、AI 消息置左，形成分侧气泡，Markdown 由 `MarkdownRender.vue`（marked）渲染
-- **思考链分离**：后端 `server.py::format_bubble()` 将 AI 思考过程用 `<details><summary>💭 已深度思考（Xs）</summary>…</details>` 置于气泡正文上方，默认折叠、点击展开（DeepSeek 风格）
-- **思考链来源**：Agent 执行过程的逐步表达（`Step i/N`、阶段描述、异常提示、自动调参说明）即思考链，由 `on_token` 回调累积推送到气泡
-- **历史净化**：后端 `strip_thinking()` 用正则剥离 `<details>` 块，避免思考链重复进入上下文
+- **气泡形式**：`gr.Chatbot` 默认将用户消息置右、AI 消息置左，形成分侧气泡
+- **思考链分离**：AI 的思考过程不混入正文，而是用 `<details><summary>💭 已深度思考（Xs）</summary>…</details>` 置于气泡正文上方，默认折叠、点击展开（DeepSeek 风格）
+- **思考链来源**：优先取流式响应中的 `reasoning_content`（DeepSeek 等模型真实思考）；若无则展示模拟思考过程
+- **历史净化**：回传 API 时用正则剥离 `<details>` 块，避免思考链重复进入上下文
 
 #### API 设置面板（OpenAI / Anthropic 双格式）
 
-工作面板「API设置」Tab（`ApiSettings.vue`，对应 `POST /api/settings`），字段清单如下：
+参考旧版“工作面板-LLM API设置”，字段清单如下：
 
-| 字段          | 组件                   | 说明                                                            |
-| ----------- | -------------------- | ------------------------------------------------------------- |
-| API 格式      | select               | OpenAI Chat Completions / Anthropic Messages，切换时联动 URL 提示与占位符 |
-| 自定义请求地址     | input                | OpenAI 补 `/chat/completions`；Anthropic 补 `/v1/messages`       |
-| 模型 ID \*    | input                | 必填                                                            |
-| API 密钥 \*   | input(type=password) | 必填，不明文展示                                                      |
-| 模型展示名称      | input（高级配置折叠区）       | 默认等于模型 ID，允许修改                                                |
-| 上下文窗口-输入/输出 | number ×2（高级配置折叠区）   | 默认 128000 / 16000                                             |
+| 字段 | 组件 | 说明 |
+|---|---|---|
+| API 格式 | `gr.Dropdown` | OpenAI Chat Completions / Anthropic Messages，切换时联动 URL 提示与占位符 |
+| 自定义请求地址 | `gr.Textbox` | OpenAI 补 `/chat/completions`；Anthropic 补 `/v1/messages` |
+| 模型 ID * | `gr.Textbox` | 必填 |
+| API 密钥 * | `gr.Textbox(password)` | 必填，不明文展示 |
+| 模型展示名称 | `gr.Textbox` | 默认等于模型 ID，允许修改 |
+| 上下文窗口-输入/输出 | `gr.Number` ×2 | **不设默认值**，留空由用户填写 |
 
 **明确不设计的功能**：模型提供商预设列表、工具调用轮次配置、多模态开关。
 
-**实时显示模型名**：保存后对话区顶栏显示绿色标签「🟢 {展示名称}」，未配置时显示「⚪ 未配置模型」。
+**实时显示模型名**：保存后在对话区输入框上方与 placeholder 中同步显示“当前模型：{展示名称}”。
 
-**真实流式调用**：保存后（`POST /api/settings` 热更新后端 `GeoThermoAI_Assistant`），发送消息即真实调用 LLM：
-
+**真实流式调用**：填写 Base URL / API Key / 模型 ID 并保存后，发送消息即真实调用 LLM：
 - OpenAI 格式：`POST {base}/chat/completions`，`Authorization: Bearer <key>`，SSE 流式
 - Anthropic 格式：`POST {base}/v1/messages`，`x-api-key: <key>` + `anthropic-version`，system 单独传递，SSE 流式
 
 #### 参数设置（机器学习方法 + 超参数）
 
-工作面板「参数」Tab（`ModelParams.vue`），保存到 `config/settings.json` 的 `model` 段，Agent 在 `rf_model` 步骤执行前自动注入：
+独立 Tab 用于选择模型方法与调整超参数：
 
-| 字段                  | 组件              | 说明                                |
-| ------------------- | --------------- | --------------------------------- |
-| 机器学习方法              | 只读输入框           | 当前固定为 Random Forest（多模型见 3.2 待实现） |
-| n\_estimators       | range (50–1000) | 决策树数量，默认 200                      |
-| max\_depth          | range (5–50)    | 最大深度，默认 25                        |
-| min\_samples\_split | range (2–50)    | 最小分裂样本数，默认 16                     |
-| min\_samples\_leaf  | range (1–20)    | 叶节点最小样本数，默认 8                     |
+| 字段 | 组件 | 说明 |
+|---|---|---|
+| 机器学习方法 | `gr.Dropdown` | Random Forest / XGBoost / LightGBM / CatBoost / Extra Trees |
+| n_estimators | `gr.Slider` (50–1000) | 决策树数量，默认 200 |
+| max_depth | `gr.Slider` (5–50) | 最大深度，默认 25 |
+| min_samples_split | `gr.Slider` (2–50) | 最小分裂样本数，默认 10 |
+| min_samples_leaf | `gr.Slider` (1–20) | 叶节点最小样本数，默认 5 |
 
-**后端开发注意事项**（待 3.2 实现时生效）：
-
-- 当用户只使用一种机器学习方法时，"实验对比" 面板只展示该方法的结果（不显示多模型对比图表）
+**后端开发注意事项**：
+- 当用户只使用一种机器学习方法时，"实验对比" Tab 只展示该方法的结果（不显示多模型对比图表）
 - 后端 `BenchmarkSkill` 应根据 `model_train_predict` 组中实际注册的 Skill 数量动态调整输出格式
 - 单模型时输出标准指标表（R²/RMSE/MAE/特征重要性）；多模型时输出对比柱状图 + 表格
 
-#### 系统依赖（Docker 基础镜像，已完成）
+#### 需要处理的系统依赖（`packages.txt`）
 
-不再需要 `packages.txt`：`Dockerfile` 直接使用 OSGeo 官方 GDAL 镜像
-`ghcr.io/osgeo/gdal:ubuntu-small-3.9.3`（Ubuntu 24.04 + Python 3.12，GDAL/PROJ 及 osgeo 绑定已预装），
-`requirements.txt` 锁定 `numpy<2`（镜像 osgeo 按 apt numpy 1.x 编译）。
+```text
+gdal-bin
+libgdal-dev
+libproj-dev
+```
 
-#### 涉及的文件（当前实现）
+#### 需要修改的文件
 
-| 文件                      | 作用                    | 说明                                          |
-| ----------------------- | --------------------- | ------------------------------------------- |
-| `server.py`             | FastAPI 后端（替代 Gradio） | REST + SSE 接口、`AppBackend` 业务层、Vue 产物静态托管   |
-| `frontend/`             | Vue 3 前端源码            | `npm run build` 产出 `dist/`，由 server.py 静态托管 |
-| `core/visualization.py` | 地图可视化                 | `LayerVisualizer` 瓦片渲染 + folium 兼容          |
-| `core/manifest.py`      | 工作流状态清单               | `run_manifest.json` 与前端进度表交叉核对              |
-| `config/settings.json`  | 运行时配置                 | API Key 留空，由前端「API设置」面板运行时填写并持久化            |
+| 文件 | 改动 | 难度 |
+|---|---|---|
+| `main.py` | 替换 `webview.create_window` → `gr.Blocks().launch()` | 高 |
+| `ui/api.py` | 保留核心逻辑，适配 Gradio 事件 | 中 |
+| `ui/index.html` | 废弃，功能由 Gradio 组件替代 | — |
+| `ui/scripts/`, `ui/styles/` | 废弃 | — |
+| `config/settings.json` | 移除硬编码的 API Key | 低 |
 
-***
+---
 
-### 3.2 \[P0] Benchmark 对比系统
+### 3.2 [P0] Benchmark 对比系统
 
 **目标**：将 `model_train_predict` 组从单一 `rf_model` 扩展到多模型，增加 Benchmark Skill 做横向对比。
 
 #### 新增模型 Skill
 
-| Skill 名称            | 依赖                 | 说明                         |
-| ------------------- | ------------------ | -------------------------- |
-| `xgboost_model`     | `xgboost`          | 梯度提升标杆，复杂地形通常优于 RF         |
-| `lightgbm_model`    | `lightgbm`         | 速度快，适合大样本场景                |
-| `catboost_model`    | `catboost`         | 默认参数最鲁棒，不调参也表现稳定，适合中小数据集   |
+| Skill 名称 | 依赖 | 说明 |
+|---|---|---|
+| `xgboost_model` | `xgboost` | 梯度提升标杆，复杂地形通常优于 RF |
+| `lightgbm_model` | `lightgbm` | 速度快，适合大样本场景 |
+| `catboost_model` | `catboost` | 默认参数最鲁棒，不调参也表现稳定，适合中小数据集 |
 | `extra_trees_model` | `sklearn.ensemble` | 零额外依赖，RF 极端随机化变体，方差更低、训练更快 |
 
 #### Benchmark Skill
@@ -300,21 +299,20 @@ class BenchmarkSkill(BaseSkill):
 
 `rf_model.py`、`ttri.py`、`tcr.py`、`lst_final.py`、`export_geotiff.py`、`evaluation.py` 等**均无需修改**。
 
-***
+---
 
-### 3.3 \[P0] 记忆系统（RAG + 结构化混合存储）
+### 3.3 [P0] 记忆系统（RAG + 结构化混合存储）
 
 #### 为什么需要两种存储？
 
-| 场景             | 需要    | 用谁       | 原因                     |
-| -------------- | ----- | -------- | ---------------------- |
-| "查武汉上次RF的R²"   | 精确数值  | **JSON** | 精确查询，不需要理解语义           |
-| "上次武汉为什么效果不好？" | 上下文理解 | **RAG**  | 需要搜索含"云量高""样本不足"等描述的记录 |
-| "TTRI 公式是什么？"  | 领域知识  | **RAG**  | 非结构化知识，关键词难覆盖          |
-| "用户偏好的云量阈值"    | 简单键值  | **JSON** | 读写各一次，没必要向量化           |
+| 场景 | 需要 | 用谁 | 原因 |
+|---|---|---|---|
+| "查武汉上次RF的R²" | 精确数值 | **JSON** | 精确查询，不需要理解语义 |
+| "上次武汉为什么效果不好？" | 上下文理解 | **RAG** | 需要搜索含"云量高""样本不足"等描述的记录 |
+| "TTRI 公式是什么？" | 领域知识 | **RAG** | 非结构化知识，关键词难覆盖 |
+| "用户偏好的云量阈值" | 简单键值 | **JSON** | 读写各一次，没必要向量化 |
 
 **核心原则**：
-
 - 能精确匹配的 → JSON（快、稳、易调试）
 - 需要理解语义的 → RAG（灵活、能模糊匹配）
 - 两者互补，而不是互相替代
@@ -383,25 +381,25 @@ class BenchmarkSkill(BaseSkill):
 
 #### 组件关系说明
 
-| 概念                     | 本质                              | 类比               |
-| ---------------------- | ------------------------------- | ---------------- |
-| **ChromaDB**           | 一个向量数据库软件（类似 SQLite）            | 数据库管理系统          |
-| **Collection**         | ChromaDB 里的一张"表"                | 数据表              |
-| **`global_knowledge`** | 一个 Collection，存全局共享知识           | 共享词典             |
-| **`project_{id}`**     | 一个 Collection，每个项目独立一个          | 项目笔记本            |
-| **JSON 文件**            | 文件系统上的文本文件                      | Excel表格 + Word文档 |
-| **RAG**                | 一个流程：存 → 转向量 → 语义搜索 → 注入 prompt | 查询方法             |
+| 概念 | 本质 | 类比 |
+|---|---|---|
+| **ChromaDB** | 一个向量数据库软件（类似 SQLite） | 数据库管理系统 |
+| **Collection** | ChromaDB 里的一张"表" | 数据表 |
+| **`global_knowledge`** | 一个 Collection，存全局共享知识 | 共享词典 |
+| **`project_{id}`** | 一个 Collection，每个项目独立一个 | 项目笔记本 |
+| **JSON 文件** | 文件系统上的文本文件 | Excel表格 + Word文档 |
+| **RAG** | 一个流程：存 → 转向量 → 语义搜索 → 注入 prompt | 查询方法 |
 
 #### 每类数据存在哪里、怎么查
 
-| 数据类别                     | 存储介质     | 具体位置                                         | 查询方式                  | 共享范围       |
-| ------------------------ | -------- | -------------------------------------------- | --------------------- | ---------- |
-| **对话消息**                 | JSON 文件  | `data/projects/{项目}/conversations/{对话}.json` | 按 conv\_id 精确加载       | 该对话内       |
-| **实验记录**（结构化：R²、参数等）     | JSON 文件  | `data/projects/{项目}/memory/experiments.json` | 精确排序/过滤（`get_best()`） | 项目内共享      |
-| **用户偏好**（键值对）            | JSON 文件  | `data/projects/{项目}/memory/preferences.json` | 按 key 精确读取            | 项目内共享      |
-| **领域通识**（Landsat参数、遥感原理） | ChromaDB | `global_knowledge` Collection                | RAG 语义检索              | **所有项目共享** |
-| **算法专识**（TTRI公式、TCR机制）   | ChromaDB | `global_knowledge` Collection                | RAG 语义检索              | **所有项目共享** |
-| **项目经验**（描述性：什么参数效果好）    | ChromaDB | `project_{项目id}` Collection                  | RAG 语义检索              | 项目内隔离      |
+| 数据类别 | 存储介质 | 具体位置 | 查询方式 | 共享范围 |
+|---|---|---|---|---|
+| **对话消息** | JSON 文件 | `data/projects/{项目}/conversations/{对话}.json` | 按 conv_id 精确加载 | 该对话内 |
+| **实验记录**（结构化：R²、参数等） | JSON 文件 | `data/projects/{项目}/memory/experiments.json` | 精确排序/过滤（`get_best()`） | 项目内共享 |
+| **用户偏好**（键值对） | JSON 文件 | `data/projects/{项目}/memory/preferences.json` | 按 key 精确读取 | 项目内共享 |
+| **领域通识**（Landsat参数、遥感原理） | ChromaDB | `global_knowledge` Collection | RAG 语义检索 | **所有项目共享** |
+| **算法专识**（TTRI公式、TCR机制） | ChromaDB | `global_knowledge` Collection | RAG 语义检索 | **所有项目共享** |
+| **项目经验**（描述性：什么参数效果好） | ChromaDB | `project_{项目id}` Collection | RAG 语义检索 | 项目内隔离 |
 
 #### 层级关系一句话
 
@@ -435,16 +433,16 @@ LLM 自行选择使用哪些信息
 
 #### 这样设计的好处
 
-| 问题        | 后果                  |
-| --------- | ------------------- |
-| RAG 没查到？  | JSON 可能查到了，兜底       |
-| JSON 没查到？ | RAG 可能查到了，兜底        |
-| 两边数据矛盾？   | LLM 自己能发现并处理        |
-| 以后加新存储？   | Agent 代码不用改，再加一条路就行 |
+| 问题 | 后果 |
+|---|---|
+| RAG 没查到？ | JSON 可能查到了，兜底 |
+| JSON 没查到？ | RAG 可能查到了，兜底 |
+| 两边数据矛盾？ | LLM 自己能发现并处理 |
+| 以后加新存储？ | Agent 代码不用改，再加一条路就行 |
 
 **不需要在 Agent 代码中写任何 if/else 路由逻辑。**
 
-#### 实现：\_enrich\_with\_memory()
+#### 实现：_enrich_with_memory()
 
 #### RAG 的完整数据流
 
@@ -795,9 +793,9 @@ class GeoThermoAgent:
 
 ##### 删除类型与清理范围
 
-| 删除操作       | 需要清理的内容                                |
-| ---------- | -------------------------------------- |
-| **删除单条对话** | 对话 JSON 文件 + 对话在 RAG 中的相关记录            |
+| 删除操作 | 需要清理的内容 |
+|---|---|
+| **删除单条对话** | 对话 JSON 文件 + 对话在 RAG 中的相关记录 |
 | **删除整个项目** | 项目目录（对话 + JSON 记忆）+ 项目的 RAG Collection |
 
 ##### 实现
@@ -890,13 +888,12 @@ Agent："⚠️ 确认删除项目「武汉_2024」？
 Agent："✅ 项目已永久删除"
 ```
 
-##### API 层实现（FastAPI 前后端对接）
+##### API 层实现（Gradio 前后端对接）
 
 ```python
-# server.py
-class AppBackend:
-    # 记忆级联删除为待实现项（3.3）；当前已有基础的 delete_conversation / delete_project（无 RAG 级联）
-
+# ui/api.py
+class GeoThermoAPI:
+    
     def delete_conversation(self, conv_id: str) -> dict:
         """前端调用的删除对话接口"""
         project_id = self._get_current_project_id()
@@ -948,9 +945,9 @@ chromadb>=0.5.0
 sentence-transformers>=2.2.0
 ```
 
-***
+---
 
-### 3.4 \[P1] 并发下载优化
+### 3.4 [P1] 并发下载优化
 
 当前 5 个下载任务串行执行，改为并发执行。
 
@@ -978,17 +975,15 @@ def _download_all(self, ...):
 
 - 联合云掩膜（`_landsat_qa_mask(qa) & _sentinel_scl_mask(scl)`）决定了预处理仍需等全部文件就绪
 - 瓶颈在 IO（网络下载），不在 CPU
-- 预估收益：下载时间节省 40\~60%
+- 预估收益：下载时间节省 40~60%
 
 #### 改动位置
 
 只改 `core/skills/builtin/data_acquisition.py` 中的 `execute()`，约 50 行。
 
-***
+---
 
-### 3.5 \[P1] Agent 表达层改进："更像Agent"
-
-> **现状（已实现部分）**：思考链表达已落地于 `core/agent/geo_thermo_agent.py`——`_execute_plan` 通过 `_emit` 输出 `Step i/N`、阶段说明、异常警告与自动调参过程，经 `on_token` 推送到气泡；`_check_exceptions` 实现异常检测与建议。下文 3.5.3\~3.5.5 的角色切换 / LLM 结果解读 / 下一步建议仍为待实现计划。
+### 3.5 [P1] Agent 表达层改进："更像Agent"
 
 #### 3.5.1 执行中的"思考链"
 
@@ -1136,11 +1131,11 @@ def _get_phase_prompt(self, phase: str) -> str:
 
 #### 改动量
 
-主要在 `core/agent/geo_thermo_agent.py`，新增 \~250 行，不涉及其他文件。
+主要在 `core/agent/geo_thermo_agent.py`，新增 ~250 行，不涉及其他文件。
 
-***
+---
 
-### 3.6 \[P1] LLM主导+规则兜底的超参数寻优
+### 3.6 [P1] LLM主导+规则兜底的超参数寻优
 
 替换简单规则驱动，改为 LLM 分析数据特征后决策 + 7条规则兜底。
 
@@ -1382,139 +1377,315 @@ def _execute_training_with_tuning(self, skill, step, data_features, on_token):
 
 ---
 
-### 3.7 [P1] 交互式地图可视化（多图层 + GEE 风格图层控制）（✅ 已实现）
+### 3.7 [P1] 交互式地图可视化（多图层 + GEE 风格图层控制）
 
-已实现：`core/visualization.py` 的 `LayerVisualizer` 负责 GeoTIFF 渲染（瓦片金字塔 + PNG 两种方式），
-前端 `panels/MapView.vue` 用 Leaflet 叠加渲染，并像 GEE 一样勾选/取消勾选、调不透明度、切换底图。
+当前 LST 结果以静态 JPEG 缩略图展示。升级为**多图层交互式地图**，所有中间产物都可像 GEE 一样勾选/取消勾选。
 
 #### 可视化数据源
 
-| 图层 | 文件 | 色带 | 说明 |
-|---|---|---|---|
-| 30m LST | `raw/landsat_lst.tif` | RdYlBu_r | Landsat 原始地表温度 |
-| Sentinel-2 RGB | `raw/sentinel2_bands.tif`（波段 4,3,2） | 真彩色合成（2%~98% 分位数拉伸） | 10m 自然色图像 |
-| DEM | `raw/dem.tif` | terrain | 数字高程模型 |
-| **10m LST** | `results/rf_10m_lst_final.tif` | RdYlBu_r | 降尺度后的 10m 地表温度 |
-
-> 注：v3.2 起已移除 NDVI / NDWI / NDBI 遥感指数图层（地图不再展示指数），图层按「数据获取 / 结果」分组。
+| 阶段 | 图层 | 文件 | 色带 | 说明 |
+|---|---|---|---|---|
+| 下载 | Landsat LST | `raw/landsat_lst.tif` | RdYlBu_r | 30m 原始地表温度 |
+| 下载 | Sentinel-2 真彩色 | `raw/sentinel2_bands.tif` (B4,B3,B2) | 真彩色合成 | 10m 自然色图像 |
+| 下载 | Sentinel-2 NIR | `raw/sentinel2_bands.tif` (B8) | 灰度 | 近红外波段 |
+| 下载 | Sentinel-2 SWIR1 | `raw/sentinel2_bands.tif` (B11) | 灰度 | 短波红外 |
+| 下载 | DEM | `raw/dem.tif` | terrain | 数字高程模型 |
+| 预处理 | NDVI | 计算自 Sentinel | RdYlGn | 植被指数 (绿=高, 红=低) |
+| 预处理 | NDWI | 计算自 Sentinel | Blues | 水体指数 (蓝=水) |
+| 预处理 | NDBI | 计算自 Sentinel | RdYlBu_r | 建成区指数 (红=建成区) |
+| 最终 | **LST 10m 结果** | `results/rf_10m_lst_final.tif` | RdYlBu_r | 降尺度后的10m地表温度 |
 
 #### 坐标转换说明
 
-所有 GeoTIFF 都是 **UTM 投影**（由 `data_acquisition` 根据研究区中心经度计算），前端 Leaflet 地图使用 **WGS84 经纬度**。叠加前必须转换。
+所有 GeoTIFF 都是 **UTM 投影**（由 `data_acquisition` 根据研究区中心经度计算），Folium 地图使用 **WGS84 经纬度**。叠加前必须转换。
 
 ```
-
-GeoTIFF (UTM, EPSG:326XX) ──→ rasterio.warp.transform() ──→ Leaflet (WGS84, EPSG:4326)
-每个图层独立转换              转为WGS84经纬度                   叠加为 L.tileLayer 瓦片
-
+GeoTIFF (UTM, EPSG:326XX) ──→ rasterio.warp.transform() ──→ Folium (WGS84, EPSG:4326)
+  每个图层独立转换              转为WGS84经纬度                   叠加为 ImageOverlay
 ```
 
-#### GEE 风格图层控制器（前端 Leaflet 实现）
-
-`MapView.vue` 左上角的图层控制面板，每个图层可独立勾选/调不透明度（0–100%），并可切换底图：
+#### GEE 风格图层控制器
 
 ```
-
 ┌──────────────────────────────────────┐
-│  图层控制                             │
-│  数据获取                             │
-│  ☑ 30m LST              ▆▆ 70%      │  ← 每个图层可独立
-│  ☑ Sentinel-2 RGB       ▆▆ 80%      │     勾选/不透明度
-│  ☑ DEM                  ▆▆ 60%      │
-│  结果                                 │
-│  ☑ 10m LST              ▆▆ 70%      │
-│  底图切换：街道地图 / 卫星影像 / Esri │
+│  🌍 图层管理器           ───  ✕     │
+│                                      │
+│  ☑ 底图: OpenStreetMap               │
+│  ○ 底图: 卫星影像                     │
+│  ─────────────────────────            │
+│  ☑ LST 10m 结果         ▆▆ 70%      │
+│  ☐ NDVI                 ▆▆ 50%      │  ← 每个图层可独立
+│  ☑ NDWI                 ▆▆ 50%      │     勾选/不透明度
+│  ☐ NDBI                 ▆▆ 50%      │
+│  ☑ Sentinel-2 真彩色    ▆▆ 100%     │
+│  ☐ DEM 地形                       │
+│  ☐ Landsat LST 30m      ▆▆ 70%      │
+│  ─────────────────────────            │
+│  [+] 添加自定义图层                   │
 └──────────────────────────────────────┘
 ```
 
-图层渲染由后端按 Web Mercator 瓦片输出（`GET /api/layer/{id}/tile/{z}/{x}/{y}`），前端 Leaflet `L.tileLayer` 叠加；
-后端对瓦片渲染做信号量并发限制（`_TILE_RENDER_SEM`）并缓存 PNG，避免大 GeoTIFF（如 1.95GB Sentinel）的瓦片渲染风暴。
-
-#### 核心实现（实际接口）
+#### 核心实现
 
 ```python
-# core/visualization.py —— 实际已实现的核心接口
+# core/visualization.py
+import os
+import json
+from typing import List, Dict
+import folium
+from folium.raster_layers import ImageOverlay
+import rasterio
+from rasterio.warp import transform
+import numpy as np
+from matplotlib import cm
+
+
 class LayerVisualizer:
-    # 图层定义（见上表）：30m LST / Sentinel-2 RGB / DEM / 10m LST
+    """管理所有可用于 Folium 地图的数据图层"""
+    
+    # 图层定义：名称、文件、色带、不透明度、顺序
     LAYER_DEFS = [
-        {"id": "landsat_lst", "label": "30m LST", "file": "raw/landsat_lst.tif", "band": 1, "colormap": "RdYlBu_r", "opacity": 0.7, "visible": True},
-        {"id": "sentinel_rgb", "label": "Sentinel-2 RGB", "file": "raw/sentinel2_bands.tif", "bands": [3, 2, 1], "opacity": 0.8, "visible": True},
-        {"id": "dem", "label": "DEM", "file": "raw/dem.tif", "band": 1, "colormap": "terrain", "opacity": 0.6, "visible": True},
-        {"id": "lst_10m", "label": "10m LST", "file": "results/rf_10m_lst_final.tif", "band": 1, "colormap": "RdYlBu_r", "opacity": 0.7, "visible": True},
+        {
+            "id": "landsat_lst",
+            "label": "Landsat LST 30m",
+            "file": "raw/landsat_lst.tif",
+            "band": 1,
+            "colormap": "RdYlBu_r",
+            "opacity": 0.7,
+            "group": "raw",
+            "visible": False,  # 默认隐藏
+        },
+        {
+            "id": "sentinel_rgb",
+            "label": "Sentinel-2 真彩色",
+            "file": "raw/sentinel2_bands.tif",
+            "bands": [4, 3, 2],  # R,G,B 多波段
+            "opacity": 0.8,
+            "group": "raw",
+            "visible": False,
+        },
+        {
+            "id": "dem",
+            "label": "DEM 地形",
+            "file": "raw/dem.tif",
+            "band": 1,
+            "colormap": "terrain",
+            "opacity": 0.6,
+            "group": "raw",
+            "visible": False,
+        },
+        {
+            "id": "ndvi",
+            "label": "NDVI 植被指数",
+            "file": None,  # 实时计算
+            "colormap": "RdYlGn",
+            "opacity": 0.5,
+            "group": "indices",
+            "visible": False,
+        },
+        {
+            "id": "lst_10m",
+            "label": "🌟 LST 10m 结果",
+            "file": "results/rf_10m_lst_final.tif",
+            "band": 1,
+            "colormap": "RdYlBu_r",
+            "opacity": 0.7,
+            "group": "result",
+            "visible": True,  # 默认显示
+        },
     ]
-
+    
     @staticmethod
-    def list_available_layers(project_dir) -> list:
-        """列出图层：可用性、透明度、可见性、WGS84 边界、原生缩放级别"""
-
+    def _read_band(tif_path: str, band: int = 1, colormap: str = None):
+        """读取单个波段，返回颜色渲染后的 RGBA 数组 + WGS84 边界"""
+        with rasterio.open(tif_path) as src:
+            arr = src.read(band).astype(np.float32)
+            nodata = src.nodata
+            if nodata is not None:
+                arr = np.where(arr == nodata, np.nan, arr)
+            
+            left, bottom, right, top = src.bounds
+            src_crs = src.crs
+            lons, lats = transform(src_crs, 'EPSG:4326',
+                                   [left, right, right, left],
+                                   [bottom, bottom, top, top])
+            bounds_wgs84 = [[float(min(lats)), float(min(lons))],
+                            [float(max(lats)), float(max(lons))]]
+        
+        valid = arr[~np.isnan(arr)]
+        if valid.size == 0:
+            return None, bounds_wgs84
+        
+        vmin, vmax = float(np.nanmin(valid)), float(np.nanmax(valid))
+        normed = np.clip((arr - vmin) / (vmax - vmin + 1e-10), 0, 1)
+        
+        if colormap:
+            cmap = getattr(cm, colormap)
+            colored = (cmap(normed)[:, :, :3] * 255).astype(np.uint8)
+            return colored, bounds_wgs84
+        return normed, bounds_wgs84
+    
     @staticmethod
-    def render_layer_png(layer_id, project_dir) -> tuple | None:
-        """渲染单图层为 PNG 字节 + WGS84 边界（兼容 folium/iframe）"""
-
-    @staticmethod
-    def render_layer_tile(layer_id, project_dir, z, x, y) -> bytes | None:
-        """渲染单个 Web Mercator 瓦片 PNG；无数据返回 None（前端视为透明）"""
-
-    @staticmethod
-    def build_map(project_dir) -> str:
-        """生成 Folium 地图 HTML（保留给 iframe 兼容路径）"""
+    def _read_rgb(tif_path: str, bands: List[int], scale_factor: float = 1/10000):
+        """读取多波段生成 RGB 真彩色"""
+        with rasterio.open(tif_path) as src:
+            rgb = []
+            for b in bands:
+                arr = src.read(b).astype(np.float32) * scale_factor
+                arr = np.clip(arr, 0, 1)
+                rgb.append(arr)
+            
+            left, bottom, right, top = src.bounds
+            src_crs = src.crs
+            lons, lats = transform(src_crs, 'EPSG:4326',
+                                   [left, right, right, left],
+                                   [bottom, bottom, top, top])
+            bounds_wgs84 = [[float(min(lats)), float(min(lons))],
+                            [float(max(lats)), float(max(lons))]]
+        
+        colored = (np.stack(rgb, axis=-1) * 255).astype(np.uint8)
+        return colored, bounds_wgs84
+    
+    def build_map(self, project_dir: str) -> str:
+        """生成包含所有可用图层的 Folium 地图 HTML"""
+        m = folium.Map(control_scale=True)
+        first_layer = True
+        
+        for layer_def in self.LAYER_DEFS:
+            file_path = os.path.join(project_dir, layer_def["file"])
+            if not os.path.isfile(file_path):
+                continue  # 文件不存在时跳过该图层
+            
+            try:
+                if "bands" in layer_def:
+                    # 多波段 RGB
+                    img, bounds = self._read_rgb(
+                        file_path, layer_def["bands"])
+                else:
+                    # 单波段 + 色带
+                    img, bounds = self._read_band(
+                        file_path, layer_def.get("band", 1),
+                        layer_def.get("colormap"))
+                
+                if img is None:
+                    continue
+                
+                if first_layer:
+                    # 用第一层的中心设置地图初始位置
+                    center_lat = (bounds[0][0] + bounds[1][0]) / 2
+                    center_lon = (bounds[0][1] + bounds[1][1]) / 2
+                    m.location = [center_lat, center_lon]
+                    first_layer = False
+                
+                ImageOverlay(
+                    image=img,
+                    bounds=bounds,
+                    opacity=layer_def["opacity"],
+                    name=layer_def["label"],
+                    show=layer_def.get("visible", True),
+                ).add_to(m)
+            except Exception:
+                continue  # 加载失败的图层静默跳过
+        
+        # 添加底图选项
+        folium.TileLayer('OpenStreetMap', name='街道地图').add_to(m)
+        folium.TileLayer(
+            'https://server.arcgisonline.com/ArcGIS/rest/services/'
+            'World_Imagery/MapServer/tile/{z}/{y}/{x}',
+            attr='Esri', name='卫星影像'
+        ).add_to(m)
+        
+        # GEE 风格图层控制器
+        folium.LayerControl(collapsed=False).add_to(m)
+        
+        return m._repr_html_()
 ```
 
-#### 与 Agent 的集成（后端 API + 前端自动刷新）
+#### 与 Agent 的集成
 
-`server.py` 的 `AppBackend` 提供地图相关接口，前端 `MapView.vue` 在切换对话 / 项目目录变化时自动刷新图层：
+每完成一个步骤，动态添加新图层到地图（而不是等全部完成再生成）：
 
 ```python
-# server.py 中
-class AppBackend:
-    def build_map_html(self, cid) -> str                    # Folium 地图 HTML（iframe 兼容）
-    def list_layers(self, cid) -> list                      # 当前项目可用图层列表
-    def render_layer_png(self, layer_id, cid)               # 单图层 PNG + WGS84 边界
-    def render_layer_tile(self, layer_id, cid, z, x, y)     # Web Mercator 瓦片
+# 在 Agent 执行完成后，动态更新可视化面板
+# api.py 中
+class GeoThermoAPI:
+    def get_map_layers(self, conv_id: str) -> dict:
+        """获取当前项目可用的所有图层信息"""
+        state = self._get_conv_state(conv_id)
+        project_dir = state["project_dir"]
+        if not project_dir:
+            return {"layers": []}
+        
+        visualizer = LayerVisualizer()
+        available = []
+        for layer_def in visualizer.LAYER_DEFS:
+            file_path = os.path.join(project_dir, layer_def["file"])
+            available.append({
+                "id": layer_def["id"],
+                "label": layer_def["label"],
+                "visible": layer_def.get("visible", False),
+                "available": os.path.isfile(file_path),
+            })
+        return {"layers": available}
+    
+    def get_lst_map(self, conv_id: str) -> str:
+        """生成完整的 Folium 地图 HTML"""
+        state = self._get_conv_state(conv_id)
+        if not state["project_dir"]:
+            return "<p>请先选择项目目录</p>"
+        visualizer = LayerVisualizer()
+        return visualizer.build_map(state["project_dir"])
 ```
-
-前端接口：`GET /api/layers?conv=...`、`GET /api/layer/{id}/png?conv=...`、`GET /api/layer/{id}/tile/{z}/{x}/{y}?conv=...`、`GET /api/map/html?conv=...`。
 
 #### 用户视角的体验
 
 ```
-Agent 执行过程中，地图面板手动点击「刷新」即可看到新图层（切换对话/项目目录也会自动刷新）：
+Agent 执行过程中，可视化面板实时更新：
 
 [1/7] data_acquisition 完成
-  → 地图上新增图层：30m LST、Sentinel-2 RGB、DEM
+  → 地图上新增图层：Landsat LST、Sentinel-2、DEM（默认隐藏）
   → 用户可手动勾选查看
 
+[2/7] data_pipeline 完成  
+  → 地图上新增图层：NDVI、NDWI、NDBI（默认隐藏）
+  → 用户查看植被分布，确认数据质量
+
 [7/7] accuracy_eval 完成
-  → 地图上新增图层：10m LST 结果
-  → 用户可叠加 30m LST 与 10m LST 对比降尺度效果
+  → 地图上新增图层：LST 10m 结果（默认显示）
+  → 用户可叠加 NDVI 和 LST 对比分析
 ```
 
 #### 新依赖
 
-- 后端：`folium>=0.16`（已有，iframe 兼容路径使用）
-- 前端（`frontend/package.json`）：`leaflet ^1.9.4`（已有）
+`folium>=0.16.0` （已有，不变）
 
 #### 改动量
 
-| 文件 | 改动 | 状态 |
+| 文件 | 改动 | 行数 |
 |---|---|---|
-| `core/visualization.py` | `LayerVisualizer`（瓦片渲染 + folium 兼容） | ✅ 已实现 |
-| `server.py` | `build_map_html` / `list_layers` / `render_layer_png` / `render_layer_tile` | ✅ 已实现 |
-| `frontend/src/components/panels/MapView.vue` | Leaflet 多图层叠加 + 图层控制面板 | ✅ 已实现 |
+| 新建 `core/visualization.py` | `LayerVisualizer` 类 | ~200 |
+| 改 `ui/api.py` | 新增 `get_map_layers()`、`get_lst_map()` | ~30 |
 
-***
+---
 
-### 3.8 \[P2] 拓展遥感任务 Skill
+### 3.8 [P2] 拓展遥感任务 Skill
 
-| Skill 名称       | Group           | 输入                 | 输出             |
-| -------------- | --------------- | ------------------ | -------------- |
+| Skill 名称 | Group | 输入 | 输出 |
+|---|---|---|---|
 | `uhi_analysis` | `post_analysis` | LST GeoTIFF + 城市边界 | 热岛强度等级图 + 统计报告 |
-| `time_series`  | `post_analysis` | 多期 LST 结果          | 温度变化趋势图        |
-| `eco_response` | `post_analysis` | LST + NDVI/LULC    | LST-NDVI 关系散点图 |
+| `time_series` | `post_analysis` | 多期 LST 结果 | 温度变化趋势图 |
+| `eco_response` | `post_analysis` | LST + NDVI/LULC | LST-NDVI 关系散点图 |
 
-***
+---
 
-### 3.10 \[P1] 断点执行
+### 3.9 [P2] 一键体验模式 + 可复现报告
+
+- **一键体验**：预置武汉 demo 数据，用户打开即用，15 秒看到完整流程
+- **可复现报告**：每次完整执行后自动生成 Markdown 实验报告
+
+---
+
+### 3.10 [P1] 断点执行
 
 支持用户从指定步骤继续执行，并在执行前自动检查前置数据是否齐全。
 
@@ -1592,30 +1763,29 @@ Agent: 正在检查 rf_model 的前置条件...
 #### 与现有路径机制的配合
 
 当前 `_normalize_plan_paths()` 会自动在 output 目录搜索已有文件，断点检查与之天然配合：
-
 - 文件存在 → `check_step_ready` 通过 → 直接执行
 - 文件不存在 → 提示用户从缺失步骤开始
 
 #### 改动量
 
-| 文件                               | 改动                                       | 行数  |
-| -------------------------------- | ---------------------------------------- | --- |
-| `core/skills/base_skill.py`      | 新增 `dependencies` 属性                     | +15 |
-| `core/skills/builtin/*.py`       | 7个Skill实现依赖声明                            | +70 |
-| `core/agent/geo_thermo_agent.py` | 新增 `check_step_ready()`、`_resume_from()` | +60 |
+| 文件 | 改动 | 行数 |
+|---|---|---|
+| `core/skills/base_skill.py` | 新增 `dependencies` 属性 | +15 |
+| `core/skills/builtin/*.py` | 7个Skill实现依赖声明 | +70 |
+ `core/agent/geo_thermo_agent.py` | 新增 `check_step_ready()`、`_resume_from()` | +60 |
 
-***
+---
 
-### 3.11 \[P2] 执行模式选择：自动执行 vs 由我批准
+### 3.11 [P2] 执行模式选择：自动执行 vs 由我批准
 
 提供两种执行模式，用户可在启动任务前选择。
 
 #### 模式对比
 
-| 模式         | 决策方式           | 适用场景                |
-| ---------- | -------------- | ------------------- |
+| 模式 | 决策方式 | 适用场景 |
+|---|---|---|
 | **⚡ 完全执行** | Agent 自动决策全部步骤 | 有经验用户、批量处理、已知区域重复实验 |
-| **✅ 由我批准** | 关键节点暂停等待用户确认   | 入门用户、新区域首次实验、教学演示   |
+| **✅ 由我批准** | 关键节点暂停等待用户确认 | 入门用户、新区域首次实验、教学演示 |
 
 #### "完全执行"模式详解
 
@@ -1792,18 +1962,19 @@ workflow_callback({
         [ ] 到这里就可以了
         [🔘] 和我上次北京的结果做对比
         [ ] 做城市热岛分析
+        [ ] 生成实验报告
 ```
 
 #### 审批节点清单
 
-| 节点         | 触发条件         | 用户决定什么          | 审批形式       |
-| ---------- | ------------ | --------------- | ---------- |
-| **影像配对选择** | 搜索到多组配对      | 选择哪一组下载         | 表格选择（已有）   |
-| **云量过高**   | 云量 > 50%     | 接受 / 放宽阈值 / 换时间 | 选择框        |
-| **训练样本不足** | 有效样本 < 5,000 | 继续 / 回退数据获取     | 选择框        |
-| **模型训练完成** | 首次训练结束       | 接受 / 进入调优 / 放弃  | 选择框 + 指标展示 |
-| **调优轮次结果** | 每轮调优完成       | 接受本轮 / 继续下一轮    | 选择框        |
-| **全部完成**   | pipeline 结束  | 选择下一步操作         | 选择框 + 建议列表 |
+| 节点 | 触发条件 | 用户决定什么 | 审批形式 |
+|---|---|---|---|
+| **影像配对选择** | 搜索到多组配对 | 选择哪一组下载 | 表格选择（已有） |
+| **云量过高** | 云量 > 50% | 接受 / 放宽阈值 / 换时间 | 选择框 |
+| **训练样本不足** | 有效样本 < 5,000 | 继续 / 回退数据获取 | 选择框 |
+| **模型训练完成** | 首次训练结束 | 接受 / 进入调优 / 放弃 | 选择框 + 指标展示 |
+| **调优轮次结果** | 每轮调优完成 | 接受本轮 / 继续下一轮 | 选择框 |
+| **全部完成** | pipeline 结束 | 选择下一步操作 | 选择框 + 建议列表 |
 
 #### 实现方案
 
@@ -1886,13 +2057,13 @@ class GeoThermoAgent:
 
 #### 改动量
 
-| 文件                               | 改动                                                             | 行数   |
-| -------------------------------- | -------------------------------------------------------------- | ---- |
-| `core/agent/geo_thermo_agent.py` | 新增 `exec_mode`、`_need_user_approval()`、`_pause_for_approval()` | \~80 |
-| `server.py`                      | 新增 `set_exec_mode()` 接口                                        | \~10 |
-| 前端（Vue 3）                       | 新增模式切换组件                                                       | \~30 |
+| 文件 | 改动 | 行数 |
+|---|---|---|
+| `core/agent/geo_thermo_agent.py` | 新增 `exec_mode`、`_need_user_approval()`、`_pause_for_approval()` | ~80 |
+| `ui/api.py` | 新增 `set_exec_mode()` 接口 | ~10 |
+| 前端（Gradio） | 新增模式切换组件 | ~30 |
 
-#### 与现有 pause\_callback 的关系
+#### 与现有 pause_callback 的关系
 
 当前已有 `pause_callback` 用于影像配对选择，"由我批准"模式在此基础上扩展：
 
@@ -1908,188 +2079,83 @@ pause_callback → {
 }
 ```
 
-前端（Vue 3，`stores/chat.js`）统一处理 `approval` 类型，根据 `node` 字段渲染不同的选择框气泡。
+前端（Gradio JS）统一处理 `approval` 类型，根据 `node` 字段渲染不同的选择框气泡。
 
-***
-
-### 3.12 \[P0] 多用户账号体系与数据隔离（公开部署前置）
-
-**背景**：ModelScope Studio 公开部署时是一个**共享容器实例**——所有访客操作同一份软件与数据（对话 / 项目 / 研究区 / `settings.json`），平台不提供用户级隔离，必须由应用内自行实现。且当前 `GET /api/settings` 无鉴权返回明文 `api_key` 与 `data_space` 凭据，公开前必须先修复。
-
-#### 3.12.1 凭据安全（P0，最先做）
-
-- `GET /api/settings` 不再回传明文 `api_key` / `data_space`，仅返回掩码（如 `sk-****1234`）与是否已配置（`has_api_key`）
-- `POST /api/settings` 保持写入能力；前端「API设置」「数据源」面板回显掩码，不显示明文
-- **凭据一律按用户隔离**：LLM API Key、data_space 账号密码、Client ID/Secret、S3 Key/Secret 等只存于对应用户目录，接口不跨用户返回；全局配置不再保存任何用户凭据
-- 全局非敏感配置（默认参数等）读写增加管理员口令保护（环境变量 `ADMIN_TOKEN`），未带口令者不可读写
-
-#### 3.12.2 数据模型：用户维度（P0）
-
-存储布局改为按用户隔离：
-
-```
-data/users/{uid}/
-├── projects.json                ← 项目列表（含 project_dir）
-├── conversations/{conv_id}.json ← 对话（project 字段保留）
-├── study_areas/*.geojson        ← 研究区文件
-├── settings.json                ← 每用户凭据与配置（LLM API Key / data_space 账号密码 / Client ID·Secret / S3 Key·Secret / 模型参数）
-├── memory/                      ← 记忆（与 3.3 衔接）
-│   ├── experiments.json
-│   └── preferences.json
-└── chromadb/                    ← RAG（Collection 名 project_{uid}_{pid}）
-```
-
-- 现阶段以「默认用户」（`default`）落地：所有接口加 `user` 解析层（JWT → header → 默认值），行为不变，先让现有功能全部走默认用户
-- **凭据逐项隔离**：每个用户独立的 LLM API Key、data_space 账号密码、Client ID/Secret、S3 Key/Secret 只写入自己的 `settings.json`，任何接口 / 下载流程都只读当前用户凭据，杜绝跨用户使用他人 Key
-- 内存态隔离：`_conv_states`、`_stream_queues`、`_pause_events` 等按 `uid:conv_id` 加命名空间，避免用户间串流/串状态
-
-#### 3.12.3 登录认证（P1，公开部署前必须完成）
-
-对标 chat.deepseek.com 的账号体系：
-
-| 功能 | 接口 | 说明 |
-|---|---|---|
-| 注册 | `POST /api/auth/register` | 账号名 + 密码（昵称可选，用于账号区展示） |
-| 登录 | `POST /api/auth/login` | 校验密码，签发 JWT |
-| 会话 | `Authorization: Bearer <token>` | 带过期时间与刷新机制 |
-| 密码存储 | bcrypt 哈希 | 禁止明文 |
-| 当前用户 | `GET /api/auth/me` | 前端账号区展示 |
-| 登出 | 前端清除 token | 无需服务端状态 |
-
-**账号与密码规范**：
-- 账号名：唯一，仅允许字母 / 数字 / `_` / `-`，注册时查重
-- 密码：**至少 6 位**，允许 **ASCII 33–126 全部可打印字符**（大小写字母、数字，以及 `!"#$%&'()*+,-./:;<=>?@[\]^_\`{|}~` 等符号，含 `*`）；后端统一 `bcrypt` 哈希存储，前端输入框 `type=password`
-- 防滥用：注册接口加**频率限制**（同一 IP 限时注册）；可选本地图形验证码（零外部依赖）
-- **不提供密码找回**：多用户仅用于多人同时运行时数据/记忆隔离，账号体系不做自助找回
-
-- FastAPI 中间件统一校验 `/api/*`，白名单放行 `/api/auth/*`、`/api/health` 与静态资源
-- 前端：新增登录/注册页 + 路由守卫（未登录仅可访问登录页）；`sidebar__footer` 改为账号区（当前用户昵称或账号名 + 登出），对标 chat.deepseek.com
-- 权限模型：普通用户只能读写自己的数据；管理员（`ADMIN_TOKEN`）可管理全局配置
-
-#### 3.12.4 隔离范围与级联删除
-
-| 数据 | 隔离粒度 | 删除行为 |
-|---|---|---|
-| 对话 | 用户级 | 删用户 → 该用户全部对话 |
-| 项目（含 project_dir 结果） | 用户级 | 删用户 → 项目列表 + 结果目录（可选） |
-| 记忆（JSON + ChromaDB） | 用户级（Collection 带 uid） | 与 3.3 级联删除一致，统一按 uid 前缀清理 |
-| 研究区文件 | 用户级 | 随用户删除 |
-| API 配置与凭据（LLM Key / data_space 账号密码 / Client ID·Secret / S3 Key·Secret） | 用户级 | 随用户删除，不跨用户残留 |
-
-#### 3.12.5 开发顺序
-
-1. **凭据安全修复**（3.12.1）——公开前必做，防止 `GET /api/settings` 泄露明文密钥
-2. **数据模型加用户维度**（3.12.2，默认用户）——现在做最便宜，避免后续全部返工
-3. **记忆模块 3.3**（按带 uid 的数据模型实现，Collection 名 `project_{uid}_{pid}`）
-4. **登录认证 + 前端账号区**（3.12.3）——公开部署前必须完成
-5. **Agent 表达层 3.5 / 执行模式 3.11**——不依赖登录，可与 2~4 并行推进
-
-#### 改动量
-
-| 文件 | 改动 |
-|---|---|
-| `server.py` | 凭据掩码、auth 路由、JWT 中间件、user 维度存储与内存态命名空间 |
-| `config/settings.json` | 全局配置瘦身，LLM Key / data_space 等全部凭据迁移到每用户 settings.json |
-| `frontend/src/` | 登录/注册页、路由守卫、账号区、API 设置掩码回显 |
-| `core/memory/`（3.3 新建） | 路径与 ChromaDB Collection 名带 uid |
-
-***
+---
 
 ## 四、实施路线图
 
-### Phase 0: 多用户账号与数据隔离（公开部署前置，见 3.12）
+### Phase 1: 最小可行迁移（~1-2 周）
 
 ```
-凭据安全 → 数据模型加用户维度（默认用户） → 记忆模块（带 uid） → 登录认证 → 公开
+核心算法全复用 → Gradio UI 骨架 → 并发下载 → 一键全流程 → 验证通过
 ```
 
-| 工作项 | 涉及文件 | 状态 |
-|---|---|---|
-| 凭据安全（/api/settings 掩码 + ADMIN_TOKEN） | `server.py` | ⏳ 待实现（3.12.1） |
-| 数据模型加用户维度 + 默认用户 | `server.py` + `config/settings.json` | ⏳ 待实现（3.12.2） |
-| 登录认证（JWT + bcrypt + 前端账号区） | `server.py` + `frontend/src/` | ⏳ 待实现（3.12.3，公开前必须完成） |
+| 工作项 | 涉及文件 |
+|---|---|
+| Gradio UI 骨架（对话 + 工作流面板） | 新建 `app.py`，改造 `ui/api.py` |
+| 并发下载 | 改 `data_acquisition.py`（+50行） |
+| API Key 运行时配置 | 改 `settings.json` 移除硬编码 |
+| 系统依赖处理 | 新建 `packages.txt` |
 
-### Phase 1: 最小可行迁移（✅ 已完成）
-
-```
-核心算法全复用 → Vue 3 + FastAPI UI 骨架 → Docker 部署 ModelScope Studio → 一键全流程 → 验证通过
-```
-
-| 工作项                      | 涉及文件                          | 状态 |
-| ------------------------ | ----------------------------- | ---- |
-| UI 骨架（对话 + 侧边栏 + 工作面板） | `server.py` + `frontend/src/`    | ✅ 已实现 |
-| 聊天流式 / 项目对话管理 / 配对选择 | `server.py`（REST + SSE）          | ✅ 已实现 |
-| API Key 运行时配置            | `config/settings.json` + `ApiSettings.vue` | ✅ 已实现 |
-| 系统依赖处理                   | `Dockerfile`（OSGeo GDAL 基础镜像）  | ✅ 已实现 |
-| 并发下载                     | 改 `data_acquisition.py`（+50行） | ⏳ 待实现（见 3.4） |
-
-### Phase 2: 核心 Agent 能力（\~2-3 周）
+### Phase 2: 核心 Agent 能力（~2-3 周）
 
 ```
 记忆系统 → Benchmark → LLM调参 → 断点执行 → 表达层
 ```
 
-| 工作项                      | 涉及文件                                                        | 预估行数  |
-| ------------------------ | ----------------------------------------------------------- | ----- |
-| ChromaDB 记忆系统            | 新建 `core/memory/` 模块                                        | \~200 |
-| Benchmark 多模型            | 新建 xgboost/lightgbm/catboost/extra\_trees + benchmark Skill | \~800 |
-| LLM主导+规则兜底调参             | 改 `geo_thermo_agent.py`                                     | \~120 |
-| 断点执行（依赖声明+检查）            | 改 `base_skill.py` + 7个Skill + agent                         | \~145 |
-| Agent 表达层（角色切换+思考链+主动提问） | 改 `geo_thermo_agent.py`                                     | \~250 |
+| 工作项 | 涉及文件 | 预估行数 |
+|---|---|---|
+| ChromaDB 记忆系统 | 新建 `core/memory/` 模块 | ~200 |
+| Benchmark 多模型 | 新建 xgboost/lightgbm/catboost/extra_trees + benchmark Skill | ~800 |
+| LLM主导+规则兜底调参 | 改 `geo_thermo_agent.py` | ~120 |
+| 断点执行（依赖声明+检查） | 改 `base_skill.py` + 7个Skill + agent | ~145 |
+| Agent 表达层（角色切换+思考链+主动提问） | 改 `geo_thermo_agent.py` | ~250 |
 
-### Phase 3: 高级功能打磨
+### Phase 3: 高级功能打磨（~1 周）
 
 ```
-交互式地图 ✅ → 结果总结 → 拓展 Skill
+交互式地图 → 结果总结 → 拓展 Skill → 一键体验 → 报告生成
 ```
 
-| 工作项               | 涉及文件                          | 状态 |
-| ----------------- | ----------------------------- | ---- |
-| 交互式地图（Leaflet + 瓦片渲染） | `core/visualization.py` + `MapView.vue` | ✅ 已实现 |
-| 结果自然语言总结          | 改 `geo_thermo_agent.py`       | ⏳ 待实现（见 3.5.3） |
-| UHI/时序/生态分析 Skill | 新建 3 个 Skill 文件               | ⏳ 待实现（见 3.8） |
+| 工作项 | 涉及文件 |
+|---|---|
+| Folium 交互式地图 | 新建 `core/visualization.py` |
+| 结果自然语言总结 | 改 `geo_thermo_agent.py` |
+| UHI/时序/生态分析 Skill | 新建 3 个 Skill 文件 |
+| 一键体验 + 实验报告 | 新建 `core/report_generator.py` |
 
-***
+---
 
 ## 五、新依赖汇总
 
 ```text
-# requirements.txt（当前已有）
-fastapi>=0.110
-uvicorn>=0.29
-python-multipart>=0.0.9
-folium>=0.16
-matplotlib>=3.7.0
-rasterio>=1.3 / scikit-learn>=1.0 / geopandas>=0.12 / shapely>=2.0 / pyshp>=2.3
-pystac-client>=0.7.0 / planetary-computer>=1.0.0
-numpy>=1.23,<2（锁版本：镜像 osgeo 按 numpy 1.x 编译）
-
-# 前端依赖（frontend/package.json，当前已有）
-vue ^3.4 / vite ^5.2 / pinia ^2.1 / vue-router ^4.3 / marked ^12 / mathjax ^3.2 / leaflet ^1.9
-
-# 待新增（后续升级项，见 3.2 / 3.3 / 3.12）
-bcrypt>=4.0.0
-PyJWT>=2.8.0
+# requirements.txt（新增部分）
+gradio>=6.0.0,<=6.8.0
+folium>=0.16.0
 chromadb>=0.5.0
 sentence-transformers>=2.2.0
 xgboost>=2.0.0
 lightgbm>=4.0.0
 catboost>=1.2.0
+matplotlib>=3.7.0
+Jinja2>=3.1.0
 
-# ModelScope 系统依赖：Docker 基础镜像（ghcr.io/osgeo/gdal:ubuntu-small-3.9.3），GDAL/PROJ 预装，无需 packages.txt
+# ModelScope packages.txt
+gdal-bin
+libgdal-dev
+libproj-dev
 ```
 
-***
+---
 
 ## 六、风险与注意事项
 
-1. **Planetary Computer 网络**: ModelScope 在中国大陆部署可能需要网络配置；Copernicus Data Space 亦需联网（含 OAuth 令牌获取）
-2. **ModelScope 部署约束**: 服务须监听 7860 端口（`ms_deploy.json`）；前端为 Vue 3 构建产物静态托管，无 Gradio 版本约束
+1. **Planetary Computer 网络**: ModelScope 在中国大陆部署可能需要网络配置
+2. **ModelScope Gradio 版本约束**: `>= 6.0.0` 且 `<= 6.8.0`，部分新特性可能受限
 3. **sentence-transformers 首次下载**: `all-MiniLM-L6-v2` 约 80MB，需在容器启动时预下载
 4. **ChromaDB 存储大小**: 嵌入向量随项目数线性增长，建议定期清理
-5. **并发下载带宽**: max\_workers=3 为推荐值，实际可根据网络环境调整
+5. **并发下载带宽**: max_workers=3 为推荐值，实际可根据网络环境调整
 6. **核心算法零改动**: 所有核心算法模块不受升级影响
 7. **LLM调参稳定性**: LLM 可能返回无效 JSON 或错误参数，规则兜底是必需的安全网
 8. **断点执行文件路径一致性**: 断点恢复依赖 `_normalize_plan_paths()` 正确搜索已有文件，需确保路径兜底逻辑覆盖所有场景
-9. **公开部署共享实例（安全）**: Studio 为共享容器，所有用户操作同一份数据，隔离必须应用内实现（3.12）；公开前必须先修复 `/api/settings` 明文凭据泄露并完成登录认证，否则任何访客可读取管理员 API Key 与 data_space 凭据
-

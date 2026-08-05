@@ -1,0 +1,40 @@
+{
+  "api": {
+    "api_format": "openai",
+    "api_base_url": "https://api.deepseek.com",
+    "model_id": "deepseek-v4-flash",
+    "api_key": "",
+    "model_type": "deepseek",
+    "display_name": "DeepSeek-V4-Flash",
+    "model_series": "default",
+    "context_input": 616000,
+    "context_output": 384000
+  },
+  "gee": {},
+  "data": {
+    "default_output_dir": "",
+    "cloud_threshold": 30,
+    "dem_source": "copernicus"
+  },
+  "model": {
+    "n_estimators": 200,
+    "max_depth": 25,
+    "min_samples_split": 16,
+    "min_samples_leaf": 8
+  },
+  "processing": {
+    "batch_size": 500000,
+    "chunk_size": 500000,
+    "train_ratio": 0.6,
+    "val_ratio": 0.2,
+    "test_ratio": 0.2
+  },
+  "data_space": {
+    "username": "3509851015@qq.com",
+    "password": "Ji200506220645*",
+    "client_id": "sh-527a6510-15ac-43ee-9a8c-9d226f7c9a06",
+    "client_secret": "gXSJseTaScHNld0P9ZpGEVmvo2DQFt1O",
+    "s3_key": "VDD5Z8S9HFNX1EBF0R1Q",
+    "s3_secret": "Y0kOSrzemUa7gJ9BQwz7Zp8ucKngBUQC0IyV8Tzg"
+  }
+}
