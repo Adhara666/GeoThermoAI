@@ -250,7 +250,7 @@ const hasAny = computed(() => project.tree.length > 0)
     <div v-if="deleteProjectTarget" class="modal-mask" @click.self="deleteProjectTarget = ''">
       <div class="modal-card modal-card--sm">
         <h3>删除项目</h3>
-        <p class="modal-text">确定删除项目「{{ deleteProjectTarget }}」？将删除其全部对话文件，此操作不可撤销。</p>
+        <p class="modal-text">确定删除项目「{{ deleteProjectTarget }}」？将删除其全部对话文件，并清除该项目产生的实验记忆与历史经验，此操作不可撤销。</p>
         <div class="modal-actions">
           <button class="btn btn--danger" @click="confirmDeleteProject">删除</button>
           <button class="btn btn--cancel" @click="deleteProjectTarget = ''">取消</button>
@@ -262,7 +262,7 @@ const hasAny = computed(() => project.tree.length > 0)
     <div v-if="deleteConvTarget" class="modal-mask" @click.self="deleteConvTarget = null">
       <div class="modal-card modal-card--sm">
         <h3>删除对话</h3>
-        <p class="modal-text">确定删除对话「{{ deleteConvTarget?.title }}」？将清除所有消息与运行中的进程。</p>
+        <p class="modal-text">确定删除对话「{{ deleteConvTarget?.title }}」？将清除所有消息、运行中的进程，以及该对话产生的实验记录。</p>
         <div class="modal-actions">
           <button class="btn btn--danger" @click="confirmDeleteConv">删除</button>
           <button class="btn btn--cancel" @click="deleteConvTarget = null">取消</button>

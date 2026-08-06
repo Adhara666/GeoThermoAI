@@ -14,6 +14,7 @@ GeoThermoAI Vue 3 版后端 — FastAPI 服务
 """
 
 import json
+import logging
 import os
 import queue
 import re
@@ -36,6 +37,7 @@ from core import auth
 from core.ai_assistant import GeoThermoAI_Assistant
 from core.skills.skill_registry import SkillRegistry
 from core.agent.geo_thermo_agent import GeoThermoAgent
+from core.memory import MemoryManager
 from core.visualization import LayerVisualizer
 from core.intermediate_cleanup import INTERMEDIATE_FILENAMES
 from core.geo_transform import (
@@ -135,6 +137,8 @@ class AppBackend:
         # 每用户独立的 assistant / agent（凭据按用户隔离，禁止跨用户共用）
         self._user_assistants: Dict[str, GeoThermoAI_Assistant] = {}
         self._user_agents: Dict[str, GeoThermoAgent] = {}
+        # 每用户独立的记忆管理器（懒加载：首次使用该用户时初始化并播种领域知识）
+        self._user_memories: Dict[str, MemoryManager] = {}
 
         # 按对话隔离的运行时状态（与旧版一致）
         self._conv_states: Dict[str, dict] = {}
@@ -303,6 +307,19 @@ class AppBackend:
             self._user_agents[uid] = ag
         return ag
 
+    def _memory_for(self) -> MemoryManager:
+        """当前用户的记忆管理器（懒加载 + 首次播种领域知识）"""
+        uid = self._uid()
+        mm = self._user_memories.get(uid)
+        if mm is None:
+            mm = MemoryManager(
+                memory_root=str(self._user_dir() / "memory"),
+                embedding_model_dir=str(_ROOT / "models" / "bge-small-zh-v1.5"),
+            )
+            mm.ensure_seeded()
+            self._user_memories[uid] = mm
+        return mm
+
     def _invalidate_user_runtime(self):
         """设置变更后重建该用户的 assistant/agent（凭据热更新）"""
         uid = self._uid()
@@ -327,7 +344,8 @@ class AppBackend:
     def _load_projects(self) -> list:
         """从 _projects.json 读取项目列表（空项目也能持久化）
 
-        新格式为 [{"name": ..., "dir": ...}]，兼容旧格式（字符串数组）。
+        新格式为 [{"id", "name", "dir"}]，兼容旧格式（dict 无 id / 字符串数组）。
+        无 id 的旧项目首次加载时自动补齐稳定 uuid 并持久化（重命名不失联）。
         """
         path = self._conv_dir() / "_projects.json"
         try:
@@ -336,12 +354,31 @@ class AppBackend:
         except Exception:
             return []
         result = []
+        changed = False
         for item in raw:
             if isinstance(item, dict):
-                result.append({"name": item.get("name", ""), "dir": item.get("dir", "")})
+                pid = item.get("id")
+                if not pid:
+                    pid = uuid.uuid4().hex[:12]
+                    changed = True
+                result.append({"id": pid, "name": item.get("name", ""), "dir": item.get("dir", "")})
             elif isinstance(item, str):
-                result.append({"name": item, "dir": ""})
-        return [p for p in result if p.get("name")]
+                result.append({"id": uuid.uuid4().hex[:12], "name": item, "dir": ""})
+                changed = True
+        result = [p for p in result if p.get("name")]
+        if changed:
+            try:
+                self._save_projects(result)
+            except Exception:
+                pass
+        return result
+
+    def _project_id(self, project_name: str) -> str:
+        """按项目名查稳定 id（找不到返回空串）"""
+        for p in self._load_projects():
+            if p.get("name") == project_name:
+                return p.get("id", "")
+        return ""
 
     def _save_projects(self, projects: list):
         path = self._conv_dir() / "_projects.json"
@@ -439,7 +476,7 @@ class AppBackend:
         normalized = str(auto_dir).replace("\\", "/")
         projects = self._load_projects()
         if not any(p["name"] == name for p in projects):
-            projects.append({"name": name, "dir": normalized})
+            projects.append({"id": uuid.uuid4().hex[:12], "name": name, "dir": normalized})
             self._save_projects(projects)
         return {"ok": True, "message": f"项目「{name}」创建成功",
                 "projects": [p["name"] for p in projects]}
@@ -475,6 +512,15 @@ class AppBackend:
         convs = self.load_conversations()
         if pid not in convs:
             return {"ok": False, "message": "项目不存在"}
+        # 级联删除记忆（experiments/preferences/ChromaDB Collection），失败仅告警不影响删除。
+        # 仅当 memory 目录已存在时才删除——未初始化过记忆时直接跳过，
+        # 避免为删除而触发 _memory_for() 的昂贵初始化（bge 模型加载 + 领域知识播种）
+        try:
+            project_id = self._project_id(pid)
+            if project_id and (self._user_dir() / "memory").exists():
+                self._memory_for().delete_project(project_id)
+        except Exception as e:
+            logging.warning(f"[memory] 删除项目记忆失败: {e}")
         for cid in list(convs[pid].keys()):
             if cid.startswith("__"):
                 continue
@@ -533,6 +579,14 @@ class AppBackend:
         convs = self.load_conversations()
         if pid not in convs or cid not in convs[pid]:
             return {"ok": False, "message": "对话不存在"}
+        # 级联删除该对话产生的实验记忆，失败仅告警不影响删除。
+        # 仅当 memory 目录已存在时才删除（避免为删除而触发昂贵的记忆初始化）
+        try:
+            project_id = self._project_id(pid)
+            if project_id and (self._user_dir() / "memory").exists():
+                self._memory_for().delete_conversation(project_id, cid)
+        except Exception as e:
+            logging.warning(f"[memory] 删除对话记忆失败: {e}")
         self._hard_delete_conversation(cid, pid, convs)
         remaining = [k for k in convs[pid] if not k.startswith("__")]
         return {"ok": True, "message": "对话已彻底删除", "remaining": remaining}
@@ -1171,6 +1225,9 @@ class AppBackend:
                         project_dir=project_dir,
                         settings_path=str(self._user_settings_path()),
                         study_areas_dir=str(self._study_dir()),
+                        conv_id=cid,
+                        project_id=self._project_id(pid),
+                        memory_manager=self._memory_for(),
                     )
                     if result and ("⚠️" in result or "失败" in result or "未找到" in result):
                         q.put(("append", "\n\n" + result))

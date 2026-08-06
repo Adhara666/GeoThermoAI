@@ -30,3 +30,7 @@ planetary-computer>=1.0.0
 # 用户账号 / 登录认证
 bcrypt>=4.0.0
 PyJWT>=2.8.0
+# 记忆系统（RAG + 结构化混合存储；bge ONNX 仅用 tokenizer，无需 torch）
+chromadb>=0.5.0
+onnxruntime>=1.16
+transformers>=4.36

@@ -154,17 +154,17 @@ class DataAcquisitionSkill(BaseSkill):
             SkillParameter(
                 name="cloud_threshold",
                 type="number",
-                description="云覆盖阈值（百分比），默认 20",
+                description="云覆盖阈值（百分比），默认 30",
                 required=False,
-                default=20,
+                default=30,
             ),
             SkillParameter(
                 name="dem_source",
                 type="string",
-                description="DEM数据源，可选 'copernicus' 或 'srtm'",
+                description="DEM 数据源（Copernicus GLO-30）",
                 required=False,
                 default="copernicus",
-                choices=["copernicus", "srtm"],
+                choices=["copernicus"],
             ),
         ]
 
@@ -213,7 +213,7 @@ class DataAcquisitionSkill(BaseSkill):
         start_date = params.get("start_date", "")
         end_date = params.get("end_date", "")
         output_dir = params.get("output_dir", "")
-        cloud_threshold = params.get("cloud_threshold", 50)
+        cloud_threshold = params.get("cloud_threshold", 30)
         dem_source = params.get("dem_source", "copernicus")
 
         if not region:
@@ -497,13 +497,13 @@ class DataAcquisitionSkill(BaseSkill):
             progress_callback("data_acquisition", 0.72, f"下载 DEM ({dem_source})...")
 
         dem_path = os.path.join(output_dir, "dem.tif")
-        dem_collection = "cop-dem-glo-30" if dem_source.lower() == "copernicus" else "srtm"
+        dem_collection = "cop-dem-glo-30"
 
         dem_items = []
         dem_from_ds = False  # DEM 瓦片是否来自 CDSE（决定下载时是否附加 CDSE 认证）
         # DEM 属 CCM（Contributing Missions）数据：CDSE 下载仅支持 S3 SigV4 签名
         # （Bearer token 会 403，已实测），因此只有配置了 S3 密钥时才走 CDSE
-        if ds_token and s3_creds and dem_source.lower() == "copernicus":
+        if ds_token and s3_creds:
             try:
                 dem_items = list(ds_catalog.search(
                     collections=[_DS_DEM_COLLECTION_GLO30], bbox=bbox, max_items=10,
