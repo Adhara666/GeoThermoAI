@@ -3,8 +3,8 @@
 
 整合数据预处理和数据集划分两个步骤：
     1. 调用 process_preprocessing() 生成30m训练特征CSV（step2）、完整30m约束层
-       （A-05）和10m预测特征CSV
-    2. 调用 split_dataset() 按空间块 + guard buffer 划分训练/验证/测试集（B-01）
+       和10m预测特征CSV
+    2. 调用 split_dataset() 按空间块 + guard buffer 划分训练/验证/测试集
 """
 
 import os
@@ -114,7 +114,7 @@ class DataPipelineSkill(BaseSkill):
             if progress_callback:
                 progress_callback(step_name, percent, message)
 
-        # ── 步骤1: 数据预处理（含完整30m约束层，A-05）───────────────
+        # ── 步骤1: 数据预处理（含完整30m约束层）──────────────────────
         if log_callback:
             log_callback("INFO", "开始数据预处理...")
 
@@ -143,7 +143,7 @@ class DataPipelineSkill(BaseSkill):
         if log_callback:
             log_callback("INFO", f"预处理完成: 训练CSV={train_csv}, 完整约束层={constraint_csv}, 预测CSV={predict_csv}")
 
-        # ── 步骤2: 数据集划分（空间块 + guard buffer，B-01）──────────────
+        # ── 步骤2: 数据集划分（空间块 + guard buffer）──────────────────
         if log_callback:
             log_callback("INFO", "开始数据集划分（空间块 + guard buffer）...")
 
@@ -199,7 +199,7 @@ class DataPipelineSkill(BaseSkill):
                     "split_info": result_data["split_info"],
                 },
             )
-            # 划分完成后，对齐栅格中间产物与 step2 抽样 CSV 不再被下游读取，立即清理
+            # 划分完成后，对齐栅格中间产物与 step2 抽样 CSV 已无下游消费方，立即清理
             cleanup_stage(project_root, "data_pipeline")
 
         if progress_callback:

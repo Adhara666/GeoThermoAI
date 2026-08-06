@@ -3,7 +3,7 @@
 
 调用 compute_lst_final() 和 export_geotiff()：
     1. 计算 LST_final = LST_pred + TCR
-    2. 将结果导出为带地理参考的GeoTIFF影像（B-07：严格按CSV的row,col写入）
+    2. 将结果导出为带地理参考的GeoTIFF影像（严格按CSV的row,col写入）
 """
 
 import os
@@ -106,12 +106,12 @@ class LSTExportSkill(BaseSkill):
             return SkillResult(success=False, message=f"LST最终计算失败: {e}")
 
         if lst_result.get("total_valid", 0) == 0:
-            return SkillResult(success=False, message="LST_final 全部为空，拒绝导出（A-02：禁止假成功）")
+            return SkillResult(success=False, message="LST_final 全部为空，拒绝导出（无有效数据）")
 
         if log_callback:
             log_callback("INFO", f"LST计算完成: {lst_result.get('total_rows', 0):,} 行")
 
-        # ── 步骤2: 导出GeoTIFF（B-07：严格按row,col写入）─────────────
+        # ── 步骤2: 导出GeoTIFF（严格按row,col写入）─────────────────────
         if log_callback:
             log_callback("INFO", "开始导出GeoTIFF...")
 
@@ -148,7 +148,7 @@ class LSTExportSkill(BaseSkill):
                 artifacts={"tif_path": tif_path, "csv_path": lst_final_csv},
                 stats={"stats": stats, "image_size": tif_result.get("image_size", {})},
             )
-            # GeoTIFF 导出完成后，LST_final 全网格 CSV 不再被下游读取（闭合评估用 tcr_result.csv），立即清理
+            # GeoTIFF 导出完成后，LST_final 全网格 CSV 已无下游消费方（闭合评估用 tcr_result.csv），立即清理
             cleanup_stage(project_root, "lst_export")
 
         if progress_callback:

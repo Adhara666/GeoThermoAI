@@ -5,6 +5,7 @@ import { useSettingsStore } from '../../stores/settings'
 const settings = useSettingsStore()
 
 // Copernicus Data Space 配置
+// 秘密字段已配置时按真实长度显示黑点（不暴露明文），重新输入才替换原值
 const username = ref('')
 const password = ref('')
 const clientId = ref('')
@@ -14,17 +15,20 @@ const s3Secret = ref('')
 const saved = ref(false)
 const saving = ref(false)
 
+/** 仍为黑点占位（未重新输入）→ 传空，后端保持原值 */
+const stripMask = (v) => (v && !v.startsWith('•') ? v.trim() : '')
+
 watch(
   () => settings.settings,
   (s) => {
     if (!s) return
     const ds = s.data_space || {}
     username.value = ds.username || ''
-    password.value = ds.password || ''
     clientId.value = ds.client_id || ''
-    clientSecret.value = ds.client_secret || ''
     s3Key.value = ds.s3_key || ''
-    s3Secret.value = ds.s3_secret || ''
+    password.value = ds.password_len ? '•'.repeat(ds.password_len) : ''
+    clientSecret.value = ds.client_secret_len ? '•'.repeat(ds.client_secret_len) : ''
+    s3Secret.value = ds.s3_secret_len ? '•'.repeat(ds.s3_secret_len) : ''
   },
   { immediate: true },
 )
@@ -35,11 +39,11 @@ async function save() {
     const ok = await settings.saveSettings({
       data_space: {
         username: username.value.trim(),
-        password: password.value.trim(),
+        password: stripMask(password.value),
         client_id: clientId.value.trim(),
-        client_secret: clientSecret.value.trim(),
+        client_secret: stripMask(clientSecret.value),
         s3_key: s3Key.value.trim(),
-        s3_secret: s3Secret.value.trim(),
+        s3_secret: stripMask(s3Secret.value),
       },
     })
     saved.value = ok
@@ -77,7 +81,7 @@ async function save() {
     </div>
     <div class="form-group">
       <label>密码</label>
-      <input v-model="password" type="password" class="form-input" placeholder="哥白尼数据空间登录密码" />
+      <input v-model="password" type="password" class="form-input" placeholder="哥白尼数据空间登录密码；已配置时显示为黑点" />
     </div>
 
     <details class="advanced" style="margin-bottom:12px">
@@ -89,7 +93,7 @@ async function save() {
         </div>
         <div class="form-group">
           <label>OAuth2 Client Secret</label>
-          <input v-model="clientSecret" type="password" class="form-input" placeholder="无账号时用于搜索影像" />
+          <input v-model="clientSecret" type="password" class="form-input" placeholder="无账号时用于搜索影像；已配置时显示为黑点" />
         </div>
         <div class="form-group">
           <label>S3 Access Key</label>
@@ -97,7 +101,7 @@ async function save() {
         </div>
         <div class="form-group">
           <label>S3 Secret Key</label>
-          <input v-model="s3Secret" type="password" class="form-input" placeholder="与 S3 Access Key 配套" />
+          <input v-model="s3Secret" type="password" class="form-input" placeholder="与 S3 Access Key 配套；已配置时显示为黑点" />
         </div>
       </div>
     </details>

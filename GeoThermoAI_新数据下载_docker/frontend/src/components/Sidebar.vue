@@ -2,27 +2,33 @@
 import { ref, computed, nextTick } from 'vue'
 import { useProjectStore } from '../stores/project'
 import { useChatStore } from '../stores/chat'
+import { useAuthStore } from '../stores/auth'
 
 defineProps({ open: Boolean })
 const emit = defineEmits(['close'])
 
 const project = useProjectStore()
 const chat = useChatStore()
+const auth = useAuthStore()
+
+function onLogout() {
+  auth.logout()
+  // 全量刷新回登录页（同时清空各 store 的登录态数据）
+  window.location.reload()
+}
 
 // ── 新建项目弹窗 ────────────────────────────────────────────
 const showNewProject = ref(false)
 const newProjectName = ref('')
-const newProjectDir = ref('')
 
 function openNewProject() {
   newProjectName.value = ''
-  newProjectDir.value = '/home/studio_service/project/output'
   showNewProject.value = true
 }
 
 async function onNewProject() {
   if (!newProjectName.value.trim()) return
-  await project.createProject(newProjectName.value, newProjectDir.value)
+  await project.createProject(newProjectName.value)
   showNewProject.value = false
 }
 
@@ -190,7 +196,11 @@ const hasAny = computed(() => project.tree.length > 0)
     </div>
 
     <div class="sidebar__footer">
-      <div>GeoThermoAI</div>
+      <div class="sidebar__user" :title="auth.user?.username">
+        <span class="sidebar__user-name">{{ auth.display }}</span>
+        <button class="sidebar__logout" title="退出登录" @click="onLogout">退出</button>
+      </div>
+      <div class="sidebar__meta">GeoThermoAI</div>
     </div>
 
     <!-- 新建项目弹窗 -->
@@ -207,15 +217,7 @@ const hasAny = computed(() => project.tree.length > 0)
             autofocus
           />
         </div>
-        <div class="form-group">
-          <label>项目保存路径</label>
-          <input
-            v-model="newProjectDir"
-            class="form-input"
-            placeholder="/home/studio_service/project/output"
-            @keyup.enter="onNewProject"
-          />
-        </div>
+        <p class="form-hint" style="margin:2px 0 4px">数据将自动保存到你的私有工作区（按账号隔离）</p>
         <div class="modal-actions">
           <button class="btn btn--confirm" @click="onNewProject">创建</button>
           <button class="btn btn--cancel" @click="showNewProject = false">取消</button>

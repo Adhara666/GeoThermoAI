@@ -1,19 +1,16 @@
 """
-TTRI 计算 Skill（A-04/A-05/A-06/A-08 重写）
+TTRI 计算 Skill
 
-    - 仅用固定 train split 拟合一次 TTRI 回归系数，固定保存 ttri_coefficients.json；
-      validate/test 用同一组系数做无标签变换（A-04，不再各自重新拟合）；
-    - 10m 预测数据的空间化插值改为基于完整30m约束层 + 统一仿射映射（A-05/A-06），
-      不再是 step2 抽样 CSV 的稀疏"unique row/col"网格 + row/3.0 假设；
-    - 去除旧版"抽查前1000行有一个有限TTRI就跳过重算"的不可靠判断：本版本每次都
-      完整重算并原子替换，不再有"成功但下游产物契约为空"的路径（A-08）；
-    - 10m TTRI 计算失败会直接返回 success=False，不再只记 WARN 后仍返回成功。
+    - 仅用训练集（train split）拟合一次 TTRI 回归系数，固定保存 ttri_coefficients.json；
+      validate/test 复用同一组系数做无标签变换；
+    - 10m 预测数据的空间化插值基于完整 30m 约束层 + 统一仿射映射双线性插值；
+    - 每次执行都完整重算并通过原子替换写回；10m TTRI 计算失败时直接返回
+      success=False，使依赖链失败。
 
-Agent 的 SKILL_PATHS（core/agent/geo_thermo_agent.py，未修改）只会注入
-output_dir/data_30m_csv/predict_10m_csv/train_csv/val_csv/test_csv，不包含
-A-05 新增的 constraint_csv/constraint_meta/predict_10m_meta；本 Skill 按固定
-命名约定从 output_dir（即预处理阶段的 processed_dir）自动推导这些路径，
-不需要 Agent 额外注入。
+Agent 的 SKILL_PATHS 只注入 output_dir / data_30m_csv / predict_10m_csv /
+train_csv / val_csv / test_csv，不包含 constraint_csv / constraint_meta /
+predict_10m_meta；本 Skill 按固定命名约定从 output_dir（即预处理阶段的
+processed_dir）自动推导这些路径，不需要 Agent 额外注入。
 """
 
 import os
@@ -99,7 +96,7 @@ class TTRIComputeSkill(BaseSkill):
             except Exception as e:
                 return SkillResult(success=False, message=f"重建输入失败: {e}")
 
-        # 固定命名推导（A-05 新增产物，Agent 不会显式注入，见模块顶部说明）
+        # 固定命名推导（Agent 不会显式注入，见模块顶部说明）
         constraint_csv = params.get("constraint_csv") or os.path.join(output_dir, "30m_constraint_grid.csv")
         constraint_meta = params.get("constraint_meta") or os.path.join(output_dir, "30m_constraint_grid_meta.json")
         predict_10m_csv = params.get("predict_10m_csv") or os.path.join(output_dir, "10m_predict_features.csv")
@@ -112,7 +109,7 @@ class TTRIComputeSkill(BaseSkill):
             if not os.path.isfile(path):
                 return SkillResult(
                     success=False,
-                    message=f"缺少必需输入文件（{label}）: {path}；请确认已成功完成 data_pipeline 阶段（fail-fast，不复用旧产物）",
+                    message=f"缺少必需输入文件（{label}）: {path}；请确认已成功完成 data_pipeline 阶段（fail-fast）",
                 )
 
         try:
@@ -142,7 +139,7 @@ class TTRIComputeSkill(BaseSkill):
         except Exception as e:
             return SkillResult(success=False, message=f"完整30m约束层 TTRI 计算失败: {e}")
 
-        # ── 步骤3: 10m预测数据TTRI（完整约束层 + 统一仿射映射插值，A-05/A-06）──
+        # ── 步骤3: 10m预测数据TTRI（完整约束层 + 统一仿射映射插值）──
         if log_callback:
             log_callback("INFO", "开始计算10m预测数据 TTRI（统一仿射映射双线性插值）...")
 
@@ -161,7 +158,7 @@ class TTRIComputeSkill(BaseSkill):
         except Exception as e:
             if os.path.exists(tmp_output):
                 os.remove(tmp_output)
-            # A-08 修复：10m TTRI 失败必须使依赖链失败，不能只 WARN 后仍返回 success=True
+            # 10m TTRI 失败必须使依赖链失败，不能只记 WARN 后仍返回成功
             return SkillResult(success=False, message=f"10m预测数据 TTRI 计算失败: {e}")
 
         if predict_result.get("total_valid", 0) == 0:
@@ -172,7 +169,7 @@ class TTRIComputeSkill(BaseSkill):
                 message="10m预测数据 TTRI 计算完成但有效行数为0，可能约束层与预测格网完全不重叠，拒绝返回成功",
             )
 
-        # 校验通过后原子替换（避免读写同一文件的竞态；A-02/A-08）
+        # 校验通过后原子替换（避免读写同一文件的竞态）
         atomic_replace(tmp_output, predict_10m_csv)
 
         result_data = {

@@ -1,0 +1,36 @@
+════════════════════════════════════════════════════════
+ GeoThermoAI —— Adhara 账号与全部凭据（备份）
+ 整理时间：2026-08-05
+════════════════════════════════════════════════════════
+
+【一】GeoThermoAI 登录账号
+  账号名 : Adhara
+  昵称   : 弧矢七
+  密码   : 20050622*
+  说明   : 账号注册在 Docker 命名卷 geothermoai_data 中；
+           若重新部署 ModelScope 或重建容器需重新注册。
+
+【二】DeepSeek 大模型 API
+  api_format    : openai
+  api_base_url  : https://api.deepseek.com
+  model_id      : deepseek-v4-flash
+  api_key       : sk-79db423ae45a400e875b21f626416d33
+
+【三】Copernicus Data Space（DEM/哨兵数据下载）
+  账号(邮箱)   : 3509851015@qq.com
+  密码         : Ji200506220645*
+
+【四】OAuth2 凭据（Copernicus Data Space 应用）
+  client_id     : sh-527a6510-15ac-43ee-9a8c-9d226f7c9a06
+  client_secret : gXSJseTaScHNld0P9ZpGEVmvo2DQFt1O
+ 
+【五】S3 对象存储凭据（数据上传/存储）
+  s3_key    : VDD5Z8S9HFNX1EBF0R1Q
+  s3_secret : Y0kOSrzemUa7gJ9BQwz7Zp8ucKngBUQC0IyV8Tzg
+
+【六】其他
+  JWT 签名密钥 : 见容器 data/.jwt_secret（docker volume: geothermoai_data）
+  说明         : config/settings.json 已清空所有明文凭据（防仓库泄露）；
+                 凭据仅存在于容器用户 settings 与本备份文件中。
+
+════════════════════════════════════════════════════════

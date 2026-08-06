@@ -1,13 +1,12 @@
 """
-随机森林训练+预测 Skill（B-02 / A-07 重写）
+随机森林训练+预测 Skill
 
-    - 训练参数改为"先拷贝默认值，再用白名单覆盖"，random_state/max_features
-      不再因用户传入部分参数而静默丢失；n_jobs 按容器 CPU 配额解析（B-02）；
-    - 测试集推理完成后，额外调用 evaluate_independent_prediction() 写出固定
-      independent_prediction.json（A-07 协议一）。Agent 的7阶段固定工作流
-      （core/agent/geo_thermo_agent.py，未修改）里没有单独的"独立预测评估"
-      步骤，因此把该产物作为 rf_model 阶段的附加产物一并写出，不新增 Agent
-      工作流步骤名。
+    - 训练参数采用"默认值 + 白名单覆盖"：仅使用白名单内的超参数（含
+      random_state/max_features），n_jobs 按容器 CPU 配额解析；
+    - 测试集推理完成后，调用 evaluate_independent_prediction() 写出固定
+      independent_prediction.json（独立预测协议）。Agent 的 7 阶段固定工作流
+      没有单独的"独立预测评估"步骤，因此该产物作为 rf_model 阶段的附加产物
+      一并写出，不新增 Agent 工作流步骤名。
 """
 
 import json
@@ -84,7 +83,7 @@ class RFModelSkill(BaseSkill):
             "test_metrics": "测试集评估指标（含MB）",
             "metrics_path": "指标JSON路径",
             "feature_importance": "特征重要性列表",
-            "independent_prediction_path": "独立预测协议JSON路径（A-07）",
+            "independent_prediction_path": "独立预测协议JSON路径",
         }
 
     def execute(
@@ -120,7 +119,7 @@ class RFModelSkill(BaseSkill):
         except ImportError:
             return SkillResult(success=False, message="无法导入RF模型/评估模块")
 
-        # ── 构建超参数（B-02：白名单覆盖默认值，包含 random_state/max_features）
+        # ── 构建超参数（白名单覆盖默认值，包含 random_state/max_features）
         rf_params = {}
         for key in ["n_estimators", "max_depth", "min_samples_split", "min_samples_leaf",
                     "max_features", "random_state"]:
@@ -172,8 +171,8 @@ class RFModelSkill(BaseSkill):
         except Exception as e:
             return SkillResult(success=False, message=f"测试集预测失败: {e}")
 
-        # ── 步骤3: 独立预测评估（A-07 协议一）──────────────────────────
-        # Agent 固定7阶段工作流未单列该步骤，作为 rf_model 阶段的附加产物写出。
+        # ── 步骤3: 独立预测评估 ──────────────────────────────────────
+        # Agent 固定 7 阶段工作流未单列该步骤，作为 rf_model 阶段的附加产物写出。
         split_info = None
         _split_info_path = os.path.join(os.path.dirname(train_csv), "split_info.json")
         if os.path.isfile(_split_info_path):
@@ -227,7 +226,7 @@ class RFModelSkill(BaseSkill):
                     "params": train_result.get("params", {}),
                 },
             )
-            # 训练+测试预测+独立评估完成后，train/val/test 划分 CSV 不再被下游读取，立即清理
+            # 训练+测试预测+独立评估完成后，train/val/test 划分 CSV 已无下游消费方，立即清理
             cleanup_stage(project_root, "rf_model")
 
         train_m = train_result.get("metrics", {}).get("train", {})

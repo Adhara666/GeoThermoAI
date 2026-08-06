@@ -49,7 +49,7 @@ class GeoThermoAgent:
 
     # ── 公开接口 ─────────────────────────────────────────────────────
 
-    def process_command(self, user_input: str, on_token=None, on_log=None, pause_callback=None, project_dir: str = "", workflow_callback=None) -> str:
+    def process_command(self, user_input: str, on_token=None, on_log=None, pause_callback=None, project_dir: str = "", workflow_callback=None, settings_path: str = "", study_areas_dir: str = "") -> str:
         """处理用户自然语言指令
 
         流程：
@@ -64,6 +64,8 @@ class GeoThermoAgent:
         pause_callback: 可选回调，当 Agent 需要用户输入时调用，
                         返回 {"paused": True, "data": {...}} 表示暂停，
                         返回 {"paused": False, "data": {...}} 表示已恢复
+        settings_path:    每用户设置文件路径（多用户隔离；空则用全局 config/settings.json）
+        study_areas_dir:  每用户研究区目录（多用户隔离；空则用全局 config/study_areas）
         """
         # 全局流式缓冲：process_command 与 _execute_plan 共用，
         # 保证气泡按"完整累积文本"展示整个中间过程（而不是被末尾覆盖）
@@ -74,7 +76,10 @@ class GeoThermoAgent:
                 on_token("".join(_stream_acc))
 
         # 0. 提示已加载的研究区文件
-        _study_areas_dir = pathlib.Path(__file__).resolve().parent.parent.parent / "config" / "study_areas"
+        _study_areas_dir = (
+            pathlib.Path(study_areas_dir) if study_areas_dir
+            else pathlib.Path(__file__).resolve().parent.parent.parent / "config" / "study_areas"
+        )
         uploaded = list(_study_areas_dir.glob("*.geojson")) if _study_areas_dir.exists() else []
         if uploaded:
             _emit(f"📁 已加载研究区文件：{sorted(uploaded, key=lambda p: p.stat().st_mtime, reverse=True)[0].name}\n")
@@ -89,11 +94,11 @@ class GeoThermoAgent:
             or ("是什么" in user_input)
         )
         if _is_advisory_request:
-            context = self._get_context()
+            context = self._get_context(settings_path=settings_path, study_areas_dir=study_areas_dir)
             return self.assistant.ask_stream(user_input, on_token, context=context)
 
         # 1. 获取当前软件状态
-        context = self._get_context()
+        context = self._get_context(settings_path=settings_path, study_areas_dir=study_areas_dir)
 
         # 2. 获取所有已注册 Skill 的描述
         tool_desc = self.registry.get_tool_descriptions_for_llm()
@@ -126,7 +131,7 @@ class GeoThermoAgent:
             if any(kw in user_input for kw in ["全流程", "一键", "跑完全流程", "执行全流程"]):
                 _emit("⚠️ LLM 计划解析失败，改用内置完整工作流计划继续执行...\n")
                 info = self._guess_region_from_input(user_input)
-                plan = self._build_full_workflow_plan(info)
+                plan = self._build_full_workflow_plan(info, study_areas_dir=study_areas_dir)
             else:
                 # 其他指令解析失败时，返回原始响应方便用户排查
                 return f"⚠️ 执行计划解析失败，返回内容如下（可截图反馈）：\n{response[:500]}"
@@ -160,12 +165,12 @@ class GeoThermoAgent:
         if needs_fix:
             _emit("⚠️ LLM 返回的执行计划不完整，自动修正为完整工作流...\n")
             info = self._guess_region_from_input(user_input)
-            plan = self._build_full_workflow_plan(info)
+            plan = self._build_full_workflow_plan(info, study_areas_dir=study_areas_dir)
 
         # 统一 LLM 生成的各步骤路径，避免不同步骤使用不一致的 output_dir
-        self._normalize_plan_paths(plan)
+        self._normalize_plan_paths(plan, study_areas_dir=study_areas_dir)
 
-        return self._execute_plan(plan, on_token=on_token, on_log=on_log, pause_callback=pause_callback, project_dir=project_dir, workflow_callback=workflow_callback, stream_acc=_stream_acc)
+        return self._execute_plan(plan, on_token=on_token, on_log=on_log, pause_callback=pause_callback, project_dir=project_dir, workflow_callback=workflow_callback, stream_acc=_stream_acc, settings_path=settings_path, study_areas_dir=study_areas_dir)
 
     def _guess_region_from_input(self, user_input: str) -> dict:
         """从用户输入中猜测研究区域和时间范围"""
@@ -198,18 +203,22 @@ class GeoThermoAgent:
 
         return {"region": bbox, "start_date": start_date, "end_date": end_date}
 
-    def _build_full_workflow_plan(self, info: dict) -> dict:
+    def _build_full_workflow_plan(self, info: dict, study_areas_dir: str = "") -> dict:
         """构建标准全流程执行计划
 
         Args:
             info: 包含 region, start_date, end_date 的字典
+            study_areas_dir: 每用户研究区目录（多用户隔离；空则用全局 config/study_areas）
         """
         region = info.get("region", "113.7,29.9,114.9,31.3")
         start_date = info.get("start_date", "2024-07-01")
         end_date = info.get("end_date", "2024-07-31")
 
         # 优先使用已上传的研究区 GeoJSON 文件路径（用绝对路径，避免相对路径解析失败）
-        _study_areas_dir = pathlib.Path(__file__).resolve().parent.parent.parent / "config" / "study_areas"
+        _study_areas_dir = (
+            pathlib.Path(study_areas_dir) if study_areas_dir
+            else pathlib.Path(__file__).resolve().parent.parent.parent / "config" / "study_areas"
+        )
         uploaded = list(_study_areas_dir.glob("*.geojson")) if _study_areas_dir.exists() else []
         if uploaded:
             study_file = str(sorted(uploaded, key=lambda p: p.stat().st_mtime, reverse=True)[0].resolve())
@@ -288,15 +297,35 @@ class GeoThermoAgent:
 
     # ── 路径统一 ─────────────────────────────────────────────────────
 
-    @staticmethod
-    def _find_study_area_file() -> Optional[str]:
-        """查找最新上传的研究区文件，返回绝对路径；未找到返回 None"""
-        _study_areas_dir = pathlib.Path(__file__).resolve().parent.parent.parent / "config" / "study_areas"
+    def _find_study_area_file(self, study_areas_dir: str = "") -> Optional[str]:
+        """查找最新上传的研究区文件，返回绝对路径；未找到返回 None
+
+        Args:
+            study_areas_dir: 每用户研究区目录；空则用全局 config/study_areas
+        """
+        _study_areas_dir = (
+            pathlib.Path(study_areas_dir) if study_areas_dir
+            else pathlib.Path(__file__).resolve().parent.parent.parent / "config" / "study_areas"
+        )
         uploaded = list(_study_areas_dir.glob("*.geojson")) if _study_areas_dir.exists() else []
         if not uploaded:
             return None
         latest = sorted(uploaded, key=lambda p: p.stat().st_mtime, reverse=True)[0]
         return str(latest.resolve())
+
+    def _load_config(self, settings_path: str = "") -> dict:
+        """读取设置（每用户 settings_path 优先；空则全局 config/settings.json）"""
+        path = (
+            pathlib.Path(settings_path) if settings_path
+            else pathlib.Path(__file__).resolve().parent.parent.parent / "config" / "settings.json"
+        )
+        if path.is_file():
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        return {}
 
     @staticmethod
     def _looks_like_file_path(value: str) -> bool:
@@ -306,7 +335,7 @@ class GeoThermoAgent:
         lower = value.lower()
         return lower.endswith((".geojson", ".json", ".shp", ".kml", ".gpkg"))
 
-    def _normalize_plan_paths(self, plan: dict) -> None:
+    def _normalize_plan_paths(self, plan: dict, study_areas_dir: str = "") -> None:
         """统一执行计划中所有步骤的路径，确保 data_pipeline 等后续步骤
         使用与 data_acquisition 相同的基准目录。
 
@@ -490,7 +519,7 @@ class GeoThermoAgent:
         # 强制 data_acquisition 的 region 使用已上传研究区文件的绝对路径：
         # 一旦存在已上传研究区，就以它为准，彻底屏蔽 LLM 生成城市名/bbox/错误路径
         # 等不一致输出导致 "could not convert string to float" 的解析崩溃。
-        study_area_file = self._find_study_area_file()
+        study_area_file = self._find_study_area_file(study_areas_dir)
         if study_area_file:
             for step in steps:
                 if step.get("skill") == "data_acquisition":
@@ -499,7 +528,7 @@ class GeoThermoAgent:
 
     # ── 执行引擎 ─────────────────────────────────────────────────────
 
-    def _execute_plan(self, plan: dict, on_token=None, on_log=None, pause_callback=None, project_dir: str = "", workflow_callback=None, stream_acc: Optional[list] = None) -> str:
+    def _execute_plan(self, plan: dict, on_token=None, on_log=None, pause_callback=None, project_dir: str = "", workflow_callback=None, stream_acc: Optional[list] = None, settings_path: str = "", study_areas_dir: str = "") -> str:
         """遍历计划中的步骤，获取对应 Skill，执行并收集结果
 
         特殊处理：
@@ -615,14 +644,7 @@ class GeoThermoAgent:
 
             # 注入用户配置参数（不覆盖 LLM 已指定的值）
             if skill_name == "data_acquisition":
-                _cfg = {}
-                _sp = pathlib.Path(__file__).resolve().parent.parent.parent / "config" / "settings.json"
-                if _sp.is_file():
-                    try:
-                        with open(_sp, "r", encoding="utf-8") as _f:
-                            _cfg = json.load(_f).get("data", {})
-                    except Exception:
-                        pass
+                _cfg = self._load_config(settings_path).get("data", {})
                 if "cloud_threshold" not in step.get("params", {}):
                     step.setdefault("params", {})["cloud_threshold"] = _cfg.get("cloud_threshold", 30)
                 if "dem_source" not in step.get("params", {}):
@@ -637,7 +659,7 @@ class GeoThermoAgent:
             # 即使 _normalize_plan_paths 的替换未生效，也保证 region 是 GeoJSON 绝对路径，
             # 屏蔽 LLM 生成的纯城市名/bbox 导致的解析崩溃）
             if skill_name == "data_acquisition":
-                _sa = self._find_study_area_file()
+                _sa = self._find_study_area_file(study_areas_dir)
                 if _sa:
                     step.setdefault("params", {})["region"] = _sa
 
@@ -649,19 +671,12 @@ class GeoThermoAgent:
 
             # ── 自动调参：model_train_predict 组 Skill 执行前 ─────────────
             if skill_name in _MODEL_TRAIN_SKILLS:
-                # 从 settings.json 注入用户设置的模型参数
-                _settings_path = pathlib.Path(__file__).resolve().parent.parent.parent / "config" / "settings.json"
-                if _settings_path.exists():
-                    try:
-                        with open(_settings_path, "r", encoding="utf-8") as _f:
-                            _cfg = json.load(_f)
-                        _model_cfg = _cfg.get("model", {})
-                        for k in ["n_estimators", "max_depth", "min_samples_split", "min_samples_leaf", "max_features"]:
-                            v = _model_cfg.get(k)
-                            if v is not None:
-                                step["params"][k] = v
-                    except Exception:
-                        pass
+                # 从用户设置注入模型参数（settings_path 为空时回退全局配置）
+                _model_cfg = self._load_config(settings_path).get("model", {})
+                for k in ["n_estimators", "max_depth", "min_samples_split", "min_samples_leaf", "max_features"]:
+                    v = _model_cfg.get(k)
+                    if v is not None:
+                        step["params"][k] = v
 
                 user_specified = bool(step.get("params"))
                 if data_features is not None and not user_specified:
@@ -868,28 +883,26 @@ class GeoThermoAgent:
 
     # ── 上下文 ──────────────────────────────────────────────────────
 
-    def _get_context(self) -> dict:
-        """返回当前软件状态上下文"""
+    def _get_context(self, settings_path: str = "", study_areas_dir: str = "") -> dict:
+        """返回当前软件状态上下文（多用户隔离：settings/研究区按用户）"""
         ctx = {"workflow_status": "idle", "config": {}}
-        _study_areas_dir = pathlib.Path(__file__).resolve().parent.parent.parent / "config" / "study_areas"
+        _study_areas_dir = (
+            pathlib.Path(study_areas_dir) if study_areas_dir
+            else pathlib.Path(__file__).resolve().parent.parent.parent / "config" / "study_areas"
+        )
         uploaded = list(_study_areas_dir.glob("*.geojson")) if _study_areas_dir.exists() else []
         if uploaded:
             ctx["study_area_file"] = str(sorted(uploaded, key=lambda p: p.stat().st_mtime, reverse=True)[0])
 
         # 读取用户配置，传给 LLM
-        _settings_path = pathlib.Path(__file__).resolve().parent.parent.parent / "config" / "settings.json"
-        if _settings_path.is_file():
-            try:
-                with open(_settings_path, "r", encoding="utf-8") as f:
-                    settings = json.load(f)
-                ctx["config"] = {
-                    "cloud_threshold": settings.get("data", {}).get("cloud_threshold", 30),
-                    "dem_source": settings.get("data", {}).get("dem_source", "copernicus"),
-                    "model_params": settings.get("model", {}),
-                    "processing": settings.get("processing", {}),
-                }
-            except Exception:
-                pass
+        settings = self._load_config(settings_path)
+        if settings:
+            ctx["config"] = {
+                "cloud_threshold": settings.get("data", {}).get("cloud_threshold", 30),
+                "dem_source": settings.get("data", {}).get("dem_source", "copernicus"),
+                "model_params": settings.get("model", {}),
+                "processing": settings.get("processing", {}),
+            }
         return ctx
 
     # ── 用户交互 ─────────────────────────────────────────────────────

@@ -10,7 +10,8 @@ export const useSettingsStore = defineStore('settings', {
 
   getters: {
     displayName: (s) => s.settings?.display_name || s.settings?.model_id || '',
-    configured: (s) => !!(s.settings && (s.settings.api_key || s.settings.base_url)),
+    // 凭据不回传明文：以 has_api_key 判断是否已配置（见升级规划 3.12.1）
+    configured: (s) => !!(s.settings && (s.settings.has_api_key || s.settings.base_url)),
   },
 
   actions: {
@@ -31,7 +32,8 @@ export const useSettingsStore = defineStore('settings', {
       const t = useToast()
       const r = await api.post('/api/settings', payload)
       if (!r.ok) { t.error(r.message); return false }
-      this.settings = { ...(this.settings || {}), ...payload }
+      // 重新拉取掩码状态，黑点长度与最新密钥一致
+      try { this.settings = await api.get('/api/settings') } catch (_) {}
       t.success(r.message)
       return true
     },

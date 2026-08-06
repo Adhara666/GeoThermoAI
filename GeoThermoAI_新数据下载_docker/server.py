@@ -23,6 +23,7 @@ import tempfile
 import threading
 import time
 import uuid
+import contextvars
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -31,6 +32,7 @@ _ROOT = Path(__file__).resolve().parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+from core import auth
 from core.ai_assistant import GeoThermoAI_Assistant
 from core.skills.skill_registry import SkillRegistry
 from core.agent.geo_thermo_agent import GeoThermoAgent
@@ -42,6 +44,10 @@ from core.geo_transform import (
     utm_epsg_for_lonlat,
 )
 from core import manifest as run_manifest
+
+# 当前请求所属用户（由鉴权中间件写入；FastAPI 同步路由在 anyio 线程池中运行，
+# 会自动携带 contextvars 上下文；后台线程需自行 set，见 chat_start._runner）
+_uid_ctx: contextvars.ContextVar = contextvars.ContextVar("current_uid", default="")
 
 # ── 常量（与旧版 ui/api.py 保持一致） ──────────────────────────
 
@@ -111,9 +117,10 @@ class AppBackend:
         # 启动期启用 GDAL/OSR 异常模式（A-01）：把静默返回 None/错误码的契约问题
         # 尽早转成可捕获的异常，而不是等到某次下载中途才发现坐标是 inf。
         enable_gdal_osr_exceptions()
-        settings = self._load_settings()
+        settings = self._load_global_settings()
         api_config = settings.get("api", {})
 
+        # 默认（未登录兜底）assistant；实际聊天走 _assistant_for()（每用户独立实例）
         self.assistant = GeoThermoAI_Assistant(
             model_type=api_config.get("model_type", "deepseek"),
             api_key=api_config.get("api_key", ""),
@@ -125,10 +132,9 @@ class AppBackend:
         self.agent = GeoThermoAgent(self.assistant, self.registry)
         self._register_builtin_skills()
 
-        self._conversations_dir = _ROOT / "data" / "conversations"
-        self._conversations_dir.mkdir(parents=True, exist_ok=True)
-        self._study_areas_dir = _ROOT / "config" / "study_areas"
-        self._study_areas_dir.mkdir(parents=True, exist_ok=True)
+        # 每用户独立的 assistant / agent（凭据按用户隔离，禁止跨用户共用）
+        self._user_assistants: Dict[str, GeoThermoAI_Assistant] = {}
+        self._user_agents: Dict[str, GeoThermoAgent] = {}
 
         # 按对话隔离的运行时状态（与旧版一致）
         self._conv_states: Dict[str, dict] = {}
@@ -168,7 +174,61 @@ class AppBackend:
         ):
             self.registry.register(skill)
 
-    def _load_settings(self) -> dict:
+    # ── 用户维度（登录隔离） ────────────────────────────────────
+
+    @staticmethod
+    def _uid() -> str:
+        return _uid_ctx.get() or "default"
+
+    def _user_dir(self) -> Path:
+        return _ROOT / "data" / "users" / self._uid()
+
+    def _conv_dir(self) -> Path:
+        d = self._user_dir() / "conversations"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def _study_dir(self) -> Path:
+        d = self._user_dir() / "study_areas"
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+
+    def _user_settings_path(self) -> Path:
+        return self._user_dir() / "settings.json"
+
+    def _workspace_root(self) -> Path:
+        """项目数据根目录：环境变量 WORKSPACE_ROOT（可指向大容量盘），默认 data/users"""
+        root = os.environ.get("WORKSPACE_ROOT", "").strip()
+        if root:
+            return Path(root)
+        return _ROOT / "data" / "users"
+
+    def _auto_project_dir(self, name: str) -> Path:
+        """按用户隔离的项目目录：{WORKSPACE_ROOT}/{uid}/workspace/{name}
+
+        路径完全由后端分配（升级规划 3.12），前端不接收用户自定义路径，
+        从根本上杜绝不同用户填相同路径导致的数据互写与越权读取。
+        """
+        safe = re.sub(r"[^A-Za-z0-9_\-\u4e00-\u9fff]", "_", name.strip()) or "project"
+        return self._workspace_root() / self._uid() / "workspace" / safe
+
+    def _owns_project_dir(self, project_dir: str) -> bool:
+        """校验 project_dir 归属当前用户：位于其工作区内，或等于其已记录的项目目录"""
+        if not project_dir:
+            return False
+        try:
+            pd = os.path.realpath(project_dir)
+            user_ws = os.path.realpath(self._workspace_root() / self._uid())
+            if pd == user_ws or pd.startswith(user_ws + os.sep):
+                return True
+            for p in self._load_projects():
+                if p.get("dir") and os.path.realpath(p["dir"]) == pd:
+                    return True
+        except Exception:
+            return False
+        return False
+
+    def _load_global_settings(self) -> dict:
         path = _ROOT / "config" / "settings.json"
         if path.exists():
             try:
@@ -178,11 +238,76 @@ class AppBackend:
                 pass
         return {}
 
+    _DEFAULT_USER_SETTINGS = {
+        "api": {
+            "api_format": "openai",
+            "api_base_url": "https://api.deepseek.com",
+            "model_id": "deepseek-v4-flash",
+            "api_key": "",
+            "model_type": "deepseek",
+            "display_name": "DeepSeek-V4-Flash",
+            "context_input": 128000,
+            "context_output": 16000,
+        },
+        "data": {"default_output_dir": "", "cloud_threshold": 30, "dem_source": "copernicus"},
+        "model": {"n_estimators": 200, "max_depth": 25, "min_samples_split": 16, "min_samples_leaf": 8},
+        "processing": {
+            "batch_size": 500000, "chunk_size": 500000,
+            "train_ratio": 0.6, "val_ratio": 0.2, "test_ratio": 0.2,
+        },
+        "data_space": {},
+    }
+
+    def _load_settings(self) -> dict:
+        """读取当前用户的设置；首次访问按默认值创建（不含任何全局凭据，凭据按用户隔离）"""
+        p = self._user_settings_path()
+        if p.exists():
+            try:
+                return json.loads(p.read_text(encoding="utf-8"))
+            except Exception:
+                pass
+        defaults = json.loads(json.dumps(self._DEFAULT_USER_SETTINGS))
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(defaults, ensure_ascii=False, indent=2), encoding="utf-8")
+        return defaults
+
     def _save_settings(self, settings: dict):
-        path = _ROOT / "config" / "settings.json"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(settings, f, ensure_ascii=False, indent=2)
+        p = self._user_settings_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(settings, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def _assistant_for(self) -> GeoThermoAI_Assistant:
+        """当前用户的 assistant（按用户凭据独立实例化并缓存，禁止跨用户共用）"""
+        uid = self._uid()
+        ast = self._user_assistants.get(uid)
+        if ast is None:
+            api = self._load_settings().get("api", {})
+            ast = GeoThermoAI_Assistant(
+                model_type=api.get("model_type", "deepseek"),
+                api_key=api.get("api_key", ""),
+                api_base_url=api.get("api_base_url", ""),
+                model_id=api.get("model_id", ""),
+                api_format=api.get("api_format", "openai"),
+            )
+            ast.model_display_name = api.get("display_name", "") or api.get("model_id", "")
+            ast.system_prompt = ast._build_system_prompt()
+            self._user_assistants[uid] = ast
+        return ast
+
+    def _agent_for(self) -> GeoThermoAgent:
+        """当前用户的 agent（与用户 assistant 绑定）"""
+        uid = self._uid()
+        ag = self._user_agents.get(uid)
+        if ag is None:
+            ag = GeoThermoAgent(self._assistant_for(), self.registry)
+            self._user_agents[uid] = ag
+        return ag
+
+    def _invalidate_user_runtime(self):
+        """设置变更后重建该用户的 assistant/agent（凭据热更新）"""
+        uid = self._uid()
+        self._user_assistants.pop(uid, None)
+        self._user_agents.pop(uid, None)
 
     def _get_conv_state(self, conv_id: str) -> dict:
         if conv_id not in self._conv_states:
@@ -204,7 +329,7 @@ class AppBackend:
 
         新格式为 [{"name": ..., "dir": ...}]，兼容旧格式（字符串数组）。
         """
-        path = self._conversations_dir / "_projects.json"
+        path = self._conv_dir() / "_projects.json"
         try:
             with open(path, "r", encoding="utf-8") as f:
                 raw = json.load(f).get("projects", [])
@@ -219,7 +344,7 @@ class AppBackend:
         return [p for p in result if p.get("name")]
 
     def _save_projects(self, projects: list):
-        path = self._conversations_dir / "_projects.json"
+        path = self._conv_dir() / "_projects.json"
         with open(path, "w", encoding="utf-8") as f:
             json.dump({"projects": projects}, f, ensure_ascii=False, indent=2)
 
@@ -227,9 +352,9 @@ class AppBackend:
         """返回 {项目名: {conv_id: {...}, "__dir__": path}}"""
         convs: Dict[str, dict] = {p["name"]: {"__dir__": p.get("dir", "")}
                                   for p in self._load_projects()}
-        if not self._conversations_dir.exists():
+        if not self._conv_dir().exists():
             return convs
-        for f in sorted(self._conversations_dir.glob("*.json"), key=lambda p: p.stat().st_mtime):
+        for f in sorted(self._conv_dir().glob("*.json"), key=lambda p: p.stat().st_mtime):
             if f.name == "_projects.json":
                 continue
             try:
@@ -256,7 +381,7 @@ class AppBackend:
 
     def _persist_conversation(self, conv_id: str, project: str, title: str,
                               messages: list, project_dir: str = ""):
-        path = self._conversations_dir / f"{conv_id}.json"
+        path = self._conv_dir() / f"{conv_id}.json"
         now = time.strftime("%Y-%m-%d %H:%M:%S")
         if path.exists():
             try:
@@ -283,7 +408,7 @@ class AppBackend:
             json.dump(data, f, ensure_ascii=False, indent=2)
 
     def _update_conversation_file(self, conv_id: str, project: str, **updates):
-        path = self._conversations_dir / f"{conv_id}.json"
+        path = self._conv_dir() / f"{conv_id}.json"
         if not path.exists():
             return
         try:
@@ -298,22 +423,20 @@ class AppBackend:
             json.dump(data, f, ensure_ascii=False, indent=2)
 
     def create_project(self, name: str, path: str = "") -> dict:
+        """创建项目；项目目录由后端按用户自动分配（{WORKSPACE_ROOT}/{uid}/workspace/{name}），
+        忽略前端传入的 path（升级规划 3.12：目录物理隔离）"""
         name = (name or "").strip()
-        path = (path or "").strip()
         convs = self.load_conversations()
         if not name:
             return {"ok": False, "message": "请输入项目名称"}
         if name in convs:
             return {"ok": False, "message": "项目已存在"}
-        normalized = ""
-        if path:
-            # C-05：先规范化路径分隔符再创建目录，避免 Linux 收到 Windows 风格
-            # 路径（含反斜杠/冒号）时先建出字面量目录，随后存储的字符串却是另一形式。
-            normalized = path.replace("\\", "/")
-            try:
-                os.makedirs(normalized, exist_ok=True)
-            except Exception as e:
-                return {"ok": False, "message": f"无法创建目录：{normalized}（{e}）"}
+        auto_dir = self._auto_project_dir(name)
+        try:
+            auto_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            return {"ok": False, "message": f"无法创建项目目录：{auto_dir}（{e}）"}
+        normalized = str(auto_dir).replace("\\", "/")
         projects = self._load_projects()
         if not any(p["name"] == name for p in projects):
             projects.append({"name": name, "dir": normalized})
@@ -387,7 +510,7 @@ class AppBackend:
                 ev.set()
             except Exception:
                 pass
-        path = self._conversations_dir / f"{cid}.json"
+        path = self._conv_dir() / f"{cid}.json"
         if path.exists():
             try:
                 os.remove(path)
@@ -415,17 +538,17 @@ class AppBackend:
         return {"ok": True, "message": "对话已彻底删除", "remaining": remaining}
 
     def save_project_dir(self, pid: str, path: str) -> dict:
+        """保存项目目录。路径由后端按用户自动分配（与 create_project 一致），
+        忽略前端传入路径，杜绝把项目指向他人目录（升级规划 3.12）。"""
         convs = self.load_conversations()
         if pid not in convs:
             return {"ok": False, "message": "请先选择项目"}
-        path = (path or "").strip()
-        # C-05：先规范化路径分隔符再创建目录（理由同 create_project）。
-        normalized = path.replace("\\", "/")
-        if normalized:
-            try:
-                os.makedirs(normalized, exist_ok=True)
-            except Exception as e:
-                return {"ok": False, "message": f"无法创建目录：{normalized}（{e}）"}
+        auto_dir = self._auto_project_dir(pid)
+        try:
+            auto_dir.mkdir(parents=True, exist_ok=True)
+        except Exception as e:
+            return {"ok": False, "message": f"无法创建项目目录：{auto_dir}（{e}）"}
+        normalized = str(auto_dir).replace("\\", "/")
         # 同步 _projects.json 中的项目目录（空项目也能记住路径）
         projects = self._load_projects()
         for p in projects:
@@ -467,54 +590,92 @@ class AppBackend:
 
     # ── API 设置 ───────────────────────────────────────────────
 
+    @staticmethod
+    def _mask_secret(v) -> str:
+        """凭据掩码：sk-****1234；空值返回空串"""
+        if not v or len(v) < 5:
+            return ""
+        return v[:2] + "****" + v[-4:]
+
     def get_settings(self) -> dict:
         s = self._load_settings()
         api = s.get("api", {})
+        raw_key = api.get("api_key", "")
+        ds = s.get("data_space", {})
         return {
             "api_format": api.get("api_format", "openai"),
             "base_url": api.get("api_base_url", ""),
-            "api_key": api.get("api_key", ""),
+            # 凭据不回传明文（升级规划 3.12.1）：只给掩码与长度（供前端按真实长度显示黑点）
+            "api_key": "",
+            "has_api_key": bool(raw_key),
+            "api_key_masked": self._mask_secret(raw_key),
+            "api_key_len": len(raw_key) if raw_key else 0,
             "model_id": api.get("model_id", ""),
             "display_name": api.get("display_name", ""),
             "model_type": api.get("model_type", "deepseek"),
             "context_input": api.get("context_input", 128000),
             "context_output": api.get("context_output", 16000),
-            # Copernicus Data Space 配置（Sentinel-2 数据源，前端数据源面板读写）
-            "data_space": s.get("data_space", {}),
+            # Copernicus Data Space 配置（前端数据源面板读写；秘密字段只回掩码+长度）
+            "data_space": {
+                "username": ds.get("username", ""),
+                "client_id": ds.get("client_id", ""),
+                "s3_key": ds.get("s3_key", ""),
+                "password": self._mask_secret(ds.get("password", "")),
+                "client_secret": self._mask_secret(ds.get("client_secret", "")),
+                "s3_secret": self._mask_secret(ds.get("s3_secret", "")),
+                "has_password": bool(ds.get("password")),
+                "has_client_secret": bool(ds.get("client_secret")),
+                "has_s3_secret": bool(ds.get("s3_secret")),
+                "password_len": len(ds.get("password") or ""),
+                "client_secret_len": len(ds.get("client_secret") or ""),
+                "s3_secret_len": len(ds.get("s3_secret") or ""),
+            },
         }
 
     def save_settings(self, payload: dict) -> dict:
+        s = self._load_settings()
+        api = s.setdefault("api", {})
+
         api_format = "anthropic" if payload.get("api_format") == "anthropic" else "openai"
         base_url = (payload.get("base_url") or "").strip().rstrip("/")
         api_key = (payload.get("api_key") or "").strip()
         model_id = (payload.get("model_id") or "").strip()
         display_name = (payload.get("display_name") or "").strip() or model_id
 
-        # 热更新运行时 assistant
-        self.assistant.api_format = api_format
-        self.assistant.api_base_url = base_url
-        self.assistant.api_key = api_key
-        self.assistant.model_id = model_id
-        self.assistant.model_display_name = display_name or model_id
-        self.assistant.system_prompt = self.assistant._build_system_prompt()
+        api["api_format"] = api_format
+        api["api_base_url"] = base_url
+        # 密钥留空则保持原值（前端回显的是掩码，不能写回）
+        if api_key:
+            api["api_key"] = api_key
+        if model_id:
+            api["model_id"] = model_id
+        if display_name:
+            api["display_name"] = display_name
+        api["model_type"] = payload.get("model_type", api.get("model_type", "deepseek"))
+        api["context_input"] = payload.get("context_input", api.get("context_input", 128000))
+        api["context_output"] = payload.get("context_output", api.get("context_output", 16000))
 
-        s = self._load_settings()
-        s.setdefault("api", {})
-        s["api"].update({
-            "api_format": api_format,
-            "api_base_url": base_url,
-            "api_key": api_key,
-            "model_id": model_id,
-            "display_name": display_name,
-            "model_type": payload.get("model_type", "deepseek"),
-            "context_input": payload.get("context_input", 128000),
-            "context_output": payload.get("context_output", 16000),
-        })
-        # 数据源面板保存 Copernicus Data Space 配置（仅当 payload 携带 data_space 时）
+        # 数据源面板保存 Copernicus Data Space 配置（秘密字段留空保持原值）
         if isinstance(payload.get("data_space"), dict):
-            s["data_space"] = {k: v for k, v in payload["data_space"].items() if v is not None}
+            ds = s.setdefault("data_space", {})
+            for k, v in payload["data_space"].items():
+                if not isinstance(v, str):
+                    if v is not None:
+                        ds[k] = v
+                    continue
+                v = v.strip()
+                if k in ("password", "client_secret", "s3_secret") and not v:
+                    continue  # 留空 = 不修改
+                if v:
+                    ds[k] = v
+                else:
+                    ds.pop(k, None)
+
         self._save_settings(s)
-        return {"ok": True, "message": "✅ API 设置已保存并应用", "display_name": display_name}
+        # 凭据变更后重建该用户的 assistant/agent（热更新，且不影响其他用户）
+        self._invalidate_user_runtime()
+        return {"ok": True, "message": "✅ API 设置已保存并应用",
+                "display_name": api.get("display_name", "")}
 
     # ── 模型参数 ───────────────────────────────────────────────
 
@@ -531,9 +692,9 @@ class AppBackend:
     # ── 研究区上传 ─────────────────────────────────────────────
 
     def save_uploaded_file(self, filename: str, content: bytes) -> str:
-        self._study_areas_dir.mkdir(parents=True, exist_ok=True)
+        self._study_dir().mkdir(parents=True, exist_ok=True)
         fname = os.path.basename(filename)
-        dest = self._study_areas_dir / fname
+        dest = self._study_dir() / fname
         try:
             with open(dest, "wb") as f:
                 f.write(content)
@@ -541,7 +702,7 @@ class AppBackend:
             return f"✗ {fname}: {e}"
         ext = os.path.splitext(fname)[1].lower()
         if ext == ".shp":
-            gj_path = self._study_areas_dir / (os.path.splitext(fname)[0] + ".geojson")
+            gj_path = self._study_dir() / (os.path.splitext(fname)[0] + ".geojson")
             ok, msg = self._shp_to_geojson(str(dest), str(gj_path))
             return f"✓ {fname}\n" + (f"✓ 已转换为 {gj_path.name}" if ok else f"⚠️ 转换失败: {msg}")
         return f"✓ {fname}"
@@ -571,9 +732,9 @@ class AppBackend:
             return False, str(e)
 
     def list_study_areas(self) -> list:
-        if not self._study_areas_dir.exists():
+        if not self._study_dir().exists():
             return []
-        files = sorted(self._study_areas_dir.glob("*.geojson"), key=lambda p: p.stat().st_mtime, reverse=True)
+        files = sorted(self._study_dir().glob("*.geojson"), key=lambda p: p.stat().st_mtime, reverse=True)
         return [f.name for f in files]
 
     # ── 工作流 / 精度 ──────────────────────────────────────────
@@ -694,6 +855,9 @@ class AppBackend:
 
     def list_project_files(self, project_dir: str) -> dict:
         project_dir = (project_dir or "").strip()
+        # 归属校验：只能访问当前用户自己的项目目录（升级规划 3.12，堵越权读取）
+        if not self._owns_project_dir(project_dir):
+            return {"ok": False, "message": "无权访问该目录", "files": []}
         if not project_dir or not os.path.isdir(project_dir):
             return {"ok": False, "message": "目录不存在或未设置", "files": []}
         files = []
@@ -713,11 +877,14 @@ class AppBackend:
         return {"ok": True, "files": files}
 
     def resolve_download(self, project_dir: str, rel_path: str) -> Tuple[Optional[str], str]:
-        """校验下载路径（防目录穿越），返回可下载的绝对路径"""
+        """校验下载路径（防目录穿越 + 归属校验），返回可下载的绝对路径"""
         project_dir = (project_dir or "").strip()
         rel_path = (rel_path or "").strip()
         if not rel_path:
             return None, "未选择文件"
+        # 归属校验：只能下载当前用户自己的项目文件（升级规划 3.12，堵越权下载）
+        if not self._owns_project_dir(project_dir):
+            return None, "无权访问该目录"
         if not project_dir or not os.path.isdir(project_dir):
             return None, "项目目录不存在或未设置"
         base = os.path.realpath(project_dir)
@@ -913,7 +1080,8 @@ class AppBackend:
         history = convs[pid][cid].get("messages", [])
         history = history + [{"role": "user", "content": user_msg}]
 
-        if not self.assistant.api_key and not self.assistant.api_base_url:
+        assistant = self._assistant_for()
+        if not assistant.api_key and not assistant.api_base_url:
             history.append({"role": "assistant", "content": "⚠️ 请先在右侧「🔑 API 设置」配置模型。"})
             self._save_history(pid, cid, history)
             return {"ok": True, "messages": history}
@@ -954,7 +1122,10 @@ class AppBackend:
             if c:
                 prior_messages.append({"role": m.get("role", "user"), "content": c})
 
+        uid = self._uid()
+
         def _runner():
+            ctx_token = _uid_ctx.set(uid)  # 后台线程不带请求 contextvars，需显式恢复用户
             try:
                 if _is_agent_command(user_msg):
                     def on_token(content: str):
@@ -991,13 +1162,15 @@ class AppBackend:
                         wp["steps"] = steps
                         q.put(("workflow", None))
 
-                    result = self.agent.process_command(
+                    result = self._agent_for().process_command(
                         user_msg,
                         on_token=on_token,
                         on_log=lambda text: q.put(("log", text)),
                         pause_callback=pause_callback,
                         workflow_callback=workflow_callback,
                         project_dir=project_dir,
+                        settings_path=str(self._user_settings_path()),
+                        study_areas_dir=str(self._study_dir()),
                     )
                     if result and ("⚠️" in result or "失败" in result or "未找到" in result):
                         q.put(("append", "\n\n" + result))
@@ -1007,13 +1180,15 @@ class AppBackend:
                         "workflow_status": conv_state["workflow_progress"],
                         "config": self._load_settings(),
                     }
-                    self.assistant.ask_stream(
+                    self._assistant_for().ask_stream(
                         user_msg, lambda c: q.put(("token", c)),
                         context=context, prior_messages=prior_messages,
                     )
                     q.put(("done", None))
             except Exception as e:
                 q.put(("error", str(e)))
+            finally:
+                _uid_ctx.reset(ctx_token)
 
         thread = threading.Thread(target=_runner, daemon=True)
         thread.start()
@@ -1197,6 +1372,32 @@ app.add_middleware(
 )
 
 
+# ── 鉴权中间件：/api/* 除白名单外必须携带有效 JWT ──────────────
+# token 来源：Authorization: Bearer <token>，或 SSE/图片等无法带 Header 时用 ?token=
+_AUTH_WHITELIST = {"/api/auth/login", "/api/auth/register", "/api/health"}
+
+
+@app.middleware("http")
+async def auth_guard(request, call_next):
+    path = request.url.path
+    if path.startswith("/api/") and path not in _AUTH_WHITELIST:
+        token = ""
+        auth_hdr = request.headers.get("authorization", "")
+        if auth_hdr.startswith("Bearer "):
+            token = auth_hdr[7:].strip()
+        if not token:
+            token = request.query_params.get("token", "")
+        payload = auth.decode_token(token) if token else None
+        if not payload or not payload.get("sub"):
+            return JSONResponse({"ok": False, "message": "未登录或登录已过期"}, status_code=401)
+        ctx_token = _uid_ctx.set(payload["sub"])
+        try:
+            return await call_next(request)
+        finally:
+            _uid_ctx.reset(ctx_token)
+    return await call_next(request)
+
+
 @app.middleware("http")
 async def no_cache_spa_html(request, call_next):
     """SPA 入口 HTML 禁止缓存，避免旧 index.html 引用已删除的哈希资源导致白屏"""
@@ -1212,6 +1413,42 @@ def _sse(gen):
     """将生成器包装为 SSE 流式响应"""
     return StreamingResponse(gen, media_type="text/event-stream",
                              headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+# ── API：账号（注册/登录/当前用户） ─────────────────────────────
+
+@app.get("/api/health")
+def health():
+    return {"ok": True, "status": "running"}
+
+
+@app.post("/api/auth/register")
+def register(payload: dict):
+    result = auth.register_user(
+        payload.get("username", ""),
+        payload.get("password", ""),
+        payload.get("nickname", ""),
+    )
+    if not result["ok"]:
+        return {"ok": False, "message": result["message"]}
+    return {"ok": True, "message": result["message"], "user": result["user"]}
+
+
+@app.post("/api/auth/login")
+def login(payload: dict):
+    user = auth.authenticate(payload.get("username", ""), payload.get("password", ""))
+    if not user:
+        return {"ok": False, "message": "账号或密码错误"}
+    token = auth.create_token(user["uid"], user["username"])
+    return {"ok": True, "token": token, "user": auth.public_user(user)}
+
+
+@app.get("/api/auth/me")
+def me():
+    user = auth.find_by_uid(_uid_ctx.get())
+    if not user:
+        return JSONResponse({"ok": False, "message": "用户不存在"}, status_code=401)
+    return {"ok": True, "user": auth.public_user(user)}
 
 
 # ── API：bootstrap ─────────────────────────────────────────────

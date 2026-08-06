@@ -3,7 +3,7 @@ import { ref, computed, watch, onMounted, onBeforeUnmount, nextTick } from 'vue'
 import L from 'leaflet'
 import 'leaflet/dist/leaflet.css'
 import { useProjectStore } from '../../stores/project'
-import { api } from '../../api'
+import { api, getToken } from '../../api'
 
 const project = useProjectStore()
 const conv = computed(() => project.currentConv)
@@ -25,7 +25,8 @@ let baseLayer = null
 const overlayMap = {} // id -> L.TileLayer
 
 function tileUrl(id, ts) {
-  return `/api/layer/${encodeURIComponent(id)}/tile/{z}/{x}/{y}?conv=${encodeURIComponent(conv.value || '')}&t=${ts}`
+  // 瓦片由 <img> 加载，无法携带 Header，鉴权 token 走查询参数
+  return `/api/layer/${encodeURIComponent(id)}/tile/{z}/{x}/{y}?conv=${encodeURIComponent(conv.value || '')}&t=${ts}&token=${encodeURIComponent(getToken())}`
 }
 
 function setBase(id) {

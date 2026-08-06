@@ -1,24 +1,23 @@
 """
-数据获取 Skill (Planetary Computer / Copernicus Data Space 版本 / GDAL 实现)
+数据获取 Skill (Planetary Computer / Copernicus Data Space / GDAL 实现)
 
 下载遥感数据：
     - Landsat 8/9 Collection 2 Level-2 (地表温度 lwir11 + qa_pixel)
-    - Sentinel-2 Level-2A (多光谱 + SCL，按景定标 BOA_ADD_OFFSET 后再拼接；
+    - Sentinel-2 Level-2A (多光谱 + SCL，按景应用 BOA_ADD_OFFSET 定标后再拼接；
       优先 Copernicus Data Space，失败回退 Planetary Computer)
     - DEM (Copernicus GLO-30；优先 Copernicus Data Space，失败回退 Planetary Computer)
 
 处理流程：下载 COG → 保存到临时文件 →（Sentinel-2 光谱波段：按景应用 BOA_ADD_OFFSET
 定标）→ gdal.Warp(mosaic + UTM + clip) → 合并多波段 → 重新打开校验 → 原子替换为正式文件
 
-本轮修复（对应审查文档 A-01/A-02/A-03，用户确认第9/11条）：
-    - A-01: bbox 坐标变换统一改用 core.geo_transform（显式传统 GIS 轴序 + 异常模式 +
-      四角加密取样 + 有限性校验），不再是 (lon,lat) 直接喂给按权威轴序解读的 SRS；
-    - A-02: 缺波段/下载失败/Warp失败不再写全零占位并继续；改为结构化失败；
-      BuildVRT/Translate 返回值显式检查；
-      成功前重新打开输出文件校验波段数/尺寸/CRS/有效覆盖率；下载与合成合并进同一个
-      try/finally，临时目录在任何失败路径下都会被清理；
-    - A-03: Sentinel-2 光谱波段在拼接前按景读取 BOA_ADD_OFFSET/quantification 定标，
-      不对所有影像盲减固定值；定标 provenance 写入固定 sentinel2_provenance.json；
+可靠性约定：
+    - bbox 坐标变换统一使用 core.geo_transform（显式传统 GIS 轴序 + 异常模式 +
+      四角加密取样 + 有限性校验）；
+    - 缺波段/下载失败/Warp 失败时返回结构化失败，不写全零占位；BuildVRT/Translate
+      返回值显式检查；成功前重新打开输出文件校验波段数/尺寸/CRS/有效覆盖率；
+      下载与合成合并进同一个 try/finally，临时目录在任何失败路径下都会被清理；
+    - Sentinel-2 光谱波段在拼接前按景读取 BOA_ADD_OFFSET/quantification 定标，
+      不对所有影像盲减固定值；定标 provenance 写入固定 sentinel2_provenance.json。
 """
 
 import os
@@ -59,7 +58,7 @@ SAT_API_TIMEOUT = 30  # STAC API 请求超时(秒)
 _SEARCH_ATTEMPTS = 3
 _STAC_TIMEOUT = 60
 
-# Sentinel-2 波段定标后使用的 nodata 哨兵值（不再用 0，避免和合法的近零校正反射率混淆）
+# Sentinel-2 波段定标后使用的 nodata 哨兵值（不用 0，避免和合法的近零校正反射率混淆）
 _S2_CALIBRATED_NODATA = -9999.0
 
 # DEM 输出 nodata 哨兵值（高程值远大于此，安全）：gdal.Warp cutline 外区域填充并
@@ -103,7 +102,7 @@ def _search_items(catalog, log_callback, label: str, attempts: int = _SEARCH_ATT
 
 
 class BandAcquisitionError(RuntimeError):
-    """必需波段下载/拼接失败的结构化异常（A-02：不得用全零占位代替）。"""
+    """必需波段下载/拼接失败的结构化异常（禁止用全零占位代替）。"""
 
 
 class DataAcquisitionSkill(BaseSkill):
@@ -196,7 +195,7 @@ class DataAcquisitionSkill(BaseSkill):
         log_callback=None,
     ) -> SkillResult:
         """执行数据下载流程；任何必需波段的结构化失败都会转成 success=False 并给出
-        清晰原因，不抛出未捕获异常、也不产出伪造的"成功"占位数据（A-02）。"""
+        清晰原因，不抛出未捕获异常、也不产出伪造的"成功"占位数据。"""
         try:
             return self._execute_impl(params, progress_callback, log_callback)
         except BandAcquisitionError as e:
@@ -455,7 +454,7 @@ class DataAcquisitionSkill(BaseSkill):
         )
         output_paths["qa_path"] = qa_path
 
-        # ── 下载 Sentinel-2 多光谱（按景定标 BOA_ADD_OFFSET，A-03）────
+        # ── 下载 Sentinel-2 多光谱（按景定标 BOA_ADD_OFFSET）────
         if progress_callback:
             progress_callback("data_acquisition", 0.42, "下载 Sentinel-2 多光谱...")
 
@@ -960,12 +959,12 @@ class DataAcquisitionSkill(BaseSkill):
                 })
         return pairs
 
-    # ── Sentinel-2 按景定标（A-03）────────────────────────────────
+    # ── Sentinel-2 按景定标 ────────────────────────────────────
 
     @staticmethod
     def _apply_s2_offset_correction(src_path: str, dst_path: str, offset: float) -> None:
         """把已下载的原始 DN 波段文件按给定 offset 校正为 corrected_DN = DN + offset，
-        原始 DN==0（NoData）像元保持为 nodata（不参与校正），nodata 哨兵改为 -9999，
+        原始 DN==0（NoData）像元保持为 nodata（不参与校正），nodata 哨兵为 -9999，
         避免和合法但接近 0 的校正反射率混淆。写出 Float32（因为校正后可能出现负值）。
         """
         from osgeo import gdal
@@ -1032,9 +1031,9 @@ class DataAcquisitionSkill(BaseSkill):
 
         Args:
             required: True 时任一必需波段缺失/下载失败/Warp失败都会抛出
-                      BandAcquisitionError（A-02：不写全零占位）；False 时
+                      BandAcquisitionError（不写全零占位）；False 时
                       静默跳过，不产生输出文件，也不抛异常。
-            apply_s2_calibration: True 时对每个 (景,波段) 文件按 A-03 定标后再加入
+            apply_s2_calibration: True 时对每个 (景,波段) 文件按景定标后再加入
                                   mosaic 输入列表（仅用于 Sentinel-2 光谱波段）。
             auth_headers: Data Space 下载时附加的 HTTP 请求头（Bearer token）；
                           s3_creds: Data Space eodata S3 密钥（access_key/secret_key），
@@ -1073,7 +1072,7 @@ class DataAcquisitionSkill(BaseSkill):
         if log_callback:
             log_callback("INFO", f"目标坐标系: {utm_epsg_str}")
 
-        # ── 2. bbox → UTM（A-01：统一显式传统 GIS 轴序 + 四角加密 + 有限性校验）──
+        # ── 2. bbox → UTM（统一显式传统 GIS 轴序 + 四角加密 + 有限性校验）──
         x1, y1, x2, y2 = bbox_wgs84_to_utm_bounds(bbox, utm_epsg)
 
         tmp_dir = tempfile.mkdtemp(prefix="gdal_dl_")
@@ -1258,7 +1257,7 @@ class DataAcquisitionSkill(BaseSkill):
                 if log_callback:
                     log_callback("INFO", f"  {b}: {len(urls)} 景 → mosaic 完成")
 
-            # ── 5. 合并多波段（显式检查返回值，A-02）──────────────────
+            # ── 5. 合并多波段（显式检查返回值）──────────────────
             final_tmp = os.path.join(tmp_dir, "final_output.tif")
             if len(band_outputs) == 1:
                 shutil.copy2(band_outputs[0], final_tmp)
@@ -1278,7 +1277,7 @@ class DataAcquisitionSkill(BaseSkill):
                     raise BandAcquisitionError(f"{band}: gdal.Translate 返回空，无法生成最终波段合并文件")
                 translate_ds = None
 
-            # ── 6. 重新打开校验后原子替换为正式文件名（A-02）───────────
+            # ── 6. 重新打开校验后原子替换为正式文件名 ───────────
             def _build(dst_tmp_path: str) -> None:
                 shutil.copy2(final_tmp, dst_tmp_path)
 
@@ -1308,7 +1307,7 @@ class DataAcquisitionSkill(BaseSkill):
 
             write_verified(_build, output_path, _validator)
 
-            # ── 7. 自动内建 overview 金字塔（方案2：新下载影像即带金字塔，瓦片渲染不再慢）──
+            # ── 7. 自动内建 overview 金字塔（新下载影像即带金字塔，加速瓦片渲染）──
             _band_label = band if isinstance(band, str) else "+".join(band)
             _ovr_resampling = "NEAREST" if band in ("SCL", "qa_pixel", "QA_PIXEL") else "AVERAGE"
             self._build_overviews(
@@ -1331,7 +1330,7 @@ class DataAcquisitionSkill(BaseSkill):
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
-    # ── 内建 overview 金字塔（方案2）────────────────────────────────
+    # ── 内建 overview 金字塔 ────────────────────────────────────
 
     @staticmethod
     def _build_overviews(tif_path: str, resampling: str = "AVERAGE",

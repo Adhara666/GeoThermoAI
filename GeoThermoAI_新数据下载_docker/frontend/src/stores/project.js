@@ -55,10 +55,11 @@ export const useProjectStore = defineStore('project', {
       if (p) this.projectDir = p.project_dir || ''
     },
 
-    async createProject(name, dir = '') {
+    async createProject(name) {
       const t = useToast()
       if (!name?.trim()) { t.error('请输入项目名称'); return }
-      const r = await api.post('/api/projects', { name: name.trim(), path: dir || '' })
+      // 项目目录由后端按用户自动分配（升级规划 3.12），前端不再传路径
+      const r = await api.post('/api/projects', { name: name.trim() })
       if (!r.ok) { t.error(r.message); return }
       await this.bootstrap()
       await this.selectProject(name.trim())

@@ -1,16 +1,16 @@
 """
-精度评估 Skill（A-07 / 第6节 重写）
+精度评估 Skill（粗尺度闭合协议）
 
-    - 不再把"独立预测精度"和"TCR后回聚合闭合度"混进同一份 JSON：本 Skill 现在
-      只负责粗尺度闭合协议（coarse_constraint_closure，A-07 协议二），使用
-      完整30m约束层作为参考，明确标注不是独立10m精度、不代表能量/辐射守恒；
-      独立预测协议（independent_prediction）已随 rf_model 阶段一并产出
-      （因为需要模型对象，而本 Skill 拿不到 model_path）；
-    - 彻底删除 5K 阈值判据：不再输出 max_abs_deviation / threshold_K / passed
-      字段及"通过/超出"文案（用户确认第5条）；
+    - 只负责粗尺度闭合协议（coarse_constraint_closure），使用完整 30m 约束层
+      作为参考，评估 10m 最终结果回聚合到 30m 产品格网的算术均值闭合度；
+      明确标注不是独立 10m 精度、不代表能量/辐射守恒；
+    - 独立预测协议（independent_prediction）已随 rf_model 阶段一并产出
+      （因为需要模型对象，本 Skill 拿不到 model_path）；
+    - 输出 MB/MAE/RMSE 及各完整有效输出范围低/高端的有符号温差，不输出
+      阈值判据类字段；
     - Agent 固定注入的 full_30m_csv/meta_30m_json 仍指向 step2 抽样文件，本
-      Skill 按固定命名约定从其所在目录推导完整30m约束层路径，不需要 Agent
-      额外注入新参数（core/agent/geo_thermo_agent.py 未修改）。
+      Skill 按固定命名约定从其所在目录推导完整 30m 约束层路径，不需要 Agent
+      额外注入新参数。
 """
 
 import os
@@ -23,7 +23,7 @@ from ...stage_rebuild import ensure_stage_inputs
 
 
 class AccuracyEvalSkill(BaseSkill):
-    """精度评估：粗尺度闭合协议（A-07 协议二）"""
+    """精度评估：粗尺度闭合协议"""
 
     @property
     def name(self) -> str:
@@ -40,7 +40,7 @@ class AccuracyEvalSkill(BaseSkill):
     @property
     def parameters(self) -> List[SkillParameter]:
         return [
-            SkillParameter(name="test_csv", type="file_path", description="（保留兼容参数，本Skill不再使用；独立预测评估已随rf_model阶段产出）", required=False),
+            SkillParameter(name="test_csv", type="file_path", description="测试集CSV路径（本Skill不使用；独立预测评估已随rf_model阶段产出）", required=False),
             SkillParameter(name="full_30m_csv", type="file_path", description="30m step2抽样CSV路径（仅用于定位同目录下的完整约束层）", required=True),
             SkillParameter(name="predict_csv", type="file_path", description="10m最终结果CSV路径（含row, col, LST_final列）", required=True),
             SkillParameter(name="output_dir", type="file_path", description="输出目录路径", required=True),
@@ -59,7 +59,7 @@ class AccuracyEvalSkill(BaseSkill):
     @property
     def output_schema(self) -> Dict[str, str]:
         return {
-            "closure_metrics": "粗尺度闭合评估结果（A-07协议二）",
+            "closure_metrics": "粗尺度闭合评估结果",
             "report_path": "评估报告JSON路径",
         }
 
@@ -140,7 +140,7 @@ class AccuracyEvalSkill(BaseSkill):
                 artifacts={"output_path": result.get("output_path", "")},
                 stats={"closure": closure, "value_range": value_range},
             )
-            # 全流程最后一步完成后，约束层与 TCR 中间 CSV 不再被任何环节读取，立即清理
+            # 全流程最后一步完成后，约束层与 TCR 中间 CSV 已无任何消费方，立即清理
             cleanup_stage(project_root, "accuracy_eval")
 
         if progress_callback:

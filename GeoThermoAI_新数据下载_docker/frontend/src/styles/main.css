@@ -266,6 +266,12 @@ input, select, textarea { font-family: inherit; }
 }
 /* 左栏底栏：内容垂直水平都居中 */
 .sidebar__footer { align-items: center; text-align: center; font-size: 12px; color: var(--text-muted); line-height: 1.5; }
+/* 左栏底栏账号区（登录后显示当前用户 + 退出） */
+.sidebar__user { display: flex; align-items: center; justify-content: center; gap: 8px; font-size: 13px; color: var(--text); }
+.sidebar__user-name { max-width: 140px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+.sidebar__logout { border: 1px solid var(--border-strong); background: none; color: var(--text-secondary); font-size: 12px; padding: 2px 10px; border-radius: 999px; cursor: pointer; }
+.sidebar__logout:hover { border-color: var(--primary); color: var(--primary); }
+.sidebar__meta { font-size: 11px; }
 /* 工作面板底栏：显眼的收起按钮 + 元信息 */
 .workbench__footer { font-size: 12px; color: var(--text-muted); line-height: 1.5; }
 .workbench__collapse {

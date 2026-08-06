@@ -1,13 +1,12 @@
 """
-TCR 热约束残差修正 Skill（A-05/A-06 重写）
+TCR 热约束残差修正 Skill
 
-    - 30m 参考不再是 step2 抽样 CSV（Agent 固定注入的 data_30m_csv 参数仍指向
-      30m_features_step2.csv），而是完整30m约束层 30m_constraint_grid.csv；
-      本 Skill 按固定命名约定，从 data_30m_csv 所在目录（即预处理阶段的
-      processed_dir）自动推导完整约束层路径，不需要 Agent 额外注入新参数
-      （core/agent/geo_thermo_agent.py 的 SKILL_PATHS 本轮未修改）；
-    - 细→粗映射统一改用 core.grid_mapping 的仿射逆变换，不再是 KDTree 最近邻；
-    - 默认 TCR 模式为 block_constant（用户确认第3条），可选 smooth_recentered。
+    - 30m 参考为完整 30m 约束层 30m_constraint_grid.csv；Agent 固定注入的
+      data_30m_csv 参数仍指向 30m_features_step2.csv，仅用于定位约束层所在
+      目录（即预处理阶段的 processed_dir），本 Skill 按固定命名约定自动推导
+      完整约束层路径，不需要 Agent 额外注入新参数；
+    - 细→粗映射使用 core.grid_mapping 的仿射逆变换；
+    - 默认 TCR 模式为 block_constant，可选 smooth_recentered（实验性，附加诊断）。
 """
 
 import os
@@ -76,7 +75,7 @@ class TCRComputeSkill(BaseSkill):
         return {
             "predict_with_tcr": "含TCR的10m预测CSV路径",
             "tcr_statistics": "TCR统计信息",
-            "validity": "有效性诊断（B-03）",
+            "validity": "有效性诊断",
         }
 
     def execute(
@@ -171,7 +170,7 @@ class TCRComputeSkill(BaseSkill):
                 artifacts={"output_path": result.get("output_path", "")},
                 stats={"tcr_statistics": tcr_stats, "validity": validity, "mode": result.get("mode")},
             )
-            # TCR 计算完成后，10m 预测特征 CSV（含 TTRI 列）不再被下游读取，立即清理
+            # TCR 计算完成后，10m 预测特征 CSV（含 TTRI 列）已无下游消费方，立即清理
             cleanup_stage(project_root, "tcr_compute")
 
         if progress_callback:

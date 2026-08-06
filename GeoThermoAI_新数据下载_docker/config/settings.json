@@ -29,12 +29,5 @@
     "val_ratio": 0.2,
     "test_ratio": 0.2
   },
-  "data_space": {
-    "username": "3509851015@qq.com",
-    "password": "Ji200506220645*",
-    "client_id": "sh-527a6510-15ac-43ee-9a8c-9d226f7c9a06",
-    "client_secret": "gXSJseTaScHNld0P9ZpGEVmvo2DQFt1O",
-    "s3_key": "VDD5Z8S9HFNX1EBF0R1Q",
-    "s3_secret": "Y0kOSrzemUa7gJ9BQwz7Zp8ucKngBUQC0IyV8Tzg"
-  }
+  "data_space": {}
 }

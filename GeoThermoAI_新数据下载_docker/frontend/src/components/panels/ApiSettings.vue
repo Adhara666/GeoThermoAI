@@ -6,6 +6,7 @@ const settings = useSettingsStore()
 const fmt = ref('OpenAI Chat Completions 格式')
 const baseUrl = ref('')
 const apiKey = ref('')
+const hasKey = ref(false)
 const modelId = ref('')
 const displayName = ref('')
 const ctxIn = ref(128000)
@@ -18,7 +19,9 @@ watch(
     if (!s) return
     fmt.value = s.api_format === 'anthropic' ? 'Anthropic Messages 格式' : 'OpenAI Chat Completions 格式'
     baseUrl.value = s.base_url || ''
-    apiKey.value = s.api_key || ''
+    // 凭据不回传明文：已配置时按真实长度显示黑点；重新输入才替换原 Key
+    hasKey.value = !!s.has_api_key
+    apiKey.value = s.api_key_len ? '•'.repeat(s.api_key_len) : ''
     modelId.value = s.model_id || ''
     displayName.value = s.display_name || ''
     ctxIn.value = s.context_input ?? 128000
@@ -37,7 +40,8 @@ async function save() {
   const ok = await settings.saveSettings({
     api_format: fmt.value.includes('Anthropic') ? 'anthropic' : 'openai',
     base_url: baseUrl.value,
-    api_key: apiKey.value,
+    // 仍是黑点占位（未重新输入）→ 传空，后端保持原 Key
+    api_key: apiKey.value && !apiKey.value.startsWith('•') ? apiKey.value : '',
     model_id: modelId.value,
     display_name: displayName.value,
     context_input: Number(ctxIn.value) || 0,
@@ -68,7 +72,7 @@ async function save() {
     </div>
     <div class="form-group">
       <label>API 密钥</label>
-      <input v-model="apiKey" type="password" class="form-input" placeholder="输入 API 密钥（保存后生效）" />
+      <input v-model="apiKey" type="password" class="form-input" placeholder="输入 API 密钥（保存后生效）；已配置时显示为黑点" />
     </div>
     <details class="advanced" style="margin-bottom:12px">
       <summary style="cursor:pointer;font-size:13px;color:var(--text-secondary)">高级配置</summary>

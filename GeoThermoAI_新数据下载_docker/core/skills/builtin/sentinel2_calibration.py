@@ -1,26 +1,25 @@
 """
-Sentinel-2 按景定标（A-03 / 用户确认第11条）
+Sentinel-2 按景定标
 
 背景：Copernicus 自 Processing Baseline 04.00 起，L2A 地表反射率产品引入
 ``BOA_ADD_OFFSET``（当前统一为每波段 -1000 DN）+ ``BOA_QUANTIFICATION_VALUE``
 （当前为 10000），真实反射率 = (DN + BOA_ADD_OFFSET) / BOA_QUANTIFICATION_VALUE；
-DN=0 仍是 NoData。旧实现固定 `DN / 10000`，遗漏了该 offset。
+DN=0 仍是 NoData。
 
 本模块按景（STAC item）解析定标参数：
     1. 优先读取该景 ``product-metadata``（MTD_MSIL2A.xml）资产，逐波段解析真实
-       ``BOA_ADD_OFFSET`` 与全局 ``BOA_QUANTIFICATION_VALUE``（"按景读取"，
-       与用户确认第11条一致，不臆造统一常数）；
+       ``BOA_ADD_OFFSET`` 与全局 ``BOA_QUANTIFICATION_VALUE``（按景读取，
+       不臆造统一常数）；
     2. 若因网络/格式原因解析失败，回退到 Copernicus 官方文档记录的
        processing-baseline 规则（baseline ≥ 04.00 → 每波段 offset=-1000，
-       quantification=10000；更旧 baseline → offset=0，即不遗漏也不误加旧数据）；
-       回退来源会在返回结果的 ``source`` 字段中明确标注，不静默假装是实测值；
+       quantification=10000；更旧 baseline → offset=0）；回退来源会在返回结果
+       的 ``source`` 字段中明确标注，不静默假装是实测值；
     3. 不对所有影像盲减固定值：只对 DN≠0（非 NoData）像元应用该公式，且严格按
        该景自身解析到的参数处理，不跨景套用。
 
-经本轮针对 Planetary Computer 真实 STAC item 核验：该 collection 未提供
-``raster:bands`` scale/offset 扩展字段，只能通过 ``product-metadata`` 资产的
-XML 或 processing_baseline 规则获取，因此不使用（也找不到）不存在的
-STAC 扩展字段。
+注：Planetary Computer 该 collection 未提供 ``raster:bands`` scale/offset 扩展
+字段，定标参数只能通过 ``product-metadata`` 资产的 XML 或 processing_baseline
+规则获取。
 """
 
 import re
