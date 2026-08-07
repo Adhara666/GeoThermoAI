@@ -80,12 +80,20 @@ async function submit() {
 
 <style scoped>
 .login-page {
-  min-height: 100vh;
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  width: 100%;
+  height: var(--app-height, 100%);
+  max-height: var(--app-height, 100%);
+  min-height: 0;
   display: flex;
   align-items: center;
   justify-content: center;
   background: linear-gradient(160deg, #f6f8fb 0%, #e9eef6 100%);
   padding: 16px;
+  overflow: auto;
 }
 .login-card {
   width: 380px;

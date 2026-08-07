@@ -123,6 +123,21 @@ def export_geotiff(
 
     for i, chunk in enumerate(pd.read_csv(lst_final_csv, chunksize=chunk_size, usecols=["row", "col", value_column])):
         n = len(chunk)
+
+        # 空值必须先于 int64 转换检出：NaN 转 int64 会变成 INT64_MIN
+        # (-9223372036854775808)，之后只能报「越界」，读者无法看出真实原因是
+        # 「row/col 是空的」——这通常意味着上游中间 CSV 写入不完整或被截断。
+        null_index = chunk["row"].isna() | chunk["col"].isna()
+        if null_index.any():
+            n_null = int(null_index.sum())
+            first_bad = int(null_index.values.argmax()) + i * chunk_size
+            raise ValueError(
+                f"GeoTIFF 导出失败：CSV 第 {i} 个批次中有 {n_null} 行的 row 或 col 是空值"
+                f"（首个出现在第 {first_bad:,} 行附近）。行列号本应是完整的整数，"
+                f"出现空值通常说明上游中间 CSV 写入不完整（磁盘空间不足或写入被中断），"
+                f"而不是模型或算法问题；拒绝导出以避免静默错位"
+            )
+
         rows = chunk["row"].values.astype(np.int64)
         cols = chunk["col"].values.astype(np.int64)
         vals = chunk[value_column].values.astype(np.float32)

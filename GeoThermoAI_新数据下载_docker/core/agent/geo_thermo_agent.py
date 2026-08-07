@@ -18,13 +18,14 @@ logger = logging.getLogger(__name__)
 from ..ai_assistant import GeoThermoAI_Assistant
 from ..skills.skill_registry import SkillRegistry
 from ..skills.base_skill import SkillResult
-
-
-# model_train_predict 组中所有 Skill 名称，用于自动调参判断
-_MODEL_TRAIN_SKILLS = {"rf_model", "xgboost_model"}
-
-# 特殊标记：Agent 需要用户输入才能继续
-PAUSE_MARKER = "__AGENT_PAUSE__"
+from . import executor, plan_schema, presentation
+from .executor import PAUSE_MARKER, MODEL_TRAIN_SKILLS as _MODEL_TRAIN_SKILLS
+from .orchestrator import agent_config, approval as approval_proto
+from .orchestrator.approval import Node, Option
+from .orchestrator.exec_mode import normalize as _normalize_exec_mode
+from .orchestrator.run_state import RunState
+from .roles.base_role import extract_json
+from .roles.slots import match_study_area
 
 # 记忆系统不可用/未接入时的基础领域知识兜底（正常接入后由 RAG 检索注入，见 core/memory/）
 _BASIC_KNOWLEDGE = """- TTRI（地形热响应指数）= a*DEM + b*Slope + c*cos(Aspect)
@@ -36,15 +37,8 @@ _BASIC_KNOWLEDGE = """- TTRI（地形热响应指数）= a*DEM + b*Slope + c*cos
   Landsat 8/9 L2、Sentinel-2 L2A、Copernicus GLO-30 DEM 均由系统自动搜索下载；不使用 Google Earth Engine（GEE）"""
 
 # 各 Skill 的阶段说明（气泡中"阶段开始"时展示，帮助用户了解每一步在做什么）
-_STEP_DESCRIPTIONS = {
-    "data_acquisition": "下载 Landsat 8/9、Sentinel-2 L2A 与 DEM 影像",
-    "data_pipeline": "预处理并划分数据集：生成 30m 训练数据、完整约束层与 10m 预测数据",
-    "ttri_compute": "拟合地形校正（TTRI）系数并空间化到 30m/10m 网格",
-    "rf_model": "训练随机森林降尺度模型并输出独立精度评价",
-    "tcr_compute": "计算地形校正残差（TCR）",
-    "lst_export": "计算最终 10m 地表温度并导出 GeoTIFF",
-    "accuracy_eval": "粗尺度闭合精度评估",
-}
+# 单一来源在 core/agent/presentation.py，避免执行引擎与本文件两处中文名不一致
+_STEP_DESCRIPTIONS = presentation.LEGACY_STEP_DESCRIPTIONS
 
 
 _PROJECT_DIR_PROMPT = """## 项目目录（已由用户设置）
@@ -62,7 +56,7 @@ class GeoThermoAgent:
 
     # ── 公开接口 ─────────────────────────────────────────────────────
 
-    def process_command(self, user_input: str, on_token=None, on_log=None, pause_callback=None, project_dir: str = "", workflow_callback=None, settings_path: str = "", study_areas_dir: str = "", conv_id: str = "", project_id: str = "", memory_manager=None) -> str:
+    def process_command(self, user_input: str, on_token=None, on_log=None, pause_callback=None, project_dir: str = "", workflow_callback=None, settings_path: str = "", study_areas_dir: str = "", conv_id: str = "", project_id: str = "", memory_manager=None, exec_mode: str = "", prior_messages=None, session_state=None) -> str:
         """处理用户自然语言指令
 
         流程：
@@ -82,7 +76,25 @@ class GeoThermoAgent:
         conv_id:          当前对话 id（实验记录级联删除依据）
         project_id:       当前项目稳定 id（记忆按项目隔离）
         memory_manager:   MemoryManager 实例（None 则跳过记忆读写，向后兼容）
+        exec_mode:        执行模式（approval / auto）；空则由角色编排取默认值
+        prior_messages:   完整对话历史（修复「Agent 路径看不到上文」，技术方案 1.5(1)）
+        session_state:    本对话已确认槽位（技术方案 8.2）
+
+        以上三个参数均为可选，不传时行为与角色化改造前完全一致。
         """
+        # 角色编排开关（技术方案第 12 章）：开启时走多角色路径，
+        # 关闭时完全走下面的现有旧路径，行为与改造前一致
+        if self._agent_settings(settings_path)["roles_enabled"]:
+            return self.process_command_with_roles(
+                user_input, on_token=on_token, on_log=on_log,
+                pause_callback=pause_callback, project_dir=project_dir,
+                workflow_callback=workflow_callback, settings_path=settings_path,
+                study_areas_dir=study_areas_dir, conv_id=conv_id,
+                project_id=project_id, memory_manager=memory_manager,
+                exec_mode=exec_mode, prior_messages=prior_messages,
+                session_state=session_state,
+            )
+
         # 全局流式缓冲：process_command 与 _execute_plan 共用，
         # 保证气泡按"完整累积文本"展示整个中间过程（而不是被末尾覆盖）
         _stream_acc: List[str] = []
@@ -98,7 +110,9 @@ class GeoThermoAgent:
         )
         uploaded = list(_study_areas_dir.glob("*.geojson")) if _study_areas_dir.exists() else []
         if uploaded:
-            _emit(f"📁 已加载研究区文件：{sorted(uploaded, key=lambda p: p.stat().st_mtime, reverse=True)[0].name}\n")
+            _emit(presentation.study_area_loaded(
+                sorted(uploaded, key=lambda p: p.stat().st_mtime,
+                       reverse=True)[0].name))
 
         # 检测是否为纯咨询类请求（例如参数推荐、原理解答、数据源问答）。
         # 这类请求不需要生成 JSON 执行计划，否则 LLM 可能返回类似
@@ -139,7 +153,7 @@ class GeoThermoAgent:
                 memory_block = ""
         system_prompt = self._build_system_prompt(context, tool_desc, project_dir=project_dir, memory_block=memory_block)
 
-        _emit("正在调用 LLM 生成执行计划...\n")
+        _emit(presentation.planning_started())
 
         # 4. 调用 LLM 生成执行计划（低温度；max_tokens 留足余量，
         #    若模型带推理，推理 token 也计入输出预算，太小的值会把 JSON 截断）
@@ -152,8 +166,8 @@ class GeoThermoAgent:
         plan = self._parse_plan(response)
         if plan is None:
             if response.startswith("API调用失败") or response.startswith("API流式调用失败"):
-                return f"⚠️ {response}"
-            _emit("⚠️ 执行计划解析失败，重试一次...\n")
+                return presentation.sanitize(response)
+            _emit(presentation.planning_retry())
             response = self.assistant._call_api([
                 {"role": "system", "content": system_prompt + "\n\n## 强制要求\n只输出一个JSON对象，不要任何解释文字、标题或代码块标记。"},
                 {"role": "user", "content": user_input},
@@ -162,14 +176,15 @@ class GeoThermoAgent:
         if plan is None:
             # 全流程指令最终兜底：用内置完整计划，保证流程可继续执行
             if any(kw in user_input for kw in ["全流程", "一键", "跑完全流程", "执行全流程"]):
-                _emit("⚠️ LLM 计划解析失败，改用内置完整工作流计划继续执行...\n")
+                _emit(presentation.planning_fallback())
                 info = self._guess_region_from_input(user_input)
                 plan = self._build_full_workflow_plan(info, study_areas_dir=study_areas_dir)
             else:
                 # 其他指令解析失败时，返回原始响应方便用户排查
-                return f"⚠️ 执行计划解析失败，返回内容如下（可截图反馈）：\n{response[:500]}"
+                return ("我没能把你的需求整理成可执行的步骤，请再说明一次"
+                        "研究区、时间范围和要生成的产品。")
 
-        _emit("执行计划已生成\n")
+        _emit(presentation.plan_ready(len(plan.get("steps", []))))
 
         # 5.5 安全网：用户要求全流程时，确保计划完整且参数有效
         steps = plan.get("steps", [])
@@ -196,7 +211,7 @@ class GeoThermoAgent:
                                              or len(steps) == 0)
 
         if needs_fix:
-            _emit("⚠️ LLM 返回的执行计划不完整，自动修正为完整工作流...\n")
+            _emit(presentation.plan_completed_by_safety_net())
             info = self._guess_region_from_input(user_input)
             plan = self._build_full_workflow_plan(info, study_areas_dir=study_areas_dir)
 
@@ -205,8 +220,52 @@ class GeoThermoAgent:
 
         return self._execute_plan(plan, on_token=on_token, on_log=on_log, pause_callback=pause_callback, project_dir=project_dir, workflow_callback=workflow_callback, stream_acc=_stream_acc, settings_path=settings_path, study_areas_dir=study_areas_dir, conv_id=conv_id, project_id=project_id, memory_manager=memory_manager)
 
+    # ── 角色编排入口（技术方案 2.1：Plan 交规划 Agent，Solve 由本类调度）────
+
+    def _agent_settings(self, settings_path: str = "") -> Dict[str, Any]:
+        """解析 settings.agent：每用户设置的 agent 段 > 全局 config/settings.json > 代码默认。"""
+        user = self._load_config(settings_path)
+        if isinstance(user.get("agent"), dict):
+            return agent_config.resolve(user)
+        return agent_config.resolve(self._load_config(""))
+
+    def process_command_with_roles(self, user_input: str, on_token=None, on_log=None,
+                                   pause_callback=None, project_dir: str = "",
+                                   workflow_callback=None, settings_path: str = "",
+                                   study_areas_dir: str = "", conv_id: str = "",
+                                   project_id: str = "", memory_manager=None,
+                                   exec_mode: str = "", prior_messages=None,
+                                   session_state=None) -> str:
+        """多角色路径（薄委托）：规划 Agent 出 plan，总调度按 plan 依次调用执行 Agent。
+
+        实现在 `core/agent/orchestrator/role_flow.py`；与旧路径互不影响，
+        `roles_enabled=False` 时永不进入这里。
+        """
+        from .orchestrator import role_flow
+
+        return role_flow.run_with_roles(
+            self, user_input, on_token=on_token, on_log=on_log,
+            pause_callback=pause_callback, project_dir=project_dir,
+            workflow_callback=workflow_callback, settings_path=settings_path,
+            study_areas_dir=study_areas_dir, conv_id=conv_id, project_id=project_id,
+            memory_manager=memory_manager, exec_mode=exec_mode,
+            prior_messages=prior_messages, session_state=session_state,
+        )
+
+    def _resolved_study_areas_dir(self, study_areas_dir: str = "") -> str:
+        path = (pathlib.Path(study_areas_dir) if study_areas_dir
+                else pathlib.Path(__file__).resolve().parent.parent.parent / "config" / "study_areas")
+        return str(path)
+
+    def _list_study_areas(self, study_areas_dir: str = "") -> List[str]:
+        base = pathlib.Path(self._resolved_study_areas_dir(study_areas_dir))
+        if not base.exists():
+            return []
+        return [p.name for p in sorted(base.glob("*.geojson"),
+                                       key=lambda p: p.stat().st_mtime, reverse=True)]
+
     def _guess_region_from_input(self, user_input: str) -> dict:
-        """从用户输入中猜测研究区域和时间范围"""
+        """从用户输入中猜测研究区域和时间范围（仅旧路径兜底使用）"""
         region_map = {
             "武汉": "113.7,29.9,114.9,31.3",
             "北京": "115.4,39.4,117.5,41.1",
@@ -299,42 +358,24 @@ class GeoThermoAgent:
         }
 
     def _parse_plan(self, response: str) -> Optional[dict]:
-        """从 LLM 响应中提取并解析 JSON 执行计划"""
-        text = response.strip()
+        """从 LLM 响应中提取并解析 JSON 执行计划
 
-        # 尝试直接解析
-        try:
-            return json.loads(text)
-        except json.JSONDecodeError:
-            pass
-
-        # 尝试从 ```json ... ``` 代码块中提取
-        import re
-        m = re.search(r'```(?:json)?\s*\n?(.*?)\n?```', text, re.DOTALL)
-        if m:
-            try:
-                return json.loads(m.group(1).strip())
-            except json.JSONDecodeError:
-                pass
-
-        # 尝试找到第一个 { 和最后一个 } 之间的内容
-        start = text.find('{')
-        end = text.rfind('}')
-        if start != -1 and end != -1 and end > start:
-            try:
-                return json.loads(text[start:end+1])
-            except json.JSONDecodeError:
-                pass
-
-        return None
+        三级兜底（直接解析 → ```json``` 代码块 → 首尾大括号）的单一实现在
+        `core/agent/roles/base_role.extract_json`，此处委托，避免两处解析策略漂移。
+        """
+        return extract_json(response)
 
     # ── 路径统一 ─────────────────────────────────────────────────────
 
-    def _find_study_area_file(self, study_areas_dir: str = "") -> Optional[str]:
-        """查找最新上传的研究区文件，返回绝对路径；未找到返回 None
+    def _find_study_area_file(self, study_areas_dir: str = "",
+                              preferred_name: str = "") -> Optional[str]:
+        """查找研究区文件，返回绝对路径；未找到返回 None
 
         Args:
             study_areas_dir: 每用户研究区目录；空则用全局 config/study_areas
+            preferred_name:  用户说的地名/文件名。给定时按「精确匹配 → 包含匹配」
+                             找对应文件；都匹配不上再退回「取最新上传」。
+                             不传时行为与改造前完全一致。
         """
         _study_areas_dir = (
             pathlib.Path(study_areas_dir) if study_areas_dir
@@ -343,6 +384,10 @@ class GeoThermoAgent:
         uploaded = list(_study_areas_dir.glob("*.geojson")) if _study_areas_dir.exists() else []
         if not uploaded:
             return None
+        if preferred_name:
+            matched = match_study_area(uploaded, preferred_name)
+            if matched is not None:
+                return str(matched.resolve())
         latest = sorted(uploaded, key=lambda p: p.stat().st_mtime, reverse=True)[0]
         return str(latest.resolve())
 
@@ -552,7 +597,12 @@ class GeoThermoAgent:
         # 强制 data_acquisition 的 region 使用已上传研究区文件的绝对路径：
         # 一旦存在已上传研究区，就以它为准，彻底屏蔽 LLM 生成城市名/bbox/错误路径
         # 等不一致输出导致 "could not convert string to float" 的解析崩溃。
-        study_area_file = self._find_study_area_file(study_areas_dir)
+        # plan 已由规划 Agent 解析出 region.study_area_file 时以它为准（技术方案 10.1）；
+        # 旧格式 plan 无该字段，行为与改造前完全一致。
+        planned_region = ""
+        if isinstance(plan.get("region"), dict):
+            planned_region = str(plan["region"].get("study_area_file") or "")
+        study_area_file = planned_region or self._find_study_area_file(study_areas_dir)
         if study_area_file:
             for step in steps:
                 if step.get("skill") == "data_acquisition":
@@ -561,372 +611,28 @@ class GeoThermoAgent:
 
     # ── 执行引擎 ─────────────────────────────────────────────────────
 
-    def _execute_plan(self, plan: dict, on_token=None, on_log=None, pause_callback=None, project_dir: str = "", workflow_callback=None, stream_acc: Optional[list] = None, settings_path: str = "", study_areas_dir: str = "", conv_id: str = "", project_id: str = "", memory_manager=None) -> str:
-        """遍历计划中的步骤，获取对应 Skill，执行并收集结果
+    def _execute_plan(self, plan: dict, on_token=None, on_log=None, pause_callback=None, project_dir: str = "", workflow_callback=None, stream_acc: Optional[list] = None, settings_path: str = "", study_areas_dir: str = "", conv_id: str = "", project_id: str = "", memory_manager=None, hooks=None, exec_mode: str = "", run_state=None) -> str:
+        """遍历计划中的步骤，获取对应 Skill，执行并收集结果（薄委托）
 
-        特殊处理：
-        - data_acquisition 完成后，将其实际输出路径注入后续步骤
-        - data_pipeline 完成后收集数据特征
-        - rf_model 执行前若用户未手动指定参数，自动调用 LLM 推荐超参数
-        - 自动统一所有步骤的 output_dir 路径
-        - 当 data_acquisition 找到多组影像配对时，通过 pause_callback 询问用户
+        实现已平移到 `core/agent/executor.execute_plan`（技术方案 10.1/10.2）。
+        本方法保留原有位置参数与关键字参数一字不改，是
+        `tests/test_memory_synthetic.py` 的回归护栏；新增的 hooks / exec_mode /
+        run_state 均为可选参数，不传时行为与平移前等价。
 
         on_token: 可选回调，用于流式输出气泡内容（阶段开始/完成摘要/最终结果）
         on_log:   可选回调，用于输出过程日志（进度百分比/INFO/WARN/详细过程）
         pause_callback: 可选回调，需要用户输入时调用
+        hooks:    可选 StageHooks，角色编排的扩展点；None 时三个钩子全部短路
         """
-        results: List[str] = []
-        data_features: Optional[dict] = None  # 缓存 data_pipeline 输出的数据特征
-        _emit_accumulator = stream_acc if stream_acc is not None else []  # 与 process_command 共用缓冲
-
-        # ── 实验记录累积（记忆系统）：收尾自动入库 ───────────────
-        exp_state = {
-            "acq_params": None,       # data_acquisition 步骤参数（region/日期）
-            "pair": None,             # 用户选中的影像配对
-            "data_features": None,    # data_pipeline 数据特征
-            "rf_data": None,          # rf_model 结果 data
-            "acc_data": None,         # accuracy_eval 结果 data
-            "step_success": {},       # skill_name -> bool
-            "failed": None,           # (skill_name, message) 首个失败步骤
-            "paused": False,          # 是否因等待用户输入而暂停
-        }
-
-        def _build_experiment_record(status: str, failure_stage: str = "", failure_message: str = "") -> dict:
-            acq = exp_state.get("acq_params") or {}
-            region = acq.get("region", "")
-            if isinstance(region, str) and region.lower().endswith(".geojson"):
-                region = os.path.basename(region)
-            record = {
-                "schema_version": 1,
-                "experiment_id": f"exp_{project_id[:8]}_{int(time.time())}" if project_id else "",
-                "conv_id": conv_id,
-                "project_id": project_id,
-                "region": region,
-                "date_range": [acq.get("start_date", ""), acq.get("end_date", "")],
-                "pair": exp_state.get("pair") or {},
-                "status": status,
-                "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
-            }
-            df = exp_state.get("data_features")
-            if df:
-                record["data_features"] = df
-            rf = exp_state.get("rf_data") or {}
-            if rf:
-                metrics = {}
-                if rf.get("train_metrics"):
-                    metrics["train"] = rf["train_metrics"]
-                if rf.get("test_metrics"):
-                    metrics["test"] = rf["test_metrics"]
-                record["model"] = "rf"
-                record["params"] = rf.get("params", {})
-                record["metrics"] = metrics
-                record["feature_importance"] = rf.get("feature_importance", [])
-                record["independent_prediction"] = rf.get("independent_prediction", {})
-                record["train_time_seconds"] = rf.get("train_time_seconds", 0)
-            acc = exp_state.get("acc_data") or {}
-            acc_full = acc.get("closure_metrics") or {}
-            if acc_full:
-                closure = dict(acc_full.get("closure", {}))
-                closure["value_range"] = acc_full.get("value_range", {})
-                record["closure"] = closure
-            if status == "failed":
-                record["failure_stage"] = failure_stage
-                record["failure_message"] = failure_message
-            return record
-
-        def _finalize_experiment(status: str, failure_stage: str = "", failure_message: str = ""):
-            """收尾写实验记录：缺记忆上下文或写入失败仅告警，绝不影响主流程。"""
-            if memory_manager is None or not project_id or not conv_id:
-                return
-            try:
-                record = _build_experiment_record(status, failure_stage, failure_message)
-                memory_manager.auto_save_experiment(project_id, record)
-            except Exception as e:
-                logger.warning(f"[memory] 实验记录写入失败（已忽略）: {e}")
-
-        def _record_step(skill_name: str, ok: bool, message: str = ""):
-            exp_state["step_success"][skill_name] = ok
-            if not ok and exp_state["failed"] is None:
-                exp_state["failed"] = (skill_name, message)
-
-        # 解析项目目录：所有路径写死相对于 project_dir
-        raw_dir = (project_dir + "/raw").replace("\\", "/") if project_dir else ""
-        processed_dir = (project_dir + "/processed").replace("\\", "/") if project_dir else ""
-        results_dir = (project_dir + "/results").replace("\\", "/") if project_dir else ""
-
-        steps = plan.get("steps", [])
-        total = len(steps)
-
-        def _emit(text, to_log=False):
-            # to_log=True 的过程日志只进日志页（on_log），不进气泡/对话历史；
-            # 其余内容进气泡累加器，经 on_token 推全文给前端气泡
-            if to_log:
-                if on_log:
-                    on_log(text)
-                return
-            _emit_accumulator.append(text)
-            full_text = "".join(_emit_accumulator)
-            if on_token:
-                on_token(full_text)
-
-        # 硬编码路径映射（每个 skill 的输入/输出路径）
-        SKILL_PATHS = {
-            "data_acquisition": {
-                "output_dir": raw_dir,
-            },
-            "data_pipeline": {
-                "output_dir": processed_dir,
-                "landsat_path": raw_dir + "/landsat_lst.tif",
-                "qa_path": raw_dir + "/landsat_qa_pixel.tif",
-                "sentinel2_path": raw_dir + "/sentinel2_bands.tif",
-                "scl_path": raw_dir + "/sentinel2_scl.tif",
-                "dem_path": raw_dir + "/dem.tif",
-            },
-            "ttri_compute": {
-                "output_dir": processed_dir,
-                "data_30m_csv": processed_dir + "/30m_features_step2.csv",
-                "predict_10m_csv": processed_dir + "/10m_predict_features.csv",
-                "train_csv": processed_dir + "/train.csv",
-                "val_csv": processed_dir + "/validate.csv",
-                "test_csv": processed_dir + "/test.csv",
-            },
-            "rf_model": {
-                "output_dir": results_dir,
-                "train_csv": processed_dir + "/train.csv",
-                "val_csv": processed_dir + "/validate.csv",
-                "test_csv": processed_dir + "/test.csv",
-            },
-            "tcr_compute": {
-                 "output_dir": results_dir,
-                 "output_path": results_dir + "/tcr_result.csv",
-                 "data_30m_csv": processed_dir + "/30m_features_step2.csv",
-                 "meta_30m_json": processed_dir + "/30m_features_step2_meta.json",
-                 "predict_10m_csv": processed_dir + "/10m_predict_features.csv",
-                 "meta_10m_json": processed_dir + "/10m_predict_features_meta.json",
-                 "model_path": None,  # 动态查找
-             },
-            "lst_export": {
-                 "output_dir": results_dir,
-                 "input_csv": results_dir + "/tcr_result.csv",
-                 "meta_10m_json": processed_dir + "/10m_predict_features_meta.json",
-             },
-            "accuracy_eval": {
-                "output_dir": results_dir,
-                "test_csv": processed_dir + "/test.csv",
-                "full_30m_csv": processed_dir + "/30m_features_step2.csv",
-                "predict_csv": results_dir + "/tcr_result.csv",
-                "meta_30m_json": processed_dir + "/30m_features_step2_meta.json",
-                "meta_10m_json": processed_dir + "/10m_predict_features_meta.json",
-            },
-        }
-
-        for i, step in enumerate(steps):
-            skill_name = step["skill"]
-            skill = self.registry.get(skill_name)
-
-            # 注入硬编码路径
-            if project_dir and skill_name in SKILL_PATHS:
-                params = step.get("params", {})
-                if not params:
-                    params = {}
-                for k, v in SKILL_PATHS[skill_name].items():
-                    if v is None:
-                        # 动态查找：model_path 等
-                        if k == "model_path" and results_dir:
-                            _mdir = results_dir + "/train"
-                            if os.path.isdir(_mdir):
-                                _pkls = sorted(
-                                    glob.glob(os.path.join(_mdir, "*.pkl")),
-                                    key=lambda p: os.path.getmtime(p), reverse=True
-                                )
-                                if _pkls:
-                                    params[k] = _pkls[0].replace("\\", "/")
-                    else:
-                        params[k] = v
-                step["params"] = params
-
-            # 注入用户配置参数（不覆盖 LLM 已指定的值）
-            if skill_name == "data_acquisition":
-                _cfg = self._load_config(settings_path).get("data", {})
-                if "cloud_threshold" not in step.get("params", {}):
-                    step.setdefault("params", {})["cloud_threshold"] = _cfg.get("cloud_threshold", 30)
-                if "dem_source" not in step.get("params", {}):
-                    step.setdefault("params", {})["dem_source"] = _cfg.get("dem_source", "copernicus")
-
-            if not skill:
-                results.append(f"未找到技能: {skill_name}")
-                _emit(f"  ❌ 未找到技能: {skill_name}\n")
-                continue
-
-            # 强制 data_acquisition 的 region 使用已上传研究区文件（执行期兜底：
-            # 即使 _normalize_plan_paths 的替换未生效，也保证 region 是 GeoJSON 绝对路径，
-            # 屏蔽 LLM 生成的纯城市名/bbox 导致的解析崩溃）
-            if skill_name == "data_acquisition":
-                _sa = self._find_study_area_file(study_areas_dir)
-                if _sa:
-                    step.setdefault("params", {})["region"] = _sa
-
-            _desc = _STEP_DESCRIPTIONS.get(skill_name, "")
-            _emit(f"**Step {i+1}/{total}**: {skill_name}" + (f" — {_desc}" if _desc else "") + "\n")
-            # 更新工作流进度（running）
-            if workflow_callback:
-                workflow_callback(skill_name, "running", i, total)
-
-            # ── 自动调参：model_train_predict 组 Skill 执行前 ─────────────
-            if skill_name in _MODEL_TRAIN_SKILLS:
-                # 从用户设置注入模型参数（settings_path 为空时回退全局配置）
-                _model_cfg = self._load_config(settings_path).get("model", {})
-                for k in ["n_estimators", "max_depth", "min_samples_split", "min_samples_leaf", "max_features"]:
-                    v = _model_cfg.get(k)
-                    if v is not None:
-                        step["params"][k] = v
-
-                user_specified = bool(step.get("params"))
-                if data_features is not None and not user_specified:
-                    _emit("正在调用 LLM 推荐模型参数...\n")
-                    tuning_prompt = self._build_tuning_prompt(data_features)
-                    tuning_response = self.assistant._call_api([
-                        {"role": "system", "content": tuning_prompt},
-                    ])
-                    try:
-                        recommended_params = json.loads(tuning_response)
-                        step["params"] = recommended_params
-                        results.append(
-                            f"[自动调参] 根据数据特征推荐参数: "
-                            f"{json.dumps(recommended_params, ensure_ascii=False)}"
-                        )
-                    except json.JSONDecodeError:
-                        results.append(
-                            "[自动调参] LLM 返回的参数无法解析，将使用 Skill 默认参数"
-                        )
-
-            # ── 执行 Skill（data_acquisition 特殊处理：搜索→选择→下载）─
-            try:
-                def _log(tag, msg):
-                    _emit(f"  [{tag}] {msg}\n", to_log=True)
-                def _progress(name, pct, msg):
-                    _emit(f"  {name} {int(pct*100)}%: {msg}\n", to_log=True)
-
-                # data_acquisition: 先搜索返回配对，用户选择后再下载
-                if skill_name == "data_acquisition":
-                    exp_state["acq_params"] = step.get("params", {})
-                    if not step.get("params", {}).get("selected_pair"):
-                        # 第一次：搜索模式
-                        result = skill.execute(
-                            step.get("params", {}),
-                            progress_callback=_progress,
-                            log_callback=_log,
-                        )
-                        result_data = result.data if isinstance(result.data, dict) else {}
-                        pairs = result_data.get("image_pairs", [])
-                        if pairs:
-                            _emit(f"  📋 找到 {len(pairs)} 组影像配对\n")
-                            # 总是让用户确认选择，即使只有一对
-                            selected = None
-                            if pause_callback:
-                                selected = self._ask_user_to_select_pair(
-                                    pairs, pause_callback, _emit, return_selected=True)
-                                if selected is None:
-                                    exp_state["paused"] = True
-                                    _emit(f"⏸️ 等待用户选择...\n")
-                                    _finalize_experiment("paused")
-                                    return "\n".join(results) + f"\n{PAUSE_MARKER}"
-                            else:
-                                selected = pairs[0]
-                                _emit(f"  ✅ 自动选择第 1 对\n")
-                            # 注入选择，重新执行下载
-                            step["params"]["selected_pair"] = selected
-                            exp_state["pair"] = selected
-                            _emit(f"  **开始下载所选配对数据**\n")
-                            result = skill.execute(
-                                step.get("params", {}),
-                                progress_callback=_progress,
-                                log_callback=_log,
-                            )
-                        else:
-                            # 执行失败：透出真实错误，不要伪装成"未找到配对"
-                            if not result.success:
-                                _msg = (result.message or f"{skill_name} 执行失败").strip()
-                                _emit(f"  ❌ {_msg}\n")
-                                results.append(f"{skill_name}: {_msg}")
-                                if workflow_callback:
-                                    workflow_callback(skill_name, "failed", i, total)
-                                _record_step(skill_name, False, _msg)
-                                _finalize_experiment("failed", skill_name, _msg)
-                                return "\n".join(results)
-                            _lc = result_data.get("landsat_count", 0)
-                            _sc = result_data.get("sentinel_count", 0)
-                            _emit(f"  ⚠️ 未找到影像配对（Landsat {_lc} 景 / Sentinel {_sc} 景），后续步骤终止\n")
-                            results.append(
-                                f"{skill_name}: 未找到符合条件的影像配对"
-                                f"（Landsat {_lc} 景 / Sentinel {_sc} 景）"
-                            )
-                            _record_step(skill_name, False, "未找到影像配对")
-                            _finalize_experiment("failed", skill_name, "未找到影像配对")
-                            return "\n".join(results)
-                else:
-                    # 普通执行或其他 Skill
-                    result = skill.execute(
-                        step.get("params", {}),
-                        progress_callback=_progress,
-                        log_callback=_log,
-                    )
-
-                results.append(f"{skill_name}: {result.message}")
-                _emit(f"  {skill_name}: {result.message}\n")
-                # 更新工作流进度（completed）
-                if workflow_callback:
-                    workflow_callback(skill_name, "completed", i, total)
-
-                # 统一记录本步骤成败（供实验记录聚合判定）
-                _record_step(skill_name, result.success, result.message)
-
-                # data_acquisition 完成后，缓存实际输出路径
-                if skill_name == "data_acquisition" and result.success:
-                    acquisition_outputs = dict(result.data) if isinstance(result.data, dict) else {}
-                    # 确保 output_dir 存在
-                    if "output_dir" not in acquisition_outputs:
-                        acquisition_outputs["output_dir"] = step.get("params", {}).get("output_dir", "")
-
-                # data_pipeline 完成后收集数据特征
-                if skill_name == "data_pipeline" and result.success:
-                    data_features = self._collect_data_features(
-                        result.data if isinstance(result.data, dict) else {})
-                    exp_state["data_features"] = data_features
-
-                # rf_model 成功后缓存模型结果（供实验记录）
-                if skill_name == "rf_model" and result.success:
-                    exp_state["rf_data"] = dict(result.data) if isinstance(result.data, dict) else {}
-
-                # accuracy_eval 成功后缓存闭合指标（供实验记录）
-                if skill_name == "accuracy_eval" and result.success:
-                    exp_state["acc_data"] = dict(result.data) if isinstance(result.data, dict) else {}
-
-                # 检查异常场景
-                should_continue = self._check_exceptions(skill_name, result, pause_callback, _emit)
-                if not should_continue:
-                    # Agent 暂停等待用户输入，中止后续步骤
-                    exp_state["paused"] = True
-                    _emit(f"⏸️ 等待用户选择...\n")
-                    _finalize_experiment("paused")
-                    return "\n".join(results) + f"\n{PAUSE_MARKER}"
-            except Exception as e:
-                results.append(f"{skill_name} 失败: {e}")
-                _emit(f"  {skill_name} 失败: {e}\n")
-                if workflow_callback:
-                    workflow_callback(skill_name, "failed", i, total)
-                _record_step(skill_name, False, str(e))
-
-        # ── 收尾：判定整体状态并写入实验记录（聚合判定，见 Schema 第三节）──
-        if exp_state["paused"]:
-            _finalize_experiment("paused")
-        else:
-            failed = exp_state["failed"]
-            if failed is not None:
-                _finalize_experiment("failed", failed[0], failed[1])
-            else:
-                _finalize_experiment("success")
-        return "\n".join(results)
+        return executor.execute_plan(
+            self, plan,
+            on_token=on_token, on_log=on_log, pause_callback=pause_callback,
+            project_dir=project_dir, workflow_callback=workflow_callback,
+            stream_acc=stream_acc, settings_path=settings_path,
+            study_areas_dir=study_areas_dir, conv_id=conv_id,
+            project_id=project_id, memory_manager=memory_manager,
+            hooks=hooks, exec_mode=exec_mode, run_state=run_state,
+        )
 
     # ── 异常检测 ─────────────────────────────────────────────────────
 
@@ -944,21 +650,21 @@ class GeoThermoAgent:
             pairs = result.data.get("image_pairs", [])
             if not pairs and "landsat_path" not in result.data:
                 # 搜索模式无配对
-                _emit("  ⚠️ 未找到符合条件的影像配对\n")
-                _emit("  建议：①扩大时间范围 ②放宽云量阈值\n")
+                _emit("  没有找到符合条件的影像组合\n")
+                _emit("  建议：扩大时间范围，或放宽云量要求\n")
             elif pairs and result.data.get("landsat_path"):
                 # 下载模式下检查配对数量
-                _emit(f"  ✅ 已下载 {len(result.data.get('landsat_lst', [result.data.get('landsat_path')]))} 景影像\n")
+                _emit(f"  已下载 {len(result.data.get('landsat_lst', [result.data.get('landsat_path')]))} 景影像\n")
 
         elif skill_name == "data_pipeline":
             valid_pixels = result.data.get("train_rows", 0)
             if valid_pixels < 10000:
-                _emit(f"  ⚠️ 有效训练样本仅 {valid_pixels:,} 个（建议>10,000），模型精度可能较低\n")
+                _emit(f"  有效训练样本仅 {valid_pixels:,} 个（建议不少于 10,000 个），模型精度可能偏低\n")
 
         elif skill_name == "rf_model":
             r2 = result.data.get("test_metrics", {}).get("R2", 1.0)
             if isinstance(r2, (int, float)) and r2 < 0.6:
-                _emit(f"  ⚠️ 模型 R²={r2:.2f}，精度较低。建议：调整参数或选择其他时间\n")
+                _emit(f"  测试集决定系数 {r2:.2f}，精度偏低。建议调整参数或更换时间段\n")
 
         elif skill_name == "tcr_compute":
             pass  # DEM标准差警告已移除
@@ -1054,13 +760,14 @@ class GeoThermoAgent:
             return_selected=False → True（继续）或 False（暂停）
         """
         if not pause_callback:
-            _emit(f"  📋 找到 {len(pairs)} 组影像配对，自动选择第 1 对\n")
+            _emit("  " + presentation.pairs_found(len(pairs)))
+            _emit("  " + presentation.pair_auto_selected(1))
             selected = pairs[0] if pairs else None
             return selected if return_selected else bool(selected)
 
         pairs_info = []
         for i, pair in enumerate(pairs):
-            pairs_info.append({
+            info = {
                 "index": i,
                 "landsat_date": str(pair.get("landsat_date", "?")),
                 "landsat_satellite": str(pair.get("landsat_satellite", "?")),
@@ -1073,10 +780,17 @@ class GeoThermoAgent:
                 "sentinel_scenes": pair.get("sentinel2_scenes", []),
                 "sentinel_cloud": pair.get("sentinel2_cloud_cover", "?"),
                 "sentinel_coverage": pair.get("sentinel2_coverage", "?"),
-            })
+            }
+            # 数据 Agent 打过分时透传推荐标记（技术方案 3.3：只增加两个字段）；
+            # 未打分时这两个字段不出现，前端旧逻辑完全不受影响
+            if pair.get("recommended"):
+                info["recommended"] = True
+                info["recommend_reason"] = str(pair.get("recommend_reason", ""))
+            if pair.get("quality_score") is not None:
+                info["quality_score"] = pair.get("quality_score")
+            pairs_info.append(info)
 
-        _emit(f"  📋 找到 {len(pairs)} 组影像配对，请选择：\n")
-
+        # 「找到 N 组可用的影像组合」由执行引擎在调用本方法前统一输出，此处不再重复
         call_result = pause_callback({"type": "select_pair", "pairs": pairs_info})
 
         if call_result and call_result.get("paused"):

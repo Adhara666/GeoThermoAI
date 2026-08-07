@@ -52,14 +52,23 @@ def project_root_from_stage_output_dir(output_dir: str) -> str:
     不论调用方传入的是哪一个子阶段目录都能收敛到同一份 manifest。
     找不到匹配的固定子目录名时（例如脚本直接传入自定义 output_dir），
     直接使用 output_dir 本身作为根目录。
+
+    多轮调优（``project_dir/results/tuning/round_N``）也必须收敛到同一个项目根：
+    因此不只看最后一段，而是自末尾向上找第一个固定子目录名。这样
+    ``project_dir/results`` 与 ``project_dir/results/tuning/round_0`` 都返回
+    ``project_dir``，run_manifest.json 仍固定写在项目根，阶段重建与清理也能找对目录。
     """
     if not output_dir:
         return output_dir
     normalized = os.path.normpath(output_dir)
-    parent, base = os.path.split(normalized)
-    if base in ("raw", "processed", "results") and parent:
-        return parent
-    return normalized
+    head = normalized
+    while True:
+        parent, base = os.path.split(head)
+        if not parent or parent == head:
+            return normalized
+        if base in ("raw", "processed", "results"):
+            return parent
+        head = parent
 
 
 def _now() -> str:

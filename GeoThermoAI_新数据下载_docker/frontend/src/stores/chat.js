@@ -2,12 +2,25 @@ import { defineStore } from 'pinia'
 import { api } from '../api'
 import { useToast } from '../composables/useToast'
 
+const EXEC_MODE_KEY = 'gtai_exec_mode'
+
+function loadExecMode() {
+  try {
+    const v = localStorage.getItem(EXEC_MODE_KEY)
+    return v === 'auto' || v === 'approval' ? v : 'approval'
+  } catch (_) {
+    return 'approval'
+  }
+}
+
 export const useChatStore = defineStore('chat', {
   state: () => ({
     messages: [],
     streaming: false,
     paused: false,
     pairs: [],
+    approval: null, // 通用审批载荷 {type,node,title,summary,options,default_option}
+    execMode: loadExecMode(), // 'approval'（由我批准）| 'auto'（完全执行）
     workflowSteps: [], // [{id,label,status}]
     logLines: [], // 实时过程日志（日志面板）
     modelLabel: '',
@@ -23,6 +36,12 @@ export const useChatStore = defineStore('chat', {
   },
 
   actions: {
+    setExecMode(mode) {
+      const next = mode === 'auto' ? 'auto' : 'approval'
+      this.execMode = next
+      try { localStorage.setItem(EXEC_MODE_KEY, next) } catch (_) {}
+    },
+
     async loadMessages(pid, cid) {
       const data = await api.get(`/api/messages?project=${encodeURIComponent(pid)}&conv=${encodeURIComponent(cid)}`)
       this.messages = data.messages || []
@@ -66,12 +85,14 @@ export const useChatStore = defineStore('chat', {
       this.streaming = true
       this.paused = false
       this.pairs = []
+      this.approval = null
       this.logLines = [] // 新流程开始时清空日志面板
       try {
         const r = await api.post('/api/chat/start', {
           project: useProjectStore().currentProject,
           conv: useProjectStore().currentConv,
           message: msg,
+          exec_mode: this.execMode,
         })
         if (!r.ok) { t.error(r.message || '发送失败'); this.streaming = false; return }
         if (r.messages) this.messages = r.messages
@@ -95,6 +116,7 @@ export const useChatStore = defineStore('chat', {
         } else if (type === 'pause') {
           this.paused = true
           this.pairs = data.pairs || []
+          this.approval = data.approval || null
           this.streaming = false
         } else if (type === 'workflow') {
           this.workflowSteps = data.steps || []
@@ -113,6 +135,7 @@ export const useChatStore = defineStore('chat', {
           this.streaming = false
           this.paused = false
           this.pairs = []
+          this.approval = null
         } else if (type === 'error') {
           t.error(data.message || '执行出错')
           this.streaming = false
@@ -133,6 +156,27 @@ export const useChatStore = defineStore('chat', {
         if (!r.ok) { t.error(r.message); return }
         this.paused = false
         this.pairs = []
+        this.approval = null
+        this.streaming = true
+        await this._listen(useProjectStore().currentConv)
+      } catch (e) {
+        t.error(`恢复失败：${e.message}`)
+      }
+    },
+
+    /** 通用审批节点恢复（技术方案 3.3 新协议） */
+    async resumeApproval(optionId, values) {
+      const t = useToast()
+      try {
+        const r = await api.post('/api/chat/resume', {
+          conv: useProjectStore().currentConv,
+          option_id: optionId,
+          values: values || {},
+        })
+        if (!r.ok) { t.error(r.message); return }
+        this.paused = false
+        this.approval = null
+        this.pairs = []
         this.streaming = true
         await this._listen(useProjectStore().currentConv)
       } catch (e) {
@@ -145,6 +189,7 @@ export const useChatStore = defineStore('chat', {
       this.streaming = false
       this.paused = false
       this.pairs = []
+      this.approval = null
       this.logLines = []
     },
   },

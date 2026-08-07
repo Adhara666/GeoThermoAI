@@ -33,9 +33,11 @@
 * { box-sizing: border-box; }
 
 html, body, #app {
-  height: 100%;
+  height: var(--app-height, 100%);
+  max-height: var(--app-height, 100%);
   margin: 0;
   padding: 0;
+  overflow: hidden;
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
     "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
   font-size: 14px;
@@ -126,7 +128,19 @@ input, select, textarea { font-family: inherit; }
 
 /* ── 整体布局 ────────────────────────────────────────────── */
 
-.app-shell { display: flex; height: 100vh; overflow: hidden; }
+/* 高度由 embedFit.js 写入 --app-height：嵌入魔搭时会扣掉 Studio 顶栏，避免底栏被裁切 */
+.app-shell {
+  display: flex;
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  width: 100%;
+  height: var(--app-height, 100%);
+  max-height: var(--app-height, 100%);
+  min-height: 0;
+  overflow: hidden;
+}
 
 .sidebar {
   width: var(--sidebar-w); flex-shrink: 0; background: var(--bg-sidebar);
@@ -391,6 +405,101 @@ input, select, textarea { font-family: inherit; }
 }
 .scene-row { display: flex; justify-content: space-between; gap: 12px; color: var(--text-secondary); line-height: 1.5; }
 .pair-card__actions { display: flex; justify-content: flex-end; margin-top: 10px; }
+.pair-option__badge { color: var(--primary); font-weight: 600; }
+.pair-option__reason { flex-basis: 100%; margin-top: 2px; font-size: 12px; color: var(--text-secondary); }
+
+/* 执行模式上拉框（发送键左侧，向上弹出） */
+.exec-mode { position: relative; flex-shrink: 0; align-self: flex-end; }
+.exec-mode__btn {
+  display: inline-flex; align-items: center; gap: 4px; height: 36px; padding: 0 10px;
+  border: 1px solid var(--border-strong); border-radius: 10px; background: var(--bg-panel);
+  color: var(--text-secondary); font-size: 12px; white-space: nowrap; transition: all 0.15s;
+}
+.exec-mode__btn:hover:not(:disabled) { border-color: var(--primary); color: var(--primary); }
+.exec-mode__btn:disabled { opacity: 0.5; }
+.exec-mode__caret { transition: transform 0.15s; }
+.exec-mode__caret--open { transform: rotate(180deg); }
+.exec-mode__panel {
+  position: absolute; bottom: calc(100% + 6px); right: 0; z-index: 30; min-width: 208px;
+  display: flex; flex-direction: column; padding: 4px;
+  background: var(--bg-panel); border: 1px solid var(--border-strong);
+  border-radius: var(--radius); box-shadow: var(--shadow-lg);
+}
+.exec-mode__item {
+  display: flex; flex-direction: column; gap: 2px; align-items: flex-start;
+  padding: 8px 10px; border: none; background: none; border-radius: var(--radius-sm);
+  text-align: left; cursor: pointer;
+}
+.exec-mode__item:hover { background: var(--bg); }
+.exec-mode__item--active { background: var(--primary-soft); }
+.exec-mode__item-title { font-size: 13px; color: var(--text); font-weight: 500; }
+.exec-mode__item-hint { font-size: 12px; color: var(--text-muted); }
+
+/* 通用审批卡片（与配对卡片同一视觉语言） */
+.approval-card {
+  max-width: 860px; margin: 0 auto 12px; padding: 14px 16px; background: var(--bg-panel);
+  border: 1px solid var(--primary); border-radius: 12px; box-shadow: var(--shadow-lg);
+}
+.approval-card__title { font-weight: 600; margin-bottom: 6px; font-size: 14px; }
+.approval-card__summary {
+  margin: 0 0 10px; font-size: 13px; line-height: 1.7; color: var(--text-secondary);
+}
+.approval-options { display: flex; flex-direction: column; gap: 8px; max-height: 340px; overflow-y: auto; }
+.approval-option {
+  display: flex; gap: 8px; align-items: flex-start; flex-wrap: wrap; padding: 10px;
+  border: 1px solid var(--border); border-radius: var(--radius-sm); cursor: pointer; transition: all 0.12s;
+}
+.approval-option:hover { border-color: var(--primary); }
+.approval-option--selected { border-color: var(--primary); background: var(--primary-soft); }
+.approval-option input { margin-top: 3px; accent-color: var(--primary); }
+.approval-option__text { font-size: 13px; line-height: 1.6; flex: 1; }
+.approval-option__badge { color: var(--primary); font-weight: 600; }
+.approval-option__hint { flex-basis: 100%; font-size: 12px; color: var(--text-muted); line-height: 1.5; }
+.approval-fields {
+  flex-basis: 100%; margin-top: 8px; padding: 8px 10px;
+  background: var(--bg-panel); border: 1px dashed var(--border-strong);
+  border-radius: var(--radius-sm); display: flex; flex-direction: column; gap: 8px;
+}
+.approval-field { display: flex; align-items: center; gap: 8px; font-size: 12px; }
+.approval-field__label { flex: 0 0 132px; color: var(--text-secondary); }
+.approval-field__input {
+  width: 110px; height: 28px; padding: 0 8px; font-size: 12px; color: var(--text);
+  border: 1px solid var(--border-strong); border-radius: var(--radius-sm); background: var(--bg);
+}
+.approval-field__input:focus { outline: none; border-color: var(--primary); }
+.approval-field__range { color: var(--text-muted); }
+.approval-card__actions { display: flex; justify-content: flex-end; margin-top: 10px; }
+
+/* 魔搭嵌入顶栏偏移量人工校准控件（附录 C，仅嵌入环境出现，默认收起） */
+.embed-calibrate { position: fixed; right: 10px; bottom: 10px; z-index: 500; }
+.embed-calibrate__fab {
+  width: 26px; height: 26px; border-radius: 50%; border: 1px solid var(--border-strong);
+  background: var(--bg-panel); color: var(--text-muted); font-size: 13px; opacity: 0.45;
+  display: flex; align-items: center; justify-content: center; box-shadow: var(--shadow);
+  transition: opacity 0.15s;
+}
+.embed-calibrate__fab:hover { opacity: 1; color: var(--primary); border-color: var(--primary); }
+.embed-calibrate__panel {
+  position: absolute; right: 0; bottom: 32px; width: 240px; padding: 12px;
+  background: var(--bg-panel); border: 1px solid var(--border-strong); border-radius: var(--radius);
+  box-shadow: var(--shadow-lg);
+}
+.embed-calibrate__title { font-size: 12.5px; font-weight: 600; margin-bottom: 4px; }
+.embed-calibrate__hint { margin: 0 0 8px; font-size: 11.5px; line-height: 1.6; color: var(--text-muted); }
+.embed-calibrate__row { display: flex; align-items: center; justify-content: center; gap: 12px; margin-bottom: 8px; }
+.embed-calibrate__row button {
+  width: 28px; height: 28px; border-radius: var(--radius-sm); border: 1px solid var(--border-strong);
+  background: var(--bg); font-size: 15px; color: var(--text);
+}
+.embed-calibrate__row button:hover { border-color: var(--primary); color: var(--primary); }
+.embed-calibrate__value { font-size: 13px; font-weight: 600; min-width: 52px; text-align: center; }
+.embed-calibrate__actions { display: flex; gap: 6px; }
+.embed-calibrate__actions button {
+  flex: 1; height: 26px; font-size: 12px; border-radius: var(--radius-sm);
+  border: 1px solid var(--border-strong); background: var(--bg);
+}
+.embed-calibrate__save { color: var(--primary); border-color: var(--primary); }
+.embed-calibrate__reset:hover { color: var(--danger); border-color: var(--danger); }
 
 /* ── 工作面板 ───────────────────────────────────────────── */
 
