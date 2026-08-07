@@ -1,9 +1,19 @@
 <script setup>
-import { ref } from 'vue'
+// 影像配对选择卡片（技术方案 9.3）
+// 数据 Agent 打过分时：最优的一组带「（推荐）」并默认选中，但决定权完全在用户，系统不代选。
+import { computed, ref, watch } from 'vue'
 import { useChatStore } from '../stores/chat'
 
 const chat = useChatStore()
-const selected = ref(0)
+
+const recommendedIndex = computed(() => {
+  const i = chat.pairs.findIndex((p) => p.recommended)
+  return i >= 0 ? i : 0
+})
+
+const selected = ref(recommendedIndex.value)
+
+watch(recommendedIndex, (i) => { selected.value = i }, { immediate: true })
 
 function confirm() {
   chat.resume(selected.value)
@@ -33,11 +43,16 @@ function scenesRows(scenes) {
 
 <template>
   <div class="pair-card">
-    <div class="pair-card__title">📋 找到 {{ chat.pairs.length }} 组影像配对，请选择一组</div>
+    <div class="pair-card__title">找到 {{ chat.pairs.length }} 组影像配对，请选择一组</div>
     <div class="pair-options">
       <label v-for="(p, i) in chat.pairs" :key="i" class="pair-option" :class="{ 'pair-option--selected': selected === i }">
         <input type="radio" :value="i" v-model="selected" />
-        <span class="pair-option__text">{{ i + 1 }}. {{ pairText(p) }}</span>
+        <span class="pair-option__text">
+          {{ i + 1 }}. {{ pairText(p) }}<span v-if="p.recommended" class="pair-option__badge">（推荐）</span>
+        </span>
+        <div v-if="p.recommended && p.recommend_reason" class="pair-option__reason">
+          {{ p.recommend_reason }}
+        </div>
         <div class="pair-option__detail">
           <div v-if="hasCloud(p.landsat_cloud)" class="scene-row">
             <span>Landsat 平均云量</span><span>{{ p.landsat_cloud }}%</span>
@@ -55,7 +70,7 @@ function scenesRows(scenes) {
       </label>
     </div>
     <div class="pair-card__actions">
-      <button class="btn btn--primary" @click="confirm">✅ 确认选择</button>
+      <button class="btn btn--primary" @click="confirm">确认选择</button>
     </div>
   </div>
 </template>

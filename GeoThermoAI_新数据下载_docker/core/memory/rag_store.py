@@ -182,10 +182,13 @@ class RAGStore:
 
     def save_experience(self, project_id: str, text: str,
                         metadata: Optional[Dict[str, Any]] = None) -> None:
-        """写入一条项目实验段落（metadata 需含唯一 source_conv + 检索键）。"""
+        """写入一条项目实验段落（metadata 需含唯一 source_conv + 检索键）。
+
+        统一补 `kind="experiment"`，供规划 Agent 按 kind 区分实验与可复用工作流。
+        """
         if not text:
             return
-        meta = _clean_metadata(metadata or {})
+        meta = _clean_metadata({"kind": "experiment", **(metadata or {})})
         col = self.project_collection(project_id)
         doc_id = str(meta.get("source_exp", "")) or f"exp_{len(text)}"
         try:
@@ -193,19 +196,48 @@ class RAGStore:
         except Exception as e:
             logger.warning(f"[memory] ChromaDB 写入实验段落失败: {e}")
 
-    def save_knowledge(self, items: List[Dict[str, Any]]) -> None:
-        """幂等播种领域知识：global_knowledge 非空则跳过。"""
-        col = self.global_collection()
-        if col.count() > 0:
+    def save_workflow(self, project_id: str, text: str,
+                      metadata: Optional[Dict[str, Any]] = None) -> None:
+        """写入一条可复用工作流段落（technical 方案 8.3），metadata 带 kind="workflow"。"""
+        if not text:
             return
+        meta = _clean_metadata({"kind": "workflow", **(metadata or {})})
+        col = self.project_collection(project_id)
+        doc_id = str(meta.get("source_workflow", "")) or f"wf_{len(text)}"
+        try:
+            col.add(ids=[doc_id], documents=[text], metadatas=[meta])
+        except Exception as e:
+            logger.warning(f"[memory] ChromaDB 写入工作流段落失败: {e}")
+
+    def save_knowledge(self, items: List[Dict[str, Any]]) -> None:
+        """按 id 增量播种领域知识（技术方案 8.4a）。
+
+        改造前的判据是「collection 非空就整体跳过」，导致新增条目（如 E 系列）
+        在老用户环境永远灌不进去。改为逐条按 id 比对：已有的不动（避免重复写入与
+        内容漂移），只补缺失的。
+        """
+        col = self.global_collection()
+        try:
+            existing = set(col.get(include=[]).get("ids", []))
+        except Exception as e:
+            logger.warning(f"[memory] 读取已有领域知识 id 失败（按空处理）: {e}")
+            existing = set()
+
         ids, docs, metas = [], [], []
         for item in items:
-            ids.append(item["id"])
+            kid = item.get("id", "")
+            if not kid or kid in existing:
+                continue
+            ids.append(kid)
             docs.append(item.get("content", ""))
             metas.append(_clean_metadata({
                 "topic": item.get("topic", ""),
                 "tags": ",".join(item.get("tags", [])),
-                "kid": item.get("id", ""),
+                "kid": kid,
+                # domain 是标量字段，可直接用于 metadata where 过滤
+                # （tags 存成逗号拼接串，$in 对它做不了包含匹配）
+                "domain": item.get("domain", ""),
+                "kind": "knowledge",
             }))
         if ids:
             try:
@@ -215,15 +247,23 @@ class RAGStore:
 
     # ── 检索 ───────────────────────────────────────────────────────
 
-    def _query_collection(self, col, query: str, n: int) -> List[Dict[str, Any]]:
+    def _query_collection(self, col, query: str, n: int,
+                          where: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        """向量检索，可选 metadata 过滤（技术方案 8.4b）。
+
+        `where` 语法在不同 ChromaDB 版本上有差异，过滤查询异常时自动退回无过滤查询
+        （与现有「检索失败返回空列表」的容错风格一致，但不因过滤语法把结果清空）。
+        """
         try:
-            if col.count() == 0:
+            total = col.count()
+            if total == 0:
                 return []
-            if self._embedding.is_bge:
-                emb = self._embedding.encode_query([query])
-                res = col.query(query_embeddings=emb, n_results=min(n, col.count()))
-            else:
-                res = col.query(query_texts=[query], n_results=min(n, col.count()))
+            res = self._query(col, query, min(n, total), where)
+            if res is None and where:
+                logger.warning("[memory] metadata 过滤查询失败，退回无过滤查询")
+                res = self._query(col, query, min(n, total), None)
+            if res is None:
+                return []
         except Exception as e:
             logger.warning(f"[memory] 向量检索失败: {e}")
             return []
@@ -239,11 +279,29 @@ class RAGStore:
             })
         return items
 
-    def search_for_agent(self, project_id: str, query: str, n: int = 3) -> List[Dict[str, Any]]:
-        return self._query_collection(self.project_collection(project_id), query, n)
+    def _query(self, col, query: str, n: int, where: Optional[Dict[str, Any]]):
+        """执行一次 query；失败返回 None 由调用方决定是否退回无过滤。"""
+        kwargs: Dict[str, Any] = {"n_results": n}
+        if where:
+            kwargs["where"] = where
+        try:
+            if self._embedding.is_bge:
+                return col.query(query_embeddings=self._embedding.encode_query([query]),
+                                 **kwargs)
+            return col.query(query_texts=[query], **kwargs)
+        except Exception as e:
+            logger.warning(f"[memory] 检索执行失败（where={where}）: {e}")
+            return None
 
-    def search_knowledge(self, query: str, n: int = 3) -> List[Dict[str, Any]]:
-        return self._query_collection(self.global_collection(), query, n)
+    def search_for_agent(self, project_id: str, query: str, n: int = 3,
+                         where: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        """项目经验检索；where 为 None 时行为与改造前完全一致。"""
+        return self._query_collection(self.project_collection(project_id), query, n, where)
+
+    def search_knowledge(self, query: str, n: int = 3,
+                         where: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
+        """领域知识检索；where 为 None 时行为与改造前完全一致。"""
+        return self._query_collection(self.global_collection(), query, n, where)
 
     # ── 删除 ───────────────────────────────────────────────────────
 

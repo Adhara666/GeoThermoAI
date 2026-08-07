@@ -4,6 +4,8 @@ import Sidebar from './components/Sidebar.vue'
 import ChatMessages from './components/ChatMessages.vue'
 import ChatInput from './components/ChatInput.vue'
 import PairSelectCard from './components/PairSelectCard.vue'
+import ApprovalCard from './components/ApprovalCard.vue'
+import EmbedCalibrate from './components/EmbedCalibrate.vue'
 import Workbench from './components/Workbench.vue'
 import LoginView from './components/LoginView.vue'
 import { toasts } from './composables/useToast'
@@ -74,6 +76,7 @@ onBeforeUnmount(() => {
 
         <ChatMessages />
         <PairSelectCard v-if="chat.paused && chat.pairs.length" />
+        <ApprovalCard v-else-if="chat.paused && chat.approval" />
         <ChatInput />
       </main>
 
@@ -88,4 +91,6 @@ onBeforeUnmount(() => {
   <div class="toast-wrap">
     <div v-for="t in toasts" :key="t.id" class="toast" :class="`toast--${t.type}`">{{ t.msg }}</div>
   </div>
+
+  <EmbedCalibrate />
 </template>

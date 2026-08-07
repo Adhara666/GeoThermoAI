@@ -29,5 +29,12 @@
     "val_ratio": 0.2,
     "test_ratio": 0.2
   },
-  "data_space": {}
+  "data_space": {},
+  "agent": {
+    "roles_enabled": true,
+    "replan_max": 3,
+    "tuning_max_rounds": 5,
+    "approval_wait_seconds": 1800,
+    "default_exec_mode": "approval"
+  }
 }

@@ -226,8 +226,12 @@ class RFModelSkill(BaseSkill):
                     "params": train_result.get("params", {}),
                 },
             )
-            # 训练+测试预测+独立评估完成后，train/val/test 划分 CSV 已无下游消费方，立即清理
-            cleanup_stage(project_root, "rf_model")
+            # 训练+测试预测+独立评估完成后，train/val/test 划分 CSV 已无下游消费方，立即清理。
+            # defer_cleanup=True 时跳过清理（多轮调优期间由训练 Agent 在接受最终结果后
+            # 显式清理一次），避免每轮都触发昂贵的 ensure_stage_inputs 重建。
+            # 未传该参数时行为与改造前完全一致。
+            if not params.get("defer_cleanup"):
+                cleanup_stage(project_root, "rf_model")
 
         train_m = train_result.get("metrics", {}).get("train", {})
         test_m = test_result.get("metrics", {})

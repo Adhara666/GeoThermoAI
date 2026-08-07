@@ -2,6 +2,7 @@
 import { ref, computed } from 'vue'
 import { useChatStore } from '../stores/chat'
 import { useProjectStore } from '../stores/project'
+import ExecModeSelect from './ExecModeSelect.vue'
 
 const chat = useChatStore()
 const project = useProjectStore()
@@ -49,6 +50,7 @@ async function submit() {
           :placeholder="chat.streaming ? '回复生成中…' : '输入指令…（Enter 发送，Shift+Enter 换行）'"
           @keydown="onKeydown"
         ></textarea>
+        <ExecModeSelect />
         <button class="chat-send" :disabled="chat.streaming || !project.currentConv" @click="submit" title="发送">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <line x1="22" y1="2" x2="11" y2="13" />

@@ -37,6 +37,10 @@ from core import auth
 from core.ai_assistant import GeoThermoAI_Assistant
 from core.skills.skill_registry import SkillRegistry
 from core.agent.geo_thermo_agent import GeoThermoAgent
+from core.agent import presentation
+from core.agent.orchestrator import agent_config, approval as approval_proto
+from core.agent.orchestrator.exec_mode import DEFAULT_EXEC_MODE
+from core.agent.orchestrator.exec_mode import normalize as normalize_exec_mode
 from core.memory import MemoryManager
 from core.visualization import LayerVisualizer
 from core.intermediate_cleanup import INTERMEDIATE_FILENAMES
@@ -70,23 +74,34 @@ _AGENT_KEYWORDS = [
 
 _WORKFLOW_KEYWORDS = ["全流程", "一键", "跑完全流程", "执行全流程", "处理", "下载", "获取"]
 
-_WORKFLOW_LABELS = {
-    "data_acquisition": "数据获取",
-    "data_pipeline": "数据预处理",
-    "ttri_compute": "TTRI 计算",
-    "rf_model": "模型训练",
-    "tcr_compute": "TCR 计算",
-    "lst_export": "LST 导出",
-    "accuracy_eval": "精度评估",
-}
+# 工作流面板标签：单一来源在 core/agent/presentation.py（技术方案 9.4），
+# 避免同一阶段在后端两处出现不一致的中文名
+_WORKFLOW_LABELS = presentation.WORKFLOW_LABELS
 
 
 def _is_agent_command(message: str) -> bool:
+    """关键词路由。角色化后降级为「LLM 不可用时的兜底」，不删除（技术方案 10.3）。"""
     return any(kw in message for kw in _AGENT_KEYWORDS)
 
 
 def _is_workflow_command(message: str) -> bool:
     return any(kw in message for kw in _WORKFLOW_KEYWORDS)
+
+
+# 审批等待超时（秒）：默认取 settings.agent.approval_wait_seconds，
+# 可用环境变量 GTAI_APPROVAL_WAIT_SECONDS 覆盖（技术方案 3.4c）
+def _approval_wait_seconds_from(agent_cfg: dict) -> int:
+    env = os.environ.get("GTAI_APPROVAL_WAIT_SECONDS", "").strip()
+    if env:
+        try:
+            return max(30, int(env))
+        except ValueError:
+            pass
+    return int(agent_cfg.get("approval_wait_seconds", agent_config.APPROVAL_WAIT_TIMEOUT))
+
+
+# 旧路径（roles_enabled=False）的暂停超时：保持改造前的 300 秒 + 静默选第一组
+_LEGACY_PAUSE_TIMEOUT = 300
 
 
 def format_bubble(thinking: str, content: str, streaming: bool = False, elapsed: float = 0) -> str:
@@ -98,7 +113,7 @@ def format_bubble(thinking: str, content: str, streaming: bool = False, elapsed:
         label = "思考中…" if (streaming and not content) else f"已深度思考（{elapsed:.1f}s）"
         o = " open" if (streaming and not content) else ""
         parts.append(
-            f"<details{o}><summary>💭 {label}</summary>\n\n{thinking}\n\n</details>"
+            f"<details{o}><summary>思考过程 · {label}</summary>\n\n{thinking}\n\n</details>"
         )
     if content:
         parts.append(content)
@@ -261,6 +276,10 @@ class AppBackend:
         },
         "data_space": {},
     }
+    # 说明：`agent` 段（角色编排特性开关）**不写进每用户默认设置**。
+    # `_load_settings` 读到已有文件时不与默认值合并，写进去会把开关钉死在创建时的取值，
+    # 导致后续升级默认值对老用户失效。缺失时统一由 `agent_config.resolve` 补代码默认值，
+    # 用户显式改过才落盘。
 
     def _load_settings(self) -> dict:
         """读取当前用户的设置；首次访问按默认值创建（不含任何全局凭据，凭据按用户隔离）"""
@@ -320,6 +339,17 @@ class AppBackend:
             self._user_memories[uid] = mm
         return mm
 
+    def _agent_settings(self) -> dict:
+        """解析角色编排配置：每用户 settings 的 agent 段 > 全局 config/settings.json > 代码默认。
+
+        每用户设置文件里通常没有 agent 段（不写入默认值，见 _DEFAULT_USER_SETTINGS 的说明），
+        因此部署时改 `config/settings.json` 即可统一切换特性开关。
+        """
+        user = self._load_settings()
+        if isinstance(user.get("agent"), dict):
+            return agent_config.resolve(user)
+        return agent_config.resolve(self._load_global_settings())
+
     def _invalidate_user_runtime(self):
         """设置变更后重建该用户的 assistant/agent（凭据热更新）"""
         uid = self._uid()
@@ -330,6 +360,7 @@ class AppBackend:
         if conv_id not in self._conv_states:
             self._conv_states[conv_id] = {
                 "project_dir": "",
+                "exec_mode": DEFAULT_EXEC_MODE,
                 "workflow_progress": {
                     "status": "idle",
                     "current_step": "",
@@ -412,6 +443,9 @@ class AppBackend:
                 if data.get("project_dir"):
                     convs[project].setdefault("__dir__", data["project_dir"])
                     self._get_conv_state(conv_id)["project_dir"] = data["project_dir"]
+                if data.get("exec_mode"):
+                    self._get_conv_state(conv_id)["exec_mode"] = normalize_exec_mode(
+                        data["exec_mode"])
             except Exception:
                 continue
         return convs
@@ -1126,7 +1160,7 @@ class AppBackend:
 
     # ── 聊天流式（线程 + 队列，复刻旧版语义） ─────────────────
 
-    def chat_start(self, pid: str, cid: str, user_msg: str) -> dict:
+    def chat_start(self, pid: str, cid: str, user_msg: str, exec_mode: str = "") -> dict:
         user_msg = (user_msg or "").strip()
         convs = self.load_conversations()
         if pid not in convs or cid not in convs[pid]:
@@ -1143,8 +1177,23 @@ class AppBackend:
         conv_state = self._get_conv_state(cid)
         project_dir = conv_state["project_dir"]
 
-        # 工作流类命令前置检查
-        if _is_workflow_command(user_msg) and _is_agent_command(user_msg):
+        agent_cfg = self._agent_settings()
+        roles_enabled = agent_cfg["roles_enabled"]
+
+        # 执行模式（技术方案 3.5）：本次请求 > 会话已记录 > settings 默认值
+        resolved_mode = normalize_exec_mode(
+            exec_mode,
+            normalize_exec_mode(conv_state.get("exec_mode"), agent_cfg["default_exec_mode"]),
+        )
+        conv_state["exec_mode"] = resolved_mode
+        try:
+            self._update_conversation_file(cid, pid, exec_mode=resolved_mode)
+        except Exception:
+            pass
+
+        # 工作流类命令前置检查。
+        # 角色化开启后交给规划 Agent 以对话方式引导（拍板结论 3），这里不再硬拦截。
+        if (not roles_enabled) and _is_workflow_command(user_msg) and _is_agent_command(user_msg):
             uploaded = self.list_study_areas()
             if not uploaded:
                 history.append({"role": "assistant",
@@ -1177,25 +1226,39 @@ class AppBackend:
                 prior_messages.append({"role": m.get("role", "user"), "content": c})
 
         uid = self._uid()
+        wait_seconds = _approval_wait_seconds_from(agent_cfg)
 
         def _runner():
             ctx_token = _uid_ctx.set(uid)  # 后台线程不带请求 contextvars，需显式恢复用户
             try:
-                if _is_agent_command(user_msg):
+                if roles_enabled or _is_agent_command(user_msg):
                     def on_token(content: str):
                         q.put(("token", content))
 
                     def pause_callback(pause_data):
+                        """等待用户在审批节点做出选择（技术方案 3.4c）。
+
+                        角色路径：分片轮询 + 超时挂起，绝不替用户做决定（拍板结论 1）。
+                        旧路径（roles_enabled=False）：保持改造前的 300 秒 + 静默选第一组。
+                        """
                         q.put(("pause", pause_data))
-                        if pause_event.wait(timeout=300):
-                            pause_event.clear()
-                        selected = self._pause_responses.get(cid)
+                        timeout = wait_seconds if roles_enabled else _LEGACY_PAUSE_TIMEOUT
+                        deadline = time.time() + timeout
+                        while time.time() < deadline:
+                            if pause_event.wait(timeout=5):
+                                pause_event.clear()
+                                break
+                            if cid in self._deleted_convs:
+                                return {"paused": True}
+                        # pop 而非 get：一次运行可能有多个暂停点，
+                        # 残留的上一次选择会让下一个暂停点被自动放行
+                        selected = self._pause_responses.pop(cid, None)
                         if selected is not None:
                             return {"paused": False, "data": selected}
-                        pairs = pause_data.get("pairs", []) if isinstance(pause_data, dict) else []
-                        if pairs:
-                            self._pause_responses[cid] = pairs[0]
-                            return {"paused": False, "data": pairs[0]}
+                        if not roles_enabled:
+                            pairs = pause_data.get("pairs", []) if isinstance(pause_data, dict) else []
+                            if pairs:
+                                return {"paused": False, "data": pairs[0]}
                         return {"paused": True}
 
                     def workflow_callback(skill_name, status, idx, total):
@@ -1228,6 +1291,8 @@ class AppBackend:
                         conv_id=cid,
                         project_id=self._project_id(pid),
                         memory_manager=self._memory_for(),
+                        exec_mode=resolved_mode,
+                        prior_messages=prior_messages,
                     )
                     if result and ("⚠️" in result or "失败" in result or "未找到" in result):
                         q.put(("append", "\n\n" + result))
@@ -1332,16 +1397,23 @@ class AppBackend:
                     self._stream_content[cid] = accumulated
                     yield from _emit("token", {"content": format_bubble("", accumulated, streaming=True)})
                 elif event_type == "pause":
-                    pairs = data.get("pairs", []) if isinstance(data, dict) else []
+                    payload = data if isinstance(data, dict) else {}
+                    pairs = payload.get("pairs", [])
                     if pairs:
                         # 保存待选配对，供 chat_resume 根据用户选择索引恢复
                         self._get_conv_state(cid)["pending_pairs"] = pairs
                         yield from _emit("pause", {"pairs": pairs})
                         paused = True
                         return
-                    else:
-                        self._pause_responses[cid] = None
-                        pause_event.set()
+                    if payload.get("type") == "approval":
+                        # 通用审批节点（技术方案 3.4a）：保存待处理载荷供 chat_resume 校验
+                        self._get_conv_state(cid)["pending_approval"] = payload
+                        yield from _emit("pause", {"approval": payload})
+                        paused = True
+                        return
+                    # 既无 pairs 也非 approval：维持现有行为，直接放行
+                    self._pause_responses[cid] = None
+                    pause_event.set()
                 elif event_type == "workflow":
                     yield from _emit("workflow", {"steps": self.get_workflow_status(cid)})
                 elif event_type == "log":
@@ -1387,21 +1459,39 @@ class AppBackend:
                 self._stream_gen.pop(cid, None)
                 # _stream_content 保留：流结束后的重连用于补齐完整气泡
 
-    def chat_resume(self, cid: str, pair_index: int) -> dict:
+    def chat_resume(self, cid: str, payload: dict) -> dict:
+        """恢复被暂停的流，支持两种协议（技术方案 3.4b）。
+
+        旧：`{"pair_index": 0}`（配对选择，逻辑保持不变）
+        新：`{"option_id": "manual_tune", "values": {...}}`（通用审批节点）
+        """
         if cid not in self._stream_queues or cid not in self._pause_events:
             return {"ok": False, "message": "没有待恢复的流"}
         conv_state = self._get_conv_state(cid)
-        pairs = conv_state.get("pending_pairs", [])
-        if not pairs:
-            return {"ok": False, "message": "没有待选配对，请重新发送指令"}
-        try:
-            idx = int(pair_index) if pair_index is not None else 0
-        except (ValueError, TypeError):
-            idx = 0
-        idx = max(0, min(idx, len(pairs) - 1))
-        self._pause_responses[cid] = pairs[idx]
+        payload = payload if isinstance(payload, dict) else {}
+
+        if "option_id" in payload:
+            pending = conv_state.get("pending_approval")
+            if not pending:
+                return {"ok": False, "message": "没有待处理的选择，请重新发送指令"}
+            parsed, err = approval_proto.parse_resume(pending, payload)
+            if parsed is None:
+                return {"ok": False, "message": err}
+            self._pause_responses[cid] = parsed
+            conv_state.pop("pending_approval", None)
+        else:
+            pairs = conv_state.get("pending_pairs", [])
+            if not pairs:
+                return {"ok": False, "message": "没有待选配对，请重新发送指令"}
+            try:
+                idx = int(payload.get("pair_index")) if payload.get("pair_index") is not None else 0
+            except (ValueError, TypeError):
+                idx = 0
+            idx = max(0, min(idx, len(pairs) - 1))
+            self._pause_responses[cid] = pairs[idx]
+            conv_state.pop("pending_pairs", None)
+
         self._pause_events[cid].set()
-        conv_state.pop("pending_pairs", None)
         return {"ok": True}
 
 
@@ -1657,7 +1747,8 @@ def map_html(conv: str = ""):
 @app.post("/api/chat/start")
 def chat_start(payload: dict):
     return backend.chat_start(
-        payload.get("project", ""), payload.get("conv", ""), payload.get("message", "")
+        payload.get("project", ""), payload.get("conv", ""), payload.get("message", ""),
+        exec_mode=payload.get("exec_mode", ""),
     )
 
 
@@ -1689,7 +1780,7 @@ def chat_current(conv: str = ""):
 
 @app.post("/api/chat/resume")
 def chat_resume(payload: dict):
-    return backend.chat_resume(payload.get("conv", ""), payload.get("pair_index"))
+    return backend.chat_resume(payload.get("conv", ""), payload)
 
 
 # ── API：文件列表 / 下载（根治"无权限"） ───────────────────────

@@ -21,7 +21,10 @@ from typing import Any, Dict, List, Optional
 
 from .rag_store import RAGStore, EmbeddingFunction
 from .experiment_log import ExperimentLog
+from .knowledge_eval import EVAL_IDS
 from .preferences import Preferences
+from .session_state import SessionState
+from .workflow_experience import WorkflowExperience, record_to_paragraph
 from . import seed_data
 
 logger = logging.getLogger(__name__)
@@ -29,6 +32,21 @@ logger = logging.getLogger(__name__)
 # 领域知识检索为空时的兜底条目（保证 Agent 基础领域知识不退化）
 _FALLBACK_KNOWLEDGE_IDS = ["K01", "K02", "K03", "K04", "K06", "K07", "K10", "K11", "K12",
                            "K13", "K20", "K21", "K22", "K23", "K24"]
+
+# 按角色定制的检索范围（技术方案 8.4c）。
+# 过滤键用 `domain` / `kid` 这类**标量**字段：tags 在 metadata 里存成逗号拼接串，
+# `$in` 对它做不了包含匹配。
+ROLE_RETRIEVAL: Dict[str, Dict[str, Any]] = {
+    "planner": {"knowledge_n": 6, "experience_n": 3, "include_best": True,
+                "knowledge_where": None, "experience_where": None,
+                "include_workflows": True, "include_preferences": True},
+    "data": {"knowledge_n": 5, "experience_n": 2, "include_best": False,
+             "knowledge_where": {"domain": "data"}},
+    "train": {"knowledge_n": 5, "experience_n": 3, "include_best": True,
+              "knowledge_where": {"domain": "model"}},
+    "eval": {"knowledge_n": 9, "experience_n": 2, "include_best": False,
+             "knowledge_where": {"kid": {"$in": list(EVAL_IDS)}}},
+}
 
 
 class MemoryManager:
@@ -38,6 +56,7 @@ class MemoryManager:
         self._root = Path(memory_root)
         self._chroma_dir = self._root / "chromadb"
         self._projects_dir = self._root / "projects"
+        self._sessions_dir = self._root / "sessions"
         self._rag = RAGStore(str(self._chroma_dir),
                              embedding=EmbeddingFunction(model_dir=embedding_model_dir))
 
@@ -52,19 +71,45 @@ class MemoryManager:
     def preferences(self, project_id: str) -> Preferences:
         return Preferences(str(self.project_memory_dir(project_id) / "preferences.json"))
 
-    # ── 播种：全局领域知识（幂等） ────────────────────────────────
+    def session_state(self, conv_id: str, project_id: str = "") -> SessionState:
+        """对话级槽位状态（技术方案 8.2）。"""
+        return SessionState(str(self._sessions_dir / f"{conv_id}.json"),
+                            conv_id=conv_id, project_id=project_id)
+
+    def workflows(self, project_id: str) -> WorkflowExperience:
+        """可复用工作流经验（技术方案 8.3）。"""
+        return WorkflowExperience(str(self.project_memory_dir(project_id) / "workflows.json"))
+
+    # ── 播种：全局领域知识（按 id 增量） ─────────────────────────
 
     def ensure_seeded(self) -> None:
-        """首次启动播种 global_knowledge；knowledge_seed.json 落盘供审计。"""
+        """播种 global_knowledge；knowledge_seed.json 落盘供审计。
+
+        技术方案 8.4a 的两处修复：
+        1. 种子文件的落盘条件从「文件不存在」改为「文件不存在 或 schema_version 不一致」，
+           升级后老环境的审计文件也会刷新；
+        2. `save_knowledge` 改为按 id 增量 upsert，新增条目（E 系列）在老环境也能灌入。
+        """
         try:
             os.makedirs(self._root, exist_ok=True)
             seed_path = self._root / "knowledge_seed.json"
-            if not seed_path.exists():
+            if self._seed_file_outdated(seed_path):
                 from ..atomic_io import atomic_write_json
                 atomic_write_json(str(seed_path), seed_data.seed_document())
-            self._rag.save_knowledge(seed_data.SEED_ITEMS)  # 幂等：count>0 跳过
+            self._rag.save_knowledge(seed_data.SEED_ITEMS)
         except Exception as e:
             logger.warning(f"[memory] 领域知识播种失败: {e}")
+
+    @staticmethod
+    def _seed_file_outdated(seed_path: Path) -> bool:
+        if not seed_path.exists():
+            return True
+        try:
+            with open(seed_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data.get("schema_version") != seed_data.SEED_SCHEMA_VERSION
+        except Exception:
+            return True
 
     # ── 写入：实验自动入库 ─────────────────────────────────────────
 
@@ -175,6 +220,111 @@ class MemoryManager:
                 )
         return "\n\n".join(blocks)
 
+    # ── 读取：按角色定制的注入（enrich_prompt 保持原样不动） ──────
+
+    def enrich_for_role(self, project_id: str, role: str, query: str) -> str:
+        """按角色定制的记忆注入（技术方案 8.4c）；role 未知时退化为 enrich_prompt。"""
+        config = ROLE_RETRIEVAL.get(role)
+        if config is None:
+            return self.enrich_prompt(project_id, query)
+
+        blocks: List[str] = []
+
+        knowledge = self._rag.search_knowledge(query, n=config["knowledge_n"],
+                                               where=config.get("knowledge_where"))
+        if not knowledge:
+            knowledge = self._fallback_knowledge(n=config["knowledge_n"])
+        if knowledge:
+            blocks.append("## 领域知识参考\n" + "\n".join(
+                f"- {(k.get('text') or '').strip()}" for k in knowledge))
+
+        if project_id:
+            experiences = self._rag.search_for_agent(
+                project_id, query, n=config["experience_n"],
+                where=config.get("experience_where"))
+            if experiences:
+                blocks.append(f"## 当前项目历史经验（项目 {project_id}）\n" + "\n".join(
+                    f"- {(e.get('text') or '').strip()}" for e in experiences))
+
+            if config.get("include_best"):
+                best = self.experiment_log(project_id).get_best()
+                if best:
+                    test = ((best.get("metrics") or {}).get("test") or {})
+                    blocks.append(
+                        f"## 历史最佳实验\n"
+                        f"- {best.get('region', '?')} | {best.get('model', '?')} | "
+                        f"R²={test.get('R2')} | 参数 "
+                        f"{json.dumps(best.get('params', {}), ensure_ascii=False)}")
+
+            if config.get("include_workflows"):
+                block = self._workflow_block(project_id)
+                if block:
+                    blocks.append(block)
+
+            if config.get("include_preferences"):
+                prefs = self.preferences(project_id).all()
+                if prefs:
+                    blocks.append("## 用户偏好\n" + "\n".join(
+                        f"- {k}：{v}" for k, v in prefs.items()))
+
+        return "\n\n".join(blocks)
+
+    def _workflow_block(self, project_id: str) -> str:
+        try:
+            records = self.workflows(project_id).all()
+        except Exception:
+            return ""
+        if not records:
+            return ""
+        lines = []
+        for record in records[-3:]:
+            metrics = record.get("metrics") or {}
+            lines.append(f"- {record.get('region', '?')} "
+                         f"{(record.get('date_range') or ['', ''])[0]}：参数 "
+                         f"{json.dumps(record.get('final_params', {}), ensure_ascii=False)}，"
+                         f"测试集 R²={metrics.get('test_r2')}")
+        return "## 该项目可复用的成功流程\n" + "\n".join(lines)
+
+    # ── 写入：可复用工作流经验（技术方案 8.3） ───────────────────
+
+    def save_workflow(self, project_id: str, record: Dict[str, Any]) -> None:
+        """双写 workflows.json + ChromaDB 段落（metadata 带 kind="workflow"）。"""
+        if not project_id or not record:
+            return
+        try:
+            self.workflows(project_id).add(record)
+        except Exception as e:
+            logger.warning(f"[memory] workflows.json 写入失败: {e}")
+        try:
+            metrics = record.get("metrics") or {}
+            self._rag.save_workflow(
+                project_id, record_to_paragraph(record),
+                metadata={
+                    "source_workflow": record.get("workflow_id", ""),
+                    "source_exp": record.get("experiment_id", ""),
+                    "source_conv": record.get("conv_id", ""),
+                    "region": record.get("region", ""),
+                    "date": (record.get("date_range") or ["", ""])[0],
+                    "test_r2": metrics.get("test_r2") if isinstance(
+                        metrics.get("test_r2"), (int, float)) else -999.0,
+                    "verdict": record.get("verdict", ""),
+                },
+            )
+        except Exception as e:
+            logger.warning(f"[memory] ChromaDB 工作流入库失败: {e}")
+
+    def search_workflows(self, project_id: str, query: str, n: int = 3) -> List[Dict[str, Any]]:
+        """只检索可复用工作流段落（按 kind 过滤）。"""
+        return self._rag.search_for_agent(project_id, query, n=n,
+                                          where={"kind": "workflow"})
+
+    def best_workflow(self, project_id: str, region: str) -> Optional[Dict[str, Any]]:
+        """取同区域中测试集 R² 最高的可复用流程（结构化精确查询）。"""
+        try:
+            return self.workflows(project_id).find_for_region(region)
+        except Exception:
+            return None
+
     def _fallback_knowledge(self, n: int = 3) -> List[Dict[str, Any]]:
         """检索为空时的兜底：返回精选种子条目的摘要，保证 Agent 基础领域知识不退化。"""
         items = [i for i in seed_data.SEED_ITEMS if i["id"] in _FALLBACK_KNOWLEDGE_IDS][:n]
@@ -184,15 +334,23 @@ class MemoryManager:
     # ── 删除级联 ───────────────────────────────────────────────────
 
     def delete_conversation(self, project_id: str, conv_id: str) -> None:
-        """删除对话：experiments.json 删该 conv 记录 + ChromaDB 删该 conv 条目。"""
+        """删除对话：experiments.json 与 workflows.json 删该 conv 记录
+        + ChromaDB 删该 conv 条目 + 删该对话的会话槽位状态（技术方案 8.2/8.3 级联约定）。"""
         try:
             self.experiment_log(project_id).delete_by_conv(conv_id)
         except Exception as e:
             logger.warning(f"[memory] 删除对话实验记录失败: {e}")
+        try:
+            self.workflows(project_id).delete_by_conv(conv_id)
+        except Exception as e:
+            logger.warning(f"[memory] 删除对话工作流经验失败: {e}")
         self._rag.delete_by_conv(project_id, conv_id)
+        self.session_state(conv_id, project_id).delete()
 
     def delete_project(self, project_id: str) -> None:
-        """删除项目：删 memory/projects/{project_id}/ 目录 + ChromaDB Collection。"""
+        """删除项目：删 memory/projects/{project_id}/ 目录 + ChromaDB Collection
+        + 删该项目下所有对话的会话槽位状态。"""
+        self._delete_project_sessions(project_id)
         try:
             mem_dir = self.project_memory_dir(project_id)
             if mem_dir.exists():
@@ -200,6 +358,19 @@ class MemoryManager:
         except Exception as e:
             logger.warning(f"[memory] 删除项目记忆目录失败: {e}")
         self._rag.delete_project_collection(project_id)
+
+    def _delete_project_sessions(self, project_id: str) -> None:
+        """按 session 文件里的 project_id 匹配删除（会话文件按对话而非项目分目录）。"""
+        if not self._sessions_dir.exists():
+            return
+        for path in self._sessions_dir.glob("*.json"):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict) and data.get("project_id") == project_id:
+                    os.remove(path)
+            except Exception as e:
+                logger.warning(f"[memory] 删除项目会话状态失败（已忽略）: {e}")
 
     # ── 偏好 ───────────────────────────────────────────────────────
 
