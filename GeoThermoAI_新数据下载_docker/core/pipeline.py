@@ -295,6 +295,7 @@ class EasyLSTPipeline:
             dem_path=self.config.get("dem_path", ""),
             output_dir=self.config.get("output_dir", "."),
             progress_callback=progress_callback,
+            step2_min_valid_samples=self.config.get("step2_min_valid_samples", 750000),
         )
         output_dir = self.config.get("output_dir", ".")
         if output_dir and output_dir != ".":
@@ -327,7 +328,7 @@ class EasyLSTPipeline:
             val_ratio=self.config.get("val_ratio", 0.2),
             test_ratio=self.config.get("test_ratio", 0.2),
             seed=self.config.get("seed", 42),
-            block_size_px=self.config.get("block_size_px", 10),
+            block_size_px=self.config.get("block_size_px", 30),
             guard_buffer_m=self.config.get("guard_buffer_m", 100.0),
             progress_callback=progress_callback,
         )

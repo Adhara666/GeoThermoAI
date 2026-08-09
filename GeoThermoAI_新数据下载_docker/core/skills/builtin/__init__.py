@@ -10,6 +10,7 @@ from .ttri_compute import TTRIComputeSkill
 from .rf_model import RFModelSkill
 from .tcr_compute import TCRComputeSkill
 from .lst_export import LSTExportSkill
+from .lst_gapfill import LSTGapFillSkill
 from .accuracy_eval import AccuracyEvalSkill
 from .ai_assistant import AIAssistantSkill
 
@@ -20,6 +21,7 @@ __all__ = [
     "RFModelSkill",
     "TCRComputeSkill",
     "LSTExportSkill",
+    "LSTGapFillSkill",
     "AccuracyEvalSkill",
     "AIAssistantSkill",
 ]

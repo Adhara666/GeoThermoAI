@@ -43,8 +43,9 @@ class DataPipelineSkill(BaseSkill):
             SkillParameter(name="val_ratio", type="number", description="验证集比例", required=False, default=0.2),
             SkillParameter(name="test_ratio", type="number", description="测试集比例", required=False, default=0.2),
             SkillParameter(name="seed", type="number", description="随机种子（仅用于派生空间块哈希分配）", required=False, default=42),
-            SkillParameter(name="block_size_px", type="number", description="空间块边长（像元数）", required=False, default=10),
+            SkillParameter(name="block_size_px", type="number", description="空间块边长（像元数）", required=False, default=30),
             SkillParameter(name="guard_buffer_m", type="number", description="train/test 缓冲带宽度（米）", required=False, default=100.0),
+            SkillParameter(name="step2_min_valid_samples", type="number", description="joint_mask 有效像元达到该数量才做 step=2 采样，不足时自动 step=1 全像元", required=False, default=750000),
         ]
 
     @property
@@ -87,8 +88,10 @@ class DataPipelineSkill(BaseSkill):
         val_ratio = params.get("val_ratio", 0.2)
         test_ratio = params.get("test_ratio", 0.2)
         seed = params.get("seed", 42)
-        block_size_px = params.get("block_size_px", 10)
+        block_size_px = params.get("block_size_px", 30)
         guard_buffer_m = params.get("guard_buffer_m", 100.0)
+        step2_min_valid_samples = params.get("step2_min_valid_samples", 750000)
+        study_area_geojson = params.get("study_area_geojson", "")
 
         for name, val in [
             ("landsat_path", landsat_path),
@@ -129,6 +132,8 @@ class DataPipelineSkill(BaseSkill):
                 progress_callback=lambda sn, pct, msg: _step_progress(
                     "data_pipeline", pct * 0.6, f"[预处理] {msg}"
                 ),
+                step2_min_valid_samples=step2_min_valid_samples,
+                study_area_geojson=study_area_geojson,
             )
         except Exception as e:
             return SkillResult(success=False, message=f"数据预处理失败: {e}")

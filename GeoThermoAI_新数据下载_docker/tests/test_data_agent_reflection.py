@@ -323,7 +323,9 @@ def test_executor_gets_blocking_decision():
     _assert(hooks.replan_request is not None, "replan 请求被记录")
     joined = "".join(ctx.emitted)
     _assert("数据检查未通过" in joined, "气泡说明数据检查未通过")
-    _assert("[规则]" in joined, "气泡标注命中的规则编号，便于追溯")
+    # 升级点 10：不再向前端展示「[规则] Dx 判定不合格」字眼，用自然语言说明判定结论
+    _assert("判定本批数据不合格" in joined, "气泡用自然语言说明判定结论（不带 [规则] 编号）")
+    _assert("[规则]" not in joined, "气泡不展示规则编号字眼")
 
     # 由我批准模式 → 弹 data_quality 审批
     captured = {}

@@ -101,12 +101,14 @@ async function onRenameConfirm() {
 }
 
 async function onSelectConv(p, c) {
-  await project.selectProject(p.project)
-  await project.selectConv(c.id)
-  await chat.loadMessages(p.project, c.id)
-  // 若该对话仍有正在运行的流，恢复订阅让气泡继续实时更新
-  await chat.resumeIfStreaming(c.id)
-  await chat.refreshWorkflow(c.id)
+  // 升级点 13：切换项目时 selectProject 会自动加载第一个对话；
+  // 已在同项目时直接 selectConv（内部会加载该对话消息/进度/恢复流）
+  if (p.project !== project.currentProject) {
+    await project.selectProject(p.project)
+    if (project.currentConv !== c.id) await project.selectConv(c.id)
+  } else if (c.id !== project.currentConv) {
+    await project.selectConv(c.id)
+  }
   emit('close')
 }
 
@@ -250,7 +252,7 @@ const hasAny = computed(() => project.tree.length > 0)
     <div v-if="deleteProjectTarget" class="modal-mask" @click.self="deleteProjectTarget = ''">
       <div class="modal-card modal-card--sm">
         <h3>删除项目</h3>
-        <p class="modal-text">确定删除项目「{{ deleteProjectTarget }}」？将删除其全部对话文件，并清除该项目产生的实验记忆与历史经验，此操作不可撤销。</p>
+        <p class="modal-text">确定删除项目「{{ deleteProjectTarget }}」？将删除其全部对话文件、清除该项目产生的实验记忆与历史经验，并彻底删除该项目的工作区数据文件夹（原始影像与全部处理产物），此操作不可撤销。</p>
         <div class="modal-actions">
           <button class="btn btn--danger" @click="confirmDeleteProject">删除</button>
           <button class="btn btn--cancel" @click="deleteProjectTarget = ''">取消</button>

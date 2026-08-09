@@ -3,6 +3,7 @@ import { ref, onMounted, onBeforeUnmount } from 'vue'
 import Sidebar from './components/Sidebar.vue'
 import ChatMessages from './components/ChatMessages.vue'
 import ChatInput from './components/ChatInput.vue'
+import ChatModeSelect from './components/ChatModeSelect.vue'
 import PairSelectCard from './components/PairSelectCard.vue'
 import ApprovalCard from './components/ApprovalCard.vue'
 import EmbedCalibrate from './components/EmbedCalibrate.vue'
@@ -67,10 +68,15 @@ onBeforeUnmount(() => {
           <button class="menu-fab" @click="sidebarOpen = true" aria-label="打开侧边栏">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
           </button>
+          <ChatModeSelect />
           <span class="chat-header__title">{{ project.currentConvTitle || '未选择对话' }}</span>
           <div class="chat-header__model">
             <span v-if="settings.configured" class="tag">🟢 {{ settings.displayName }}</span>
             <span v-else class="tag tag--warning">⚪ 未配置模型</span>
+            <!-- 工作面板打开按钮：位于模型标签右侧，蓝底白字 -->
+            <button v-if="!workbenchOpen" class="workbench-open-btn" @click="workbenchOpen = true" title="打开工作面板">
+              <span>工作面板</span>
+            </button>
           </div>
         </header>
 
@@ -79,10 +85,6 @@ onBeforeUnmount(() => {
         <ApprovalCard v-else-if="chat.paused && chat.approval" />
         <ChatInput />
       </main>
-
-      <button v-if="!workbenchOpen" class="workbench-toggle-fab" @click="workbenchOpen = true" title="打开工作面板">
-        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></svg>
-      </button>
 
       <Workbench :open="workbenchOpen" @close="workbenchOpen = false" />
     </div>

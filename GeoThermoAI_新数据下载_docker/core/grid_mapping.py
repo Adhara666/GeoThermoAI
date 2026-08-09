@@ -160,20 +160,51 @@ def build_dense_grid_interpolator(grid: np.ndarray):
     )
 
 
+def nearest_valid_index(grid):
+    """对含 NaN 的稠密栅格计算「最近有效像素索引」映射。
+
+    Returns:
+        None 表示栅格全部有效（无需回退）；
+        否则返回 (nearest_row, nearest_col)，两者形状与 grid 相同，
+        元素为距该像素最近「有效（非 NaN）」像素的行/列索引。
+    """
+    from scipy import ndimage
+
+    valid = np.isfinite(grid)
+    if valid.all():
+        return None
+    _, idx = ndimage.distance_transform_edt(~valid, return_indices=True)
+    return (idx[0], idx[1])
+
+
 def interpolate_dense_grid_to_fine(
-    fine_row, fine_col, fine_transform, coarse_transform, interpolator
+    fine_row, fine_col, fine_transform, coarse_transform, interpolator,
+    grid=None, nearest_index=None,
 ) -> np.ndarray:
     """统一仿射映射 + 双线性插值：把稠密粗格栅格插值到给定细格 (row,col) 位置。
 
     RegularGridInterpolator 的采样点坐标 i 对应"像元中心"，而 xy_to_pixel_corner
     返回的是角点坐标，需要减 0.5 换算到中心坐标系，才能与稠密栅格的索引坐标对齐。
+
+    grid/nearest_index 给定时，落在约束层覆盖范围外（插值返回 NaN）的细像元
+    用「最近有效栅格值」回退，保证每个预测样本都有取值（TTRI/TCR 口径统一）。
     """
     x, y = pixel_center_xy(fine_row, fine_col, fine_transform)
     row_corner, col_corner = xy_to_pixel_corner(x, y, coarse_transform)
     query_row = row_corner - 0.5
     query_col = col_corner - 0.5
     pts = np.column_stack([query_row, query_col])
-    return interpolator(pts)
+    out = interpolator(pts)
+    if grid is not None and nearest_index is not None:
+        nan = np.isnan(out)
+        if nan.any():
+            h, w = grid.shape
+            ri = np.round(query_row[nan]).astype(np.int64).clip(0, h - 1)
+            ci = np.round(query_col[nan]).astype(np.int64).clip(0, w - 1)
+            nr = nearest_index[0][ri, ci]
+            nc = nearest_index[1][ri, ci]
+            out[nan] = grid[nr, nc]
+    return out
 
 
 def aggregate_by_coarse_cell(

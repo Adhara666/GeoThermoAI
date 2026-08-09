@@ -23,10 +23,11 @@ class Node:
     TUNING_DECISION = "tuning_decision"
     TUNING_ROUND = "tuning_round"
     FINAL_REPORT = "final_report"
+    POSTPROCESS = "postprocess"
 
 
 ALL_NODES = (Node.PLAN_CONFIRM, Node.PAIR_SELECTION, Node.NO_PAIR, Node.DATA_QUALITY,
-             Node.TUNING_DECISION, Node.TUNING_ROUND, Node.FINAL_REPORT)
+             Node.TUNING_DECISION, Node.TUNING_ROUND, Node.FINAL_REPORT, Node.POSTPROCESS)
 
 
 # ── 选项 id ────────────────────────────────────────────────────────
@@ -47,6 +48,8 @@ class Option:
     STOP = "stop"                   # 停止
     DONE = "done"                   # 结束
     MORE_ANALYSIS = "more_analysis"  # 做其他分析
+    RUN_POSTPROCESS = "run_postprocess"   # 执行结果后处理（空洞填补）
+    SKIP_POSTPROCESS = "skip_postprocess" # 不需要结果后处理，结束流程
 
 
 # AUTO（完全执行）模式下各节点的默认策略（技术方案 3.2 最后一列）。
@@ -59,6 +62,8 @@ AUTO_DEFAULT_STRATEGY: Dict[str, Optional[str]] = {
     Node.TUNING_DECISION: Option.AI_TUNE,
     Node.TUNING_ROUND: None,          # 按七规则自动决定，不暂停
     Node.FINAL_REPORT: Option.DONE,
+    # 结果后处理（可选）：完全执行模式默认跳过，不暂停询问
+    Node.POSTPROCESS: Option.SKIP_POSTPROCESS,
 }
 
 # 手动调参表单排除的超参：随机种子是可复现性开关，不是调优旋钮
@@ -154,7 +159,7 @@ def build_plan_confirm(goal: str, summary: str = "") -> dict:
     )
 
 
-def build_no_pair(summary: str) -> dict:
+def build_no_pair(summary: str, exclude_reselect: bool = False) -> dict:
     return build(
         Node.NO_PAIR,
         title="没有找到合格的影像组合，请选择下一步",
@@ -164,46 +169,50 @@ def build_no_pair(summary: str) -> dict:
                    hint="允许云量更高的影像进入候选"),
             option(Option.WIDEN_TIME, "扩大时间范围",
                    hint="向前后各延长搜索窗口"),
-            option(Option.CHANGE_SOURCE, "更换数据源",
-                   hint="改用另一个数据平台重新搜索"),
             option(Option.REPLAN, "换时间或地区，重新规划"),
             option(Option.STOP, "先停下来"),
         ],
     )
 
 
-def build_data_quality(summary: str) -> dict:
+def build_data_quality(summary: str, exclude_reselect: bool = False) -> dict:
+    options = []
+    if not exclude_reselect:
+        # 升级点 12：所有影像对都已尝试过时，不再推荐"重新选择影像组合"
+        options.append(option(Option.RESELECT_PAIR, "重新选择影像组合", recommended=True,
+                              hint="回到影像组合选择，换一组云量更低的重跑"))
+    options.append(option(Option.REPLAN, "换时间或地区，重新规划"))
+    # v1.2 新增：检查规则本身也可能有误判，用户比系统更清楚这批数据能不能用
+    options.append(option(Option.ACCEPT, "我接受现状，继续执行",
+                          hint="忽略本次检查未通过的提示，直接进入模型训练"))
+    options.append(option(Option.STOP, "先停下来"))
+    if not options:
+        options.append(option(Option.STOP, "先停下来"))
     return build(
         Node.DATA_QUALITY,
         title="数据检查未通过，请选择下一步",
         summary=summary,
-        options=[
-            option(Option.RESELECT_PAIR, "重新选择影像组合", recommended=True,
-                   hint="回到影像组合选择，换一组云量更低的重跑"),
-            option(Option.CHANGE_SOURCE, "更换数据源"),
-            option(Option.REPLAN, "换时间或地区，重新规划"),
-            # v1.2 新增：检查规则本身也可能有误判，用户比系统更清楚这批数据能不能用
-            option(Option.ACCEPT, "我接受现状，继续执行",
-                   hint="忽略本次检查未通过的提示，直接进入模型训练"),
-            option(Option.STOP, "先停下来"),
-        ],
+        options=options,
     )
 
 
 def build_tuning_decision(summary: str, fields: Optional[List[dict]] = None,
-                          max_rounds: int = 5) -> dict:
+                          max_rounds: int = 5, exclude_reselect: bool = False) -> dict:
+    options = [
+        option(Option.AI_TUNE, "让系统继续自动调优", recommended=True,
+               hint=f"在硬性规则约束下最多再训练 {max_rounds} 轮，自动选取误差最小的一轮"),
+        option(Option.MANUAL_TUNE, "我自己设置参数", fields=fields or []),
+        option(Option.ACCEPT, "接受当前结果，继续下一步"),
+    ]
+    if not exclude_reselect:
+        # 升级点 12：所有影像对都已尝试过时，不再提示"重新选择影像组合"
+        options.append(option(Option.RESELECT_PAIR, "重新选择影像组合"))
+    options.append(option(Option.REPLAN, "换时间或地区，重新规划"))
     return build(
         Node.TUNING_DECISION,
         title="模型训练完成，请选择下一步",
         summary=summary,
-        options=[
-            option(Option.AI_TUNE, "让系统继续自动调优", recommended=True,
-                   hint=f"在硬性规则约束下最多再训练 {max_rounds} 轮，自动选取误差最小的一轮"),
-            option(Option.MANUAL_TUNE, "我自己设置参数", fields=fields or []),
-            option(Option.ACCEPT, "接受当前结果，继续下一步"),
-            option(Option.RESELECT_PAIR, "重新选择影像组合"),
-            option(Option.REPLAN, "换时间或地区，重新规划"),
-        ],
+        options=options,
     )
 
 
@@ -226,6 +235,25 @@ def build_final_report(summary: str) -> dict:
             option(Option.DONE, "结束", recommended=True),
             option(Option.MORE_ANALYSIS, "做其他分析",
                    hint="回到对话，继续提出新的分析需求"),
+        ],
+    )
+
+
+def build_postprocess(summary: str) -> dict:
+    """结果后处理（可选）提问：是否对 10m LST 做空洞填补。
+
+    云像元在预处理阶段被扣除，10m 地表温度产品存在空洞；填洞只估计空洞
+    像元、不改变无云区数值，输出带空洞掩膜的完整产品（升级点：结果后处理）。
+    """
+    return build(
+        Node.POSTPROCESS,
+        title="结果后处理（可选）",
+        summary=summary,
+        options=[
+            option(Option.RUN_POSTPROCESS, "执行结果后处理（空洞填补）", recommended=True,
+                   hint="填充因云像元扣除造成的空洞，得到无空洞的 10m 地表温度产品"),
+            option(Option.SKIP_POSTPROCESS, "不需要，结束流程",
+                   hint="保留当前带空洞的原始 10m 地表温度产品"),
         ],
     )
 

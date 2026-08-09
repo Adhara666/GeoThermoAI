@@ -65,6 +65,7 @@ WORKFLOW_STEPS = [
     "tcr_compute",
     "lst_export",
     "accuracy_eval",
+    "postprocess",  # 结果后处理（可选）：10m LST 空洞填补，默认不执行
 ]
 
 _AGENT_KEYWORDS = [
@@ -117,8 +118,7 @@ def format_bubble(thinking: str, content: str, streaming: bool = False, elapsed:
         )
     if content:
         parts.append(content)
-    elif streaming:
-        parts.append("▍")
+    # 流式占位改为空串：不再插入 "▍" 块状字符（前端用打字光标指示生成中，升级点 14）
     return "\n\n".join(parts)
 
 
@@ -167,6 +167,10 @@ class AppBackend:
         self._stream_gen: Dict[str, int] = {}
         # 每个对话已累积的流式内容：断线重连/流结束后的重连用于补齐完整气泡
         self._stream_content: Dict[str, str] = {}
+        # 每个对话已累积的思考过程（reasoning_content，升级点 15）：断线重连补齐折叠链
+        self._stream_thinking: Dict[str, str] = {}
+        # 每个对话已计算的思考用时（升级点 16）：断线重连/切回对话恢复 (用时XX秒)
+        self._stream_thinking_seconds: Dict[str, float] = {}
 
     # ── 内部工具 ───────────────────────────────────────────────
 
@@ -178,6 +182,7 @@ class AppBackend:
             RFModelSkill,
             TCRComputeSkill,
             LSTExportSkill,
+            LSTGapFillSkill,
             AccuracyEvalSkill,
             AIAssistantSkill,
         )
@@ -188,6 +193,7 @@ class AppBackend:
             RFModelSkill(),
             TCRComputeSkill(),
             LSTExportSkill(),
+            LSTGapFillSkill(),
             AccuracyEvalSkill(),
             AIAssistantSkill(),
         ):
@@ -546,15 +552,34 @@ class AppBackend:
         convs = self.load_conversations()
         if pid not in convs:
             return {"ok": False, "message": "项目不存在"}
-        # 级联删除记忆（experiments/preferences/ChromaDB Collection），失败仅告警不影响删除。
-        # 仅当 memory 目录已存在时才删除——未初始化过记忆时直接跳过，
-        # 避免为删除而触发 _memory_for() 的昂贵初始化（bge 模型加载 + 领域知识播种）
+        # 级联删除记忆（experiments/preferences/ChromaDB Collection）放后台线程，
+        # 主线程先完成文件与状态删除，立即返回提示（升级点 24：删除慢体验优化）
         try:
             project_id = self._project_id(pid)
             if project_id and (self._user_dir() / "memory").exists():
-                self._memory_for().delete_project(project_id)
+                threading.Thread(
+                    target=self._async_delete_project_memory,
+                    args=(project_id,),
+                    daemon=True,
+                ).start()
         except Exception as e:
             logging.warning(f"[memory] 删除项目记忆失败: {e}")
+        # 级联删除该项目的工作区数据文件夹（影像/产物等全部文件 + 文件夹本身）：
+        # 同时覆盖自动分配目录与项目中记录的自定义目录（兼容旧数据），
+        # 大目录删除放后台线程，不阻塞删除请求返回
+        try:
+            dirs = {self._auto_project_dir(pid)}
+            for _p in self._load_projects():
+                if _p.get("name") == pid and _p.get("dir"):
+                    dirs.add(Path(_p["dir"]))
+            for d in {os.path.realpath(str(x)) for x in dirs if str(x)}:
+                if self._owns_project_dir(d) and os.path.isdir(d):
+                    threading.Thread(
+                        target=lambda d=d: shutil.rmtree(d, ignore_errors=True),
+                        daemon=True,
+                    ).start()
+        except Exception as e:
+            logging.warning(f"[memory] 删除项目工作区目录失败: {e}")
         for cid in list(convs[pid].keys()):
             if cid.startswith("__"):
                 continue
@@ -564,6 +589,30 @@ class AppBackend:
         return {"ok": True, "message": f"项目「{pid}」已删除",
                 "projects": [p["name"] for p in projects]}
 
+    def _async_delete_project_memory(self, project_id: str):
+        """后台线程删除项目记忆（不阻塞删除请求返回）"""
+        try:
+            self._memory_for().delete_project(project_id)
+        except Exception as e:
+            logging.warning(f"[memory] 后台删除项目记忆失败: {e}")
+
+    def _conv_project_dir(self, project_root: str, conv_id: str) -> str:
+        """对话级独立工作目录（方案 A：并行互不干扰）。
+
+        每个对话使用 {项目根}/convs/{对话id} 作为自己的 project_dir，
+        所有影像/产物/清单都写在该子目录内，对话之间不共享文件、可并行执行。
+        项目根未设置时返回空串（沿用旧行为：先设置项目目录才能执行）。
+        """
+        root = (project_root or "").strip()
+        if not root:
+            return ""
+        conv_dir = os.path.join(root, "convs", conv_id).replace("\\", "/")
+        try:
+            os.makedirs(conv_dir, exist_ok=True)
+        except OSError:
+            pass
+        return conv_dir
+
     def create_conversation(self, project: str, title: str) -> dict:
         title = (title or "").strip() or "新对话"
         conv_id = uuid.uuid4().hex[:12]
@@ -571,8 +620,9 @@ class AppBackend:
         convs = self.load_conversations()
         if project not in convs:
             return {"ok": False, "message": "项目不存在，请先创建项目"}
-        self._get_conv_state(conv_id)["project_dir"] = convs[project].get("__dir__", "")
-        self._persist_conversation(conv_id, project, title, [], convs[project].get("__dir__", ""))
+        conv_dir = self._conv_project_dir(convs[project].get("__dir__", ""), conv_id)
+        self._get_conv_state(conv_id)["project_dir"] = conv_dir
+        self._persist_conversation(conv_id, project, title, [], conv_dir)
         return {
             "ok": True,
             "message": f"对话「{title}」创建成功",
@@ -590,6 +640,19 @@ class AppBackend:
                 ev.set()
             except Exception:
                 pass
+        # 方案 A：删除该对话的工作目录 {项目根}/convs/{cid}（后台线程）。
+        # 项目级共享缓存（pairs/{研究区}/、dem_{研究区}.tif）在项目根，
+        # 不属于单个对话，保留供其他对话复用，不会因删除对话而丢失。
+        try:
+            project_root = str((convs.get(pid) or {}).get("__dir__") or "")
+            conv_dir = self._conv_project_dir(project_root, cid)
+            if conv_dir and os.path.isdir(conv_dir):
+                threading.Thread(
+                    target=lambda d=conv_dir: shutil.rmtree(d, ignore_errors=True),
+                    daemon=True,
+                ).start()
+        except Exception as e:
+            logging.warning(f"[conv] 删除对话工作目录失败: {e}")
         path = self._conv_dir() / f"{cid}.json"
         if path.exists():
             try:
@@ -608,22 +671,34 @@ class AppBackend:
         self._stream_starts.pop(cid, None)
         self._stream_gen.pop(cid, None)
         self._stream_content.pop(cid, None)
+        self._stream_thinking.pop(cid, None)
 
     def delete_conversation(self, cid: str, pid: str) -> dict:
         convs = self.load_conversations()
         if pid not in convs or cid not in convs[pid]:
             return {"ok": False, "message": "对话不存在"}
-        # 级联删除该对话产生的实验记忆，失败仅告警不影响删除。
-        # 仅当 memory 目录已存在时才删除（避免为删除而触发昂贵的记忆初始化）
+        # 级联删除该对话产生的实验记忆放后台线程，主线程先完成文件与状态删除，
+        # 立即返回提示（升级点 24：删除慢体验优化）
         try:
             project_id = self._project_id(pid)
             if project_id and (self._user_dir() / "memory").exists():
-                self._memory_for().delete_conversation(project_id, cid)
+                threading.Thread(
+                    target=self._async_delete_conversation_memory,
+                    args=(project_id, cid),
+                    daemon=True,
+                ).start()
         except Exception as e:
             logging.warning(f"[memory] 删除对话记忆失败: {e}")
         self._hard_delete_conversation(cid, pid, convs)
         remaining = [k for k in convs[pid] if not k.startswith("__")]
         return {"ok": True, "message": "对话已彻底删除", "remaining": remaining}
+
+    def _async_delete_conversation_memory(self, project_id: str, cid: str):
+        """后台线程删除对话记忆（不阻塞删除请求返回）"""
+        try:
+            self._memory_for().delete_conversation(project_id, cid)
+        except Exception as e:
+            logging.warning(f"[memory] 后台删除对话记忆失败: {e}")
 
     def save_project_dir(self, pid: str, path: str) -> dict:
         """保存项目目录。路径由后端按用户自动分配（与 create_project 一致），
@@ -646,10 +721,11 @@ class AppBackend:
         for cid in convs[pid]:
             if cid.startswith("__"):
                 continue
+            conv_dir = self._conv_project_dir(normalized, cid)
             if cid in self._conv_states:
-                self._conv_states[cid]["project_dir"] = normalized
+                self._conv_states[cid]["project_dir"] = conv_dir
             try:
-                self._update_conversation_file(cid, pid, project_dir=normalized)
+                self._update_conversation_file(cid, pid, project_dir=conv_dir)
             except Exception:
                 pass
         return {"ok": True, "message": "项目目录已保存", "path": normalized}
@@ -657,7 +733,8 @@ class AppBackend:
     def get_messages(self, pid: str, cid: str) -> list:
         convs = self.load_conversations()
         if pid in convs and cid in convs[pid]:
-            self._get_conv_state(cid)["project_dir"] = convs[pid].get("__dir__", "")
+            self._get_conv_state(cid)["project_dir"] = self._conv_project_dir(
+                convs[pid].get("__dir__", ""), cid)
             return convs[pid][cid].get("messages", [])
         return []
 
@@ -670,7 +747,7 @@ class AppBackend:
         convs[pid][cid]["messages"] = history
         convs[pid][cid]["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
         try:
-            project_dir = convs[pid].get("__dir__", "")
+            project_dir = self._conv_project_dir(convs[pid].get("__dir__", ""), cid)
             title = convs[pid][cid].get("title", "")
             self._persist_conversation(cid, pid, title, history, project_dir)
         except Exception:
@@ -825,6 +902,54 @@ class AppBackend:
         files = sorted(self._study_dir().glob("*.geojson"), key=lambda p: p.stat().st_mtime, reverse=True)
         return [f.name for f in files]
 
+    # 当前研究区：以 study_areas 目录下的隐藏标记文件持久化（多用户目录天然隔离，
+    # core/agent 层的 _find_study_area_file 直接读取该标记，无需跨层传递 settings）
+    def _current_study_area_path(self) -> Path:
+        return self._study_dir() / ".current.txt"
+
+    def get_current_study_area(self) -> str:
+        """返回当前选中的研究区文件名；未设置或文件已被删除时返回空串"""
+        p = self._current_study_area_path()
+        if p.exists():
+            name = p.read_text(encoding="utf-8").strip()
+            if name and (self._study_dir() / name).is_file():
+                return name
+        return ""
+
+    def set_current_study_area(self, name: str) -> bool:
+        """设置当前研究区；文件不存在返回 False"""
+        name = os.path.basename((name or "").strip())
+        if not name or not (self._study_dir() / name).is_file():
+            return False
+        self._current_study_area_path().write_text(name, encoding="utf-8")
+        return True
+
+    def delete_study_area(self, name: str) -> str:
+        """删除研究区文件（geojson 及同名配套 shp/dbf/shx/prj）；返回结果消息"""
+        name = os.path.basename((name or "").strip())
+        if not name:
+            return "未指定研究区文件名"
+        gj = self._study_dir() / name
+        if not gj.is_file():
+            return f"研究区文件不存在：{name}"
+        stem = os.path.splitext(name)[0]
+        removed = 0
+        for ext in (".geojson", ".shp", ".dbf", ".shx", ".prj"):
+            f = self._study_dir() / (stem + ext)
+            if f.is_file():
+                try:
+                    f.unlink()
+                    removed += 1
+                except OSError:
+                    pass
+        # 删除的是当前选中项 → 清空 current 标记
+        if self.get_current_study_area() == name:
+            try:
+                self._current_study_area_path().unlink()
+            except OSError:
+                pass
+        return f"已删除 {name}" if removed else f"删除失败：{name}"
+
     # ── 工作流 / 精度 ──────────────────────────────────────────
 
     def get_workflow_status(self, cid: Optional[str]) -> List[dict]:
@@ -847,7 +972,10 @@ class AppBackend:
         project_dir = self._get_project_dir(cid)
         if project_dir:
             try:
-                manifest_stages = run_manifest.load_manifest(project_dir).get("stages", {})
+                # 升级点 2：manifest 落在影像对独立目录（pairs/L{date}_S{date}），
+                # 无配对时兼容旧的项目根布局
+                manifest_root = self._latest_pair_root(project_dir)
+                manifest_stages = run_manifest.load_manifest(manifest_root).get("stages", {})
             except Exception:
                 manifest_stages = {}
 
@@ -863,6 +991,17 @@ class AppBackend:
                 final_status = manifest_status
             else:
                 final_status = agent_status
+            # 结果后处理（可选）：主流程已跑完但未执行后处理 → 明确显示"未执行（可选）"
+            if s == "postprocess" and final_status not in (
+                run_manifest.STATUS_COMPLETED, run_manifest.STATUS_FAILED,
+            ):
+                main_done = (
+                    steps_map.get("accuracy_eval") == "completed"
+                    or manifest_stages.get("accuracy_eval", {}).get("status")
+                    == run_manifest.STATUS_COMPLETED
+                )
+                if main_done:
+                    final_status = "skipped"
             rows.append({"id": s, "label": _WORKFLOW_LABELS.get(s, s), "status": final_status})
         return rows
 
@@ -887,13 +1026,33 @@ class AppBackend:
         project_dir = self._get_project_dir(cid)
         if not project_dir:
             return empty
-        results_dir = os.path.join(project_dir, "results")
+        # 升级点 2：评估结果位于影像对独立目录（取最近修改的一对）
+        results_dir = os.path.join(self._latest_pair_root(project_dir), "results")
         return {
             "independent_prediction": self._read_eval_json(os.path.join(results_dir, "independent_prediction.json")),
             "coarse_constraint_closure": self._read_eval_json(os.path.join(results_dir, "coarse_constraint_closure.json")),
         }
 
     # ── 地图 ──────────────────────────────────────────────────
+
+    def _latest_pair_root(self, project_dir: str) -> str:
+        """项目下最近修改的影像对独立目录（升级点 2：pairs/L{date}_S{date}）。
+
+        无 pairs 目录或为空时返回项目根，兼容旧布局；取最近修改对保证
+        工作流进度 / 精度 / 地图等只读接口始终对准用户当前正在处理的一对。
+        """
+        if not project_dir:
+            return project_dir
+        pairs_root = os.path.join(project_dir, "pairs")
+        if os.path.isdir(pairs_root):
+            try:
+                pair_dirs = [os.path.join(pairs_root, d) for d in sorted(os.listdir(pairs_root))
+                             if os.path.isdir(os.path.join(pairs_root, d))]
+            except OSError:
+                pair_dirs = []
+            if pair_dirs:
+                return max(pair_dirs, key=lambda p: os.path.getmtime(p))
+        return project_dir
 
     def _get_project_dir(self, cid: Optional[str]) -> str:
         """解析对话对应项目目录；内存为空时从会话文件回填"""
@@ -941,6 +1100,47 @@ class AppBackend:
 
     # ── 文件列表 / 下载 ────────────────────────────────────────
 
+    def get_sys_usage(self) -> dict:
+        """本软件（容器进程）的实时资源占用（GB，不含百分比）。
+
+        内存：容器主进程 RSS，读 /proc/self/status 的 VmRSS（Linux 容器内即本软件进程）。
+        磁盘：软件数据根目录（含所有用户、所有项目的工作区与记忆）总大小。
+        磁盘统计较慢，30 秒内缓存复用；内存每次实时读取。
+        """
+        now = time.time()
+        cached = getattr(self, "_usage_cache", None)
+        if cached and now - cached["ts"] < 30:
+            return cached["data"]
+
+        mem_gb = 0.0
+        try:
+            with open("/proc/self/status", "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.startswith("VmRSS:"):
+                        mem_gb = float(line.split()[1]) / 1024.0 / 1024.0  # kB → GB
+                        break
+        except Exception:
+            pass
+
+        disk_gb = 0.0
+        try:
+            root = self._workspace_root()
+            if root.is_dir():
+                total = 0
+                for dirpath, _dirs, files in os.walk(root):
+                    for name in files:
+                        try:
+                            total += os.path.getsize(os.path.join(dirpath, name))
+                        except OSError:
+                            continue
+                disk_gb = total / (1024.0 ** 3)
+        except Exception:
+            pass
+
+        data = {"mem_gb": round(mem_gb, 2), "disk_gb": round(disk_gb, 2)}
+        self._usage_cache = {"ts": now, "data": data}
+        return data
+
     def list_project_files(self, project_dir: str) -> dict:
         project_dir = (project_dir or "").strip()
         # 归属校验：只能访问当前用户自己的项目目录（升级规划 3.12，堵越权读取）
@@ -954,9 +1154,13 @@ class AppBackend:
                 # 中间过程产物（会被阶段清理删除）不在下载面板展示
                 if name in INTERMEDIATE_FILENAMES:
                     continue
+                # 升级点 28：生成中的文件不展示 —— .partial 是原子写入的半成品，
+                # 0 字节是刚创建还没写入内容，都要等文件生成完整后才出现在列表
+                if name.endswith(".partial"):
+                    continue
                 full = os.path.join(root, name)
                 try:
-                    if os.path.isfile(full):
+                    if os.path.isfile(full) and os.path.getsize(full) > 0:
                         rel = os.path.relpath(full, project_dir).replace("\\", "/")
                         files.append({"path": rel, "size": os.path.getsize(full), "name": name})
                 except OSError:
@@ -982,8 +1186,13 @@ class AppBackend:
         # 中间过程产物不提供下载（与下载面板过滤规则一致）
         if os.path.basename(target) in INTERMEDIATE_FILENAMES:
             return None, "该文件为中间过程产物，不提供下载"
+        # 升级点 28：生成中的文件不提供下载（与下载面板过滤规则一致）
+        if os.path.basename(target).endswith(".partial"):
+            return None, "该文件正在生成中，请稍后再试"
         if not os.path.isfile(target):
             return None, "文件不存在"
+        if os.path.getsize(target) == 0:
+            return None, "该文件正在生成中，请稍后再试"
         return target, ""
 
     # ── 测试 ──────────────────────────────────────────────────
@@ -1033,6 +1242,57 @@ class AppBackend:
         except Exception as e:
             lines.append(f"❌ 3. 影像搜索失败：{e}")
         lines.append("\n---\n若 1-3 全部通过：容器网络正常；若第 1 步失败：容器无法访问 Planetary Computer。")
+        return "\n".join(lines)
+
+    def test_cdse_connection(self) -> str:
+        """Copernicus Data Space 连通性测试（升级点 9：测试页补齐 Copernicus）。
+
+        与 test_planetary_connection 同口径：STAC API 可达性 + Sentinel-2 搜索。
+        """
+        import time as _time
+        import requests as _requests
+        from pystac_client import Client
+        from pystac_client.stac_api_io import StacApiIO
+
+        _DS_STAC_URL = "https://stac.dataspace.copernicus.eu/v1"
+        _bbox = [113.7, 29.9, 114.9, 31.3]
+        lines = []
+        try:
+            t0 = _time.time()
+            resp = _requests.get(_DS_STAC_URL, headers={"Accept": "application/json"}, timeout=15)
+            elapsed = _time.time() - t0
+            if resp.status_code == 200:
+                lines.append(f"✅ 1. STAC API 可达（HTTP 200，耗时 {elapsed:.1f}s）")
+            else:
+                lines.append(f"⚠️ 1. STAC API 返回 HTTP {resp.status_code}（耗时 {elapsed:.1f}s）")
+                lines.append("\n---\n若第 1 步即失败，说明容器网络无法访问 stac.dataspace.copernicus.eu。")
+                return "\n".join(lines)
+        except Exception as e:
+            lines.append(f"❌ 1. STAC API 不可达：{e}")
+            lines.append("\n---\n若第 1 步即失败，说明容器网络无法访问 Copernicus Data Space。")
+            return "\n".join(lines)
+        try:
+            catalog = Client.open(
+                _DS_STAC_URL,
+                headers={"Accept": "application/json"},
+                stac_io=StacApiIO(timeout=30, max_retries=1),
+            )
+            lines.append("✅ 2. STAC 目录打开成功")
+        except Exception as e:
+            lines.append(f"❌ 2. STAC 目录打开失败：{e}")
+            return "\n".join(lines)
+        try:
+            items = list(catalog.search(
+                collections=["sentinel-2-l2a"],
+                bbox=_bbox,
+                datetime="2025-01-01/2026-07-31",
+                query={"eo:cloud_cover": {"lt": 90}},
+                max_items=5,
+            ).items())
+            lines.append(f"✅ 3. 影像搜索正常（找到 {len(items)} 景 Sentinel-2 示例）")
+        except Exception as e:
+            lines.append(f"❌ 3. 影像搜索失败：{e}")
+        lines.append("\n---\n若 1-3 全部通过：容器网络正常；若第 1 步失败：容器无法访问 Copernicus Data Space。")
         return "\n".join(lines)
 
     def test_gdal_status(self) -> str:
@@ -1160,7 +1420,7 @@ class AppBackend:
 
     # ── 聊天流式（线程 + 队列，复刻旧版语义） ─────────────────
 
-    def chat_start(self, pid: str, cid: str, user_msg: str, exec_mode: str = "") -> dict:
+    def chat_start(self, pid: str, cid: str, user_msg: str, exec_mode: str = "", chat_mode: str = "") -> dict:
         user_msg = (user_msg or "").strip()
         convs = self.load_conversations()
         if pid not in convs or cid not in convs[pid]:
@@ -1206,8 +1466,8 @@ class AppBackend:
                 self._save_history(pid, cid, history)
                 return {"ok": True, "messages": history}
 
-        # 追加占位 assistant 气泡
-        history = history + [{"role": "assistant", "content": "▍"}]
+        # 追加占位 assistant 气泡（空内容，不显示黑竖线；生成中由前端打字光标指示）
+        history = history + [{"role": "assistant", "content": ""}]
         self._save_history(pid, cid, history)
 
         # 创建流式队列 + 后台线程
@@ -1231,7 +1491,34 @@ class AppBackend:
         def _runner():
             ctx_token = _uid_ctx.set(uid)  # 后台线程不带请求 contextvars，需显式恢复用户
             try:
-                if roles_enabled or _is_agent_command(user_msg):
+                # 升级点 17：Chat 模式 = 只读对话。禁止执行任何 Skill / 工作流、
+                # 禁止生成或修改文件，Agent 只能基于现有信息回答问题。
+                if chat_mode == "chat":
+                    context = {
+                        "workflow_status": conv_state["workflow_progress"],
+                        "config": self._load_settings(),
+                        "study_areas": self.list_study_areas(),  # 已上传研究区文件名
+                        "mode_hint": (
+                            "当前为只读 Chat 模式：你不能执行任何降尺度工作流、"
+                            "不能下载/生成/修改任何文件，只能基于已有资料回答用户问题。\n"
+                            "回答规范（严格遵守）：\n"
+                            "1. 提示用户执行生成任务时，切换目标的叫法必须是「Work 模式」，"
+                            "严禁叫「工作流执行模式」或其他叫法；Work 模式才能执行降尺度工作流、"
+                            "下载数据与生成文件。\n"
+                            "2. 若已上传研究区文件中，有文件名包含的城市与用户咨询的城市一致，"
+                            "说明研究区边界已就绪，不要在后续建议中索要「研究区边界/范围/行政边界」。\n"
+                            "3. 询问影像时间范围时具体到月份即可（如 2023 年 7 月），不要出现「某天」。\n"
+                            "4. 生成产品的引导语建议为：若你需要实际生成<城市>的产品，"
+                            "请切换到 Work 模式，并提供以下信息，我可以协助你完成配置并生成产品。"
+                        ),
+                    }
+                    self._assistant_for().ask_stream(
+                        user_msg, lambda c: q.put(("token", c)),
+                        context=context, prior_messages=prior_messages,
+                        on_thinking=lambda t: q.put(("thinking", t)),
+                    )
+                    q.put(("done", None))
+                elif roles_enabled or _is_agent_command(user_msg):
                     def on_token(content: str):
                         q.put(("token", content))
 
@@ -1282,6 +1569,7 @@ class AppBackend:
                     result = self._agent_for().process_command(
                         user_msg,
                         on_token=on_token,
+                        on_thinking=lambda t: q.put(("thinking", t)),
                         on_log=lambda text: q.put(("log", text)),
                         pause_callback=pause_callback,
                         workflow_callback=workflow_callback,
@@ -1305,6 +1593,7 @@ class AppBackend:
                     self._assistant_for().ask_stream(
                         user_msg, lambda c: q.put(("token", c)),
                         context=context, prior_messages=prior_messages,
+                        on_thinking=lambda t: q.put(("thinking", t)),
                     )
                     q.put(("done", None))
             except Exception as e:
@@ -1332,8 +1621,10 @@ class AppBackend:
             # 流已结束（含断线后重连）：把已累积内容一次性交付，避免气泡停在半截
             saved = self._stream_content.get(cid, "")
             if saved:
+                thinking = self._stream_thinking.get(cid, "")
                 yield ("event: done\ndata: " + json.dumps(
-                    {"content": format_bubble("", saved, streaming=False)},
+                    {"content": format_bubble("", saved, streaming=False),
+                     "thinking": thinking},
                     ensure_ascii=False) + "\n\n")
             else:
                 yield "event: done\ndata: {}\n\n"
@@ -1352,7 +1643,10 @@ class AppBackend:
                 pid = p
                 break
         accumulated = self._stream_content.get(cid, "")
+        thinking = self._stream_thinking.get(cid, "")
         start_time = self._stream_starts.get(cid, time.time())
+        thinking_started = None  # 思考开始时刻，用于计算思考用时（升级点 16）
+        thinking_seconds = self._stream_thinking_seconds.get(cid, 0.0)
         last_emit = time.time()
 
         def _emit(event: str, data: Any):
@@ -1388,11 +1682,29 @@ class AppBackend:
                     break
                 last_emit = time.time()
 
-                if event_type == "token":
+                if event_type == "thinking":
+                    thinking = data
+                    self._stream_thinking[cid] = thinking
+                    if thinking_started is None:
+                        # 新一轮思考开始（含决策后 resume 的后续反思），启动计时
+                        thinking_started = time.time()
+                    # 独立 thinking 事件实时推送思考增量（升级点 15 实时显示），
+                    # content 事件只承载正文，思考链由前端独立折叠块渲染
+                    yield from _emit("thinking", {"thinking": thinking})
+                elif event_type == "token":
+                    # 第一个正文 token 到达 → 思考结束，结算本次思考用时（升级点 16）
+                    if thinking_started is not None:
+                        thinking_seconds = round(time.time() - thinking_started, 1)
+                        thinking_started = None  # 本轮思考结束；下次 thinking 重新计时
+                        self._stream_thinking_seconds[cid] = thinking_seconds
                     accumulated = data
                     self._stream_content[cid] = accumulated
                     yield from _emit("token", {"content": format_bubble("", accumulated, streaming=True)})
                 elif event_type == "append":
+                    if thinking_started is not None:
+                        thinking_seconds = round(time.time() - thinking_started, 1)
+                        thinking_started = None
+                        self._stream_thinking_seconds[cid] = thinking_seconds
                     accumulated += data
                     self._stream_content[cid] = accumulated
                     yield from _emit("token", {"content": format_bubble("", accumulated, streaming=True)})
@@ -1402,13 +1714,15 @@ class AppBackend:
                     if pairs:
                         # 保存待选配对，供 chat_resume 根据用户选择索引恢复
                         self._get_conv_state(cid)["pending_pairs"] = pairs
-                        yield from _emit("pause", {"pairs": pairs})
+                        # pause 时同步带上思考用时（升级点 16）：由我批准模式在
+                        # plan_confirm / 选影像处暂停，done 事件不会走到，用时须在此送达
+                        yield from _emit("pause", {"pairs": pairs, "thinking_seconds": thinking_seconds})
                         paused = True
                         return
                     if payload.get("type") == "approval":
                         # 通用审批节点（技术方案 3.4a）：保存待处理载荷供 chat_resume 校验
                         self._get_conv_state(cid)["pending_approval"] = payload
-                        yield from _emit("pause", {"approval": payload})
+                        yield from _emit("pause", {"approval": payload, "thinking_seconds": thinking_seconds})
                         paused = True
                         return
                     # 既无 pairs 也非 approval：维持现有行为，直接放行
@@ -1427,11 +1741,17 @@ class AppBackend:
 
             elapsed = time.time() - start_time
             final = format_bubble("", accumulated, streaming=False, elapsed=elapsed)
-            yield from _emit("done", {"content": final})
+            yield from _emit("done", {"content": final, "thinking": thinking, "thinking_seconds": thinking_seconds})
             if pid:
                 convs = self.load_conversations()
                 if cid in convs.get(pid, {}):
-                    convs[pid][cid]["messages"][-1]["content"] = final
+                    last = convs[pid][cid]["messages"][-1]
+                    last["content"] = final
+                    # 思考链独立字段持久化，供重新进入对话时前端渲染折叠块（升级点 15/16）
+                    if thinking:
+                        last["thinking"] = thinking
+                    if thinking_seconds:
+                        last["thinking_seconds"] = thinking_seconds
                     self._save_history(pid, cid, convs[pid][cid]["messages"])
                     saved_normally = True
         except Exception as e:
@@ -1446,6 +1766,10 @@ class AppBackend:
                         msgs = convs[pid][cid].get("messages", [])
                         if msgs and msgs[-1].get("role") == "assistant":
                             msgs[-1]["content"] = format_bubble("", accumulated, streaming=False)
+                            if thinking:
+                                msgs[-1]["thinking"] = thinking
+                            if thinking_seconds:
+                                msgs[-1]["thinking_seconds"] = thinking_seconds
                             self._save_history(pid, cid, msgs)
                 except Exception:
                     pass
@@ -1457,7 +1781,7 @@ class AppBackend:
                 self._agent_threads.pop(cid, None)
                 self._stream_starts.pop(cid, None)
                 self._stream_gen.pop(cid, None)
-                # _stream_content 保留：流结束后的重连用于补齐完整气泡
+                # _stream_content / _stream_thinking 保留：流结束后的重连用于补齐完整气泡
 
     def chat_resume(self, cid: str, payload: dict) -> dict:
         """恢复被暂停的流，支持两种协议（技术方案 3.4b）。
@@ -1498,8 +1822,10 @@ class AppBackend:
 # ── FastAPI 应用 ───────────────────────────────────────────────
 
 # 瓦片渲染并发信号量：限制同时渲染的瓦片数量，防止大 GeoTIFF 的瓦片渲染风暴
-# 占满 FastAPI 线程池、饿死其他 API 请求（见 render_layer_tile）
-_TILE_RENDER_SEM = threading.BoundedSemaphore(3)
+# 占满 FastAPI 线程池、饿死其他 API 请求（见 render_layer_tile）。
+# 升级点 29：后端已有 lru_cache（同瓦片重复请求直接命中），并发从 3 提高到 8，
+# 显著加速首次平移/缩放时的冷瓦片加载。
+_TILE_RENDER_SEM = threading.BoundedSemaphore(8)
 
 backend = AppBackend()
 
@@ -1622,6 +1948,7 @@ def bootstrap():
         "projects": tree,
         "settings": backend.get_settings(),
         "study_areas": backend.list_study_areas(),
+        "current_study_area": backend.get_current_study_area(),
     }
 
 
@@ -1699,7 +2026,32 @@ async def upload_study_area(files: List[UploadFile] = File(...)):
 
 @app.get("/api/study-areas")
 def study_areas():
-    return {"study_areas": backend.list_study_areas()}
+    return {"study_areas": backend.list_study_areas(), "current": backend.get_current_study_area()}
+
+
+@app.post("/api/study-area/current")
+def set_study_area_current(payload: dict):
+    """切换当前研究区：写入 .current.txt 标记，Agent 执行时优先使用该文件"""
+    name = payload.get("name") or ""
+    if not backend.set_current_study_area(name):
+        raise HTTPException(status_code=400, detail="研究区文件不存在")
+    return {
+        "ok": True,
+        "message": f"已切换当前研究区为 {name}",
+        "current": name,
+        "study_areas": backend.list_study_areas(),
+    }
+
+
+@app.delete("/api/study-area")
+def delete_study_area(name: str = ""):
+    message = backend.delete_study_area(name)
+    return {
+        "ok": True,
+        "message": message,
+        "current": backend.get_current_study_area(),
+        "study_areas": backend.list_study_areas(),
+    }
 
 
 # ── API：工作流 / 精度 / 地图 ──────────────────────────────────
@@ -1731,10 +2083,13 @@ def layer_png(layer_id: str, conv: str = ""):
 
 @app.get("/api/layer/{layer_id}/tile/{z}/{x}/{y}")
 def layer_tile(layer_id: str, z: int, x: int, y: int, conv: str = ""):
+    # 升级点 29：允许浏览器缓存瓦片（同一图层同一 URL 平移/缩放时直接本地取，
+    # 不再重复请求后端）；图层更新时前端 tileUrl 的 t 参数变化，自动失效拉新
+    _cache_headers = {"Cache-Control": "public, max-age=300"}
     png = backend.render_layer_tile(layer_id, conv or None, z, x, y)
     if png is None:
-        return Response(status_code=204)
-    return Response(content=png, media_type="image/png")
+        return Response(status_code=204, headers=_cache_headers)
+    return Response(content=png, media_type="image/png", headers=_cache_headers)
 
 
 @app.get("/api/map/html", response_class=HTMLResponse)
@@ -1749,6 +2104,7 @@ def chat_start(payload: dict):
     return backend.chat_start(
         payload.get("project", ""), payload.get("conv", ""), payload.get("message", ""),
         exec_mode=payload.get("exec_mode", ""),
+        chat_mode=payload.get("chat_mode", ""),
     )
 
 
@@ -1775,6 +2131,8 @@ def chat_current(conv: str = ""):
     return {
         "active": conv in backend._stream_queues,
         "content": format_bubble("", content, streaming=False) if content else "",
+        "thinking": backend._stream_thinking.get(conv, ""),
+        "thinking_seconds": backend._stream_thinking_seconds.get(conv, 0.0),
     }
 
 
@@ -1788,6 +2146,12 @@ def chat_resume(payload: dict):
 @app.get("/api/files")
 def files(project_dir: str = ""):
     return backend.list_project_files(project_dir)
+
+
+@app.get("/api/sysinfo")
+def sysinfo():
+    """日志面板实时资源占用：本软件进程内存 + 软件数据目录磁盘（GB）"""
+    return backend.get_sys_usage()
 
 
 @app.get("/api/download")
@@ -1804,11 +2168,47 @@ def download(project_dir: str = "", path: str = ""):
     )
 
 
+@app.post("/api/download/multiple")
+def download_multiple(payload: dict):
+    """批量下载（升级点 26）：paths 数组 → 打包为 zip 返回"""
+    project_dir = str(payload.get("project_dir") or "")
+    paths = payload.get("paths") or []
+    if not isinstance(paths, list) or not paths:
+        raise HTTPException(status_code=400, detail="未选择文件")
+    # 先统一校验，任一非法即拒绝（防目录穿越 + 归属校验）
+    targets = []
+    for rel in paths:
+        target, err = backend.resolve_download(project_dir, str(rel))
+        if target is None:
+            raise HTTPException(status_code=400, detail=f"非法请求：{err}")
+        targets.append((str(rel), target))
+    import io
+    import zipfile
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for rel, target in targets:
+            # 以相对路径入库，子目录结构保留；避免同名文件互相覆盖
+            arcname = rel.replace("\\", "/")
+            zf.write(target, arcname)
+    buf.seek(0)
+    return StreamingResponse(
+        buf,
+        media_type="application/zip",
+        headers={"Content-Disposition": "attachment; filename=geothermoai_download.zip"},
+    )
+
+
 # ── API：测试 ──────────────────────────────────────────────────
 
 @app.post("/api/test/planetary")
 def test_planetary():
     return {"result": backend.test_planetary_connection()}
+
+
+@app.post("/api/test/cdse")
+def test_cdse():
+    """Copernicus Data Space 连通性测试（升级点 9）。"""
+    return {"result": backend.test_cdse_connection()}
 
 
 @app.post("/api/test/gdal")

@@ -16,6 +16,25 @@ from ..atomic_io import atomic_write_json
 _lock = threading.Lock()
 
 
+def _norm_date(s) -> str:
+    """日期归一化为 YYYYMMDD 定长字符串（YYYY-MM-DD / YYYYMMDD / 空）。"""
+    return str(s or "").replace("-", "").replace("/", "").strip()
+
+
+def _ranges_overlap(rec_range, start: str, end: str) -> bool:
+    """记录 date_range 与查询区间是否相交；空串边界视为无界。"""
+    rec_range = rec_range or ["", ""]
+    rs, re = _norm_date(rec_range[0]), _norm_date(rec_range[1])
+    qs, qe = _norm_date(start), _norm_date(end)
+    if not rs and not re:
+        return True  # 记录无日期，仅靠 region/影像对过滤
+    if re and qs and re < qs:
+        return False  # 记录结束早于查询开始
+    if rs and qe and rs > qe:
+        return False  # 记录开始晚于查询结束
+    return True
+
+
 class ExperimentLog:
     """experiments.json 读写封装（每项目一份）。"""
 
@@ -90,6 +109,33 @@ class ExperimentLog:
         if best:
             best.pop("_r2", None)
         return best
+
+    def query(self, region: str = "", start: str = "", end: str = "",
+              landsat_date: str = "", sentinel2_date: str = "",
+              model: str = "") -> List[Dict[str, Any]]:
+        """精确查询历史实验（结构化过滤，结构化查询层）。
+
+        支持按研究区（子串）、时间范围（date_range 区间相交）、
+        影像对日期（pair.landsat_date / pair.sentinel2_date）、模型组合过滤，
+        返回匹配的成功实验列表（按时间倒序）。全部条件可选，为空表示不限制。
+        """
+        results = []
+        for r in self._load():
+            if r.get("status") != "success":
+                continue
+            if region and region not in str(r.get("region", "")):
+                continue
+            if model and r.get("model") != model:
+                continue
+            if (start or end) and not _ranges_overlap(r.get("date_range"), start, end):
+                continue
+            pair = r.get("pair") or {}
+            if landsat_date and _norm_date(pair.get("landsat_date")) != _norm_date(landsat_date):
+                continue
+            if sentinel2_date and _norm_date(pair.get("sentinel2_date")) != _norm_date(sentinel2_date):
+                continue
+            results.append(r)
+        return sorted(results, key=lambda x: x.get("timestamp", ""), reverse=True)
 
     def all(self) -> List[Dict[str, Any]]:
         return self._load()

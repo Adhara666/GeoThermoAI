@@ -23,6 +23,7 @@ PLANNER_INTENT_PROMPT = """{identity}
 - qa：领域问答（问原理、问参数含义、问数据源、问某地名是否认识），只需要回答，不需要跑流程
 - task：要让系统真的跑一次生产流程（下载数据、训练模型、生成地表温度产品）
 - modify：修改上一轮已经确认的需求或参数（换时间、换地区、换参数）
+- postprocess：对已有的地表温度产品做结果后处理，不重新跑生产流程（例如用户说「无空洞/填洞/空洞填补/结果后处理/对已有结果做XX」）
 - unclear：说不清，需要反问
 
 ## 判定要点
@@ -30,6 +31,7 @@ PLANNER_INTENT_PROMPT = """{identity}
 - 用户在回答你上一轮的反问（例如你问月份，他答「7 月」）→ 延续上一轮意图，通常是 task
 - 用户只是确认某个地名、问「你认识 X 吗」→ qa，不要当成任务
 - 用户明确说想要产品/结果/数据但没给全信息 → 仍然是 task，把缺失项写进 missing
+- **model 未指定时绝不反问、绝不写进 missing**：模型默认使用随机森林（rf）；只有用户明确要求具体模型（如 XGBoost）时才抽取 model 槽位
 
 ## 槽位
 - region_name：用户说的研究区名称（地名），没提就填 null
@@ -45,8 +47,12 @@ PLANNER_INTENT_PROMPT = """{identity}
 
 ## 输出格式（严格遵守）
 {{"intent": "task", "intent_confidence": 0.92, "reason": "一句话说明判定依据",
-  "slots": {{"region_name": "九江镇", "time_expression": "25年", "product": "lst_10m", "model": null}},
+  "slots": {{"region_name": "示例地名", "time_expression": "25年", "product": "lst_10m", "model": null}},
   "missing": ["time_range"], "question": null}}
+
+注意：上方示例中的「示例地名」仅为展示 JSON 结构的占位符，不是真实研究区。
+实际输出时 region_name 必须取自用户输入或「用户已上传的研究区文件」中的真实地名，
+严禁照抄示例地名，严禁输出示例占位地名。
 """
 
 

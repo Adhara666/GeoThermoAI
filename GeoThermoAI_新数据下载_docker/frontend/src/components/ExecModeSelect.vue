@@ -46,7 +46,8 @@ onBeforeUnmount(() => document.removeEventListener('click', onDocClick))
       <svg class="exec-mode__caret" :class="{ 'exec-mode__caret--open': open }"
            width="12" height="12" viewBox="0 0 24 24" fill="none"
            stroke="currentColor" stroke-width="2">
-        <polyline points="18 15 12 9 6 15" />
+        <!-- 默认朝下（收起），点击展开面板后朝上（--open 旋转 180°） -->
+        <polyline points="18 9 12 15 6 9" />
       </svg>
     </button>
 

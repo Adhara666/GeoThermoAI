@@ -78,12 +78,14 @@ export const api = {
     return res.json()
   },
 
-  /** 建立 SSE 连接；onEvent(type, data)；返回 AbortController */
+  setCurrentStudyArea: (name) => req('POST', '/api/study-area/current', { name }),
+  deleteStudyArea: (name) => req('DELETE', `/api/study-area?name=${encodeURIComponent(name)}`),
+
+  /** 建立 SSE 连接；onEvent(type, data)；返回 { close }（升级点 5/6：切换对话时主动关闭旧连接） */
   stream(convId, onEvent, onError) {
-    const ctrl = new AbortController()
     const es = new EventSource(`/api/chat/stream?conv=${encodeURIComponent(convId)}&token=${encodeURIComponent(getToken())}`)
     es.onmessage = (e) => { try { onEvent('message', JSON.parse(e.data)) } catch (_) {} }
-    ;['token', 'append', 'pause', 'workflow', 'log', 'done', 'error'].forEach((t) => {
+    ;['token', 'thinking', 'append', 'pause', 'workflow', 'log', 'done', 'error'].forEach((t) => {
       es.addEventListener(t, (e) => {
         let data = {}
         try { data = JSON.parse(e.data) } catch (_) {}
@@ -97,7 +99,7 @@ export const api = {
       // EventSource 自动重连；close 后不会再触发
       if (es.readyState === EventSource.CLOSED && onError) onError('连接已关闭')
     }
-    return ctrl
+    return { close: () => { try { es.close() } catch (_) {} } }
   },
 }
 

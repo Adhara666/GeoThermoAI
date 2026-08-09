@@ -30,7 +30,7 @@ def run_with_roles(agent, user_input: str, on_token=None, on_log=None,
                    pause_callback=None, project_dir: str = "", workflow_callback=None,
                    settings_path: str = "", study_areas_dir: str = "", conv_id: str = "",
                    project_id: str = "", memory_manager=None, exec_mode: str = "",
-                   prior_messages=None, session_state=None) -> str:
+                   prior_messages=None, session_state=None, on_thinking=None) -> str:
     """多角色路径：规划 Agent 出 plan，本方法按 plan 依次调用执行 Agent。
 
     与 `process_command` 的旧路径互不影响；`roles_enabled=False` 时永不进入这里。
@@ -57,7 +57,8 @@ def run_with_roles(agent, user_input: str, on_token=None, on_log=None,
 
     planner = PlannerAgent(agent.assistant, agent.registry,
                            memory_manager=memory_manager, project_id=project_id,
-                           on_log=on_log, replan_max=cfg["replan_max"])
+                           on_log=on_log, replan_max=cfg["replan_max"],
+                           on_thinking=on_thinking)
     run_state = RunState(exec_mode=mode, replan_max=cfg["replan_max"],
                          conv_id=conv_id, project_id=project_id)
 
@@ -85,7 +86,8 @@ def run_with_roles(agent, user_input: str, on_token=None, on_log=None,
             except Exception:
                 pass
         return agent.assistant.ask_stream(user_input, on_token, context=context,
-                                         prior_messages=prior_messages or [])
+                                         prior_messages=prior_messages or [],
+                                         on_thinking=on_thinking)
 
     if outcome.action == PlannerOutcome.ASK:
         _emit(outcome.question)
@@ -125,14 +127,15 @@ def run_with_roles(agent, user_input: str, on_token=None, on_log=None,
         project_dir=project_dir, workflow_callback=workflow_callback,
         stream_acc=stream_acc, settings_path=settings_path,
         study_areas_dir=study_areas_dir, conv_id=conv_id, project_id=project_id,
-        memory_manager=memory_manager,
+        memory_manager=memory_manager, on_thinking=on_thinking,
     )
 
 def solve_with_replan(agent, plan: dict, *, planner, ctx, run_state, session, emit,
                       mode: str, cfg: dict, on_token=None, on_log=None,
                       pause_callback=None, project_dir: str = "", workflow_callback=None,
                       stream_acc=None, settings_path: str = "", study_areas_dir: str = "",
-                      conv_id: str = "", project_id: str = "", memory_manager=None) -> str:
+                      conv_id: str = "", project_id: str = "", memory_manager=None,
+                      on_thinking=None) -> str:
     """Solve 阶段：按 plan 执行；子 Agent 请求 replan 时由本方法（总调度）发起。
 
     replan 只能由总调度发起、只能由规划 Agent 产出新 plan（技术方案 2.4 规则 1）。
@@ -149,13 +152,16 @@ def solve_with_replan(agent, plan: dict, *, planner, ctx, run_state, session, em
         hooks = RoleHooks(
             exec_mode=mode, run_state=run_state, pause_callback=pause_callback,
             data_agent=DataAgent(agent.assistant, memory_manager=memory_manager,
-                                 project_id=project_id, on_log=on_log),
+                                 project_id=project_id, on_log=on_log,
+                                 on_thinking=on_thinking),
             train_agent=TrainAgent(agent.assistant, agent.registry,
                                    memory_manager=memory_manager,
                                    project_id=project_id, on_log=on_log,
-                                   max_rounds=cfg["tuning_max_rounds"]),
+                                   max_rounds=cfg["tuning_max_rounds"],
+                                   on_thinking=on_thinking),
             eval_agent=EvalAgent(agent.assistant, memory_manager=memory_manager,
-                                 project_id=project_id, on_log=on_log),
+                                 project_id=project_id, on_log=on_log,
+                                 on_thinking=on_thinking),
             agent_cfg=cfg, on_log=on_log,
         )
         agent._normalize_plan_paths(current, study_areas_dir=study_areas_dir)
@@ -321,5 +327,6 @@ def plan_summary(plan: dict) -> str:
     constraints = plan.get("constraints") or {}
     cloud = constraints.get("cloud_threshold")
     cloud_text = f"，云量上限 {cloud}" if cloud is not None else ""
-    return (f"研究区 {region}，时间 {when}{cloud_text}。"
-            f"共 {len(plan.get('steps') or [])} 步：{stages}。")
+    # 升级点 27：研究区/时间/云量与步骤数分两行显示，前后两句都不带句号
+    return (f"研究区 {region}，时间 {when}{cloud_text}\n"
+            f"共 {len(plan.get('steps') or [])} 步：{stages}")

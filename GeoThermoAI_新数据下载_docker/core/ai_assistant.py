@@ -74,7 +74,7 @@ class GeoThermoAI_Assistant:
 数学公式请使用 LaTeX 语法，行内公式用 $...$ 包裹，块级公式用 $$...$$ 包裹。
 格式规则：
 - 列表必须使用无序列表（用 - 开头），禁止使用编号列表（如 1. 2. 3.）
-- 禁止输出 ### 等 markdown 标记符作为纯文本，标题直接用 **粗体** 表示即可
+- 禁止输出任何 markdown 标记符号（如 **、##、###、*、` 等），需要强调时用引号「」或直接自然语言表达即可
 - 段落之间用空行分隔，保持内容紧凑"""
 
     def ask(self, question: str, context: dict = None, prior_messages: list = None) -> str:
@@ -110,8 +110,13 @@ class GeoThermoAI_Assistant:
         on_token: Callable[[str], None],
         context: dict = None,
         prior_messages: list = None,
+        on_thinking: Callable[[str], None] = None,
     ) -> str:
-        """流式向AI提问，每次收到 token 回调 on_token(累计内容)"""
+        """流式向AI提问，每次收到 token 回调 on_token(累计内容)
+
+        on_thinking（可选）：模型输出思考过程（如 DeepSeek 的 reasoning_content）
+        时，以累计思考内容回调，供前端以可折叠形式展示（升级点 15）。
+        """
         if not self.api_key and not self.api_base_url:
             error = "未检测到LLM模型配置，请先在设置中配置 API 密钥或自定义请求地址。"
             on_token(error)
@@ -139,17 +144,24 @@ class GeoThermoAI_Assistant:
             on_token(result)
             return result
         else:
-            return self._call_openai_api_stream(messages, on_token)
+            return self._call_openai_api_stream(messages, on_token, on_thinking=on_thinking)
 
     def _call_api(self, messages: List[Dict], **overrides) -> str:
-        """调用大模型API，overrides 可覆盖 max_tokens/temperature 等参数"""
+        """调用大模型API，overrides 可覆盖 max_tokens/temperature 等参数。
+        支持 on_thinking 回调（透传非流式响应中的 reasoning_content，升级点 15）。"""
         if self.api_format == 'anthropic':
             return self._call_anthropic_api(messages)
         else:
             return self._call_openai_api(messages, **overrides)
 
     def _call_openai_api(self, messages: List[Dict], **overrides) -> str:
-        """调用 OpenAI 兼容格式 API"""
+        """调用 OpenAI 兼容格式 API
+
+        on_thinking（可选）：非流式响应（如规划 Agent 出 plan 前的 LLM 调用）
+        携带 reasoning_content 时回调，让规划/反思等同步阶段的思考也能实时展示
+        （升级点 15）。
+        """
+        on_thinking = overrides.get("on_thinking")
         if self.api_base_url:
             api_url = f"{self.api_base_url}/chat/completions"
         else:
@@ -168,18 +180,33 @@ class GeoThermoAI_Assistant:
             "temperature": overrides.get("temperature", 0.7),
             "max_tokens": overrides.get("max_tokens", 8192)
         }
+        # DeepSeek-V4 系列思考模式默认开启：reasoning_content 计入 max_tokens，
+        # 对「单步结构化输出」类任务（如 eval 结果解读）会占满预算导致正文为空而降级。
+        # 调用方（如 eval_agent）可传 thinking={"type": "disabled"} 关闭该次调用的思考链。
+        thinking = overrides.get("thinking")
+        if thinking is not None:
+            payload["thinking"] = thinking
 
         try:
             response = requests.post(api_url, headers=headers, json=payload, timeout=120)
             response.raise_for_status()
-            return response.json()['choices'][0]['message']['content']
+            message = response.json()['choices'][0]['message']
+            thinking = message.get("reasoning_content") or ""
+            if thinking and on_thinking:
+                on_thinking(thinking)
+            return message.get("content", "")
         except Exception as e:
             return f"API调用失败: {str(e)}"
 
     def _call_openai_api_stream(
-        self, messages: List[Dict], on_token: Callable[[str], None]
+        self, messages: List[Dict], on_token: Callable[[str], None],
+        on_thinking: Callable[[str], None] = None,
     ) -> str:
-        """流式调用 OpenAI 兼容格式 API，每次收到 token 回调 on_token(累计内容)"""
+        """流式调用 OpenAI 兼容格式 API，每次收到 token 回调 on_token(累计内容)
+
+        on_thinking：模型输出 reasoning_content（DeepSeek 等思考模型）时，
+        以累计思考内容回调（升级点 15：前端可折叠展示思考过程）。
+        """
         if self.api_base_url:
             api_url = f"{self.api_base_url}/chat/completions"
         else:
@@ -201,6 +228,7 @@ class GeoThermoAI_Assistant:
         }
 
         full_content = ""
+        full_thinking = ""
         try:
             response = requests.post(
                 api_url, headers=headers, json=payload, stream=True, timeout=120
@@ -215,11 +243,13 @@ class GeoThermoAI_Assistant:
                             break
                         try:
                             chunk = json.loads(data)
-                            content = (
-                                chunk.get("choices", [{}])[0]
-                                .get("delta", {})
-                                .get("content", "")
-                            )
+                            delta = chunk.get("choices", [{}])[0].get("delta", {})
+                            # 思考过程：DeepSeek 等模型用 reasoning_content 字段输出
+                            thinking = delta.get("reasoning_content") or ""
+                            if thinking and on_thinking:
+                                full_thinking += thinking
+                                on_thinking(full_thinking)
+                            content = delta.get("content") or ""
                             if content:
                                 full_content += content
                                 on_token(full_content)

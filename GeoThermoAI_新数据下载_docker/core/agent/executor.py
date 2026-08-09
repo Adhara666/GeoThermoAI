@@ -90,18 +90,46 @@ def new_exp_state() -> dict:
     }
 
 
-def build_skill_paths(raw_dir: str, processed_dir: str, results_dir: str) -> Dict[str, dict]:
-    """各 Skill 的输入/输出路径硬编码映射（与平移前一致）。"""
+def build_skill_paths(raw_dir: str, processed_dir: str, results_dir: str,
+                      dates: Optional[dict] = None, project_dir: str = "") -> Dict[str, dict]:
+    """各 Skill 的输入/输出路径硬编码映射。
+
+    dates 携带当前配对的影像日期（YYYYMMDD），用于生成带日期的文件名
+    （升级点 4：本地 LST/Sentinel-2 文件名必须带日期；DEM 不带日期）。
+    project_dir 注入给 data_acquisition，供「已下载配对去重 / 重复影像复制 / DEM 复用」使用。
+    """
+    ldate = str((dates or {}).get("landsat") or "").strip()
+    sdate = str((dates or {}).get("sentinel2") or "").strip()
+
+    def _landsat(name: str) -> str:
+        return f"{name}_{ldate}.tif" if ldate else f"{name}.tif"
+
+    def _sentinel(name: str) -> str:
+        return f"{name}_{sdate}.tif" if sdate else f"{name}.tif"
+
+    landsat_file = _landsat("landsat_lst")
+    qa_file = _landsat("landsat_qa_pixel")
+    s2_file = _sentinel("sentinel2_bands")
+    scl_file = _sentinel("sentinel2_scl")
+    tcr_csv = f"tcr_result_{sdate}.csv" if sdate else "tcr_result.csv"
+    lst_tif = f"rf_10m_lst_final_{sdate}.tif" if sdate else "rf_10m_lst_final.tif"
+    lst_csv = f"rf_10m_predict_{sdate}.csv" if sdate else "rf_10m_predict.csv"
+    # 结果后处理（升级点：空洞填补）产物：命名与原始产品区分，
+    # 前缀 _filled 保证与 lst_export 的 glob（rf_10m_lst_final_[0-9]*）互不串扰
+    filled_tif = f"rf_10m_lst_final_filled_{sdate}.tif" if sdate else "rf_10m_lst_final_filled.tif"
+    filled_mask = f"rf_10m_lst_final_filled_{sdate}_cloud_mask.tif" if sdate else "rf_10m_lst_final_filled_cloud_mask.tif"
+
     return {
         "data_acquisition": {
             "output_dir": raw_dir,
+            "project_dir": project_dir,  # 供已下载对跳过/重复影像复制/DEM 复用
         },
         "data_pipeline": {
             "output_dir": processed_dir,
-            "landsat_path": raw_dir + "/landsat_lst.tif",
-            "qa_path": raw_dir + "/landsat_qa_pixel.tif",
-            "sentinel2_path": raw_dir + "/sentinel2_bands.tif",
-            "scl_path": raw_dir + "/sentinel2_scl.tif",
+            "landsat_path": raw_dir + "/" + landsat_file,
+            "qa_path": raw_dir + "/" + qa_file,
+            "sentinel2_path": raw_dir + "/" + s2_file,
+            "scl_path": raw_dir + "/" + scl_file,
             "dem_path": raw_dir + "/dem.tif",
         },
         "ttri_compute": {
@@ -120,7 +148,7 @@ def build_skill_paths(raw_dir: str, processed_dir: str, results_dir: str) -> Dic
         },
         "tcr_compute": {
             "output_dir": results_dir,
-            "output_path": results_dir + "/tcr_result.csv",
+            "output_path": results_dir + "/" + tcr_csv,
             "data_30m_csv": processed_dir + "/30m_features_step2.csv",
             "meta_30m_json": processed_dir + "/30m_features_step2_meta.json",
             "predict_10m_csv": processed_dir + "/10m_predict_features.csv",
@@ -129,18 +157,51 @@ def build_skill_paths(raw_dir: str, processed_dir: str, results_dir: str) -> Dic
         },
         "lst_export": {
             "output_dir": results_dir,
-            "input_csv": results_dir + "/tcr_result.csv",
+            "input_csv": results_dir + "/" + tcr_csv,
             "meta_10m_json": processed_dir + "/10m_predict_features_meta.json",
+            "output_tif": results_dir + "/" + lst_tif,
+            "lst_final_csv": results_dir + "/" + lst_csv,
         },
         "accuracy_eval": {
             "output_dir": results_dir,
             "test_csv": processed_dir + "/test.csv",
             "full_30m_csv": processed_dir + "/30m_features_step2.csv",
-            "predict_csv": results_dir + "/tcr_result.csv",
+            "predict_csv": results_dir + "/" + tcr_csv,
             "meta_30m_json": processed_dir + "/30m_features_step2_meta.json",
             "meta_10m_json": processed_dir + "/10m_predict_features_meta.json",
         },
+        "lst_gapfill": {
+            "output_dir": results_dir,
+            "input_tif": results_dir + "/" + lst_tif,
+            "output_tif": results_dir + "/" + filled_tif,
+            "output_mask": results_dir + "/" + filled_mask,
+        },
     }
+
+
+def pair_dirs(project_dir: str, selected_pair: Optional[dict]) -> tuple:
+    """按当前选中的影像对计算独立目录（升级点 2：每对影像及其后续文件目录独立）。
+
+    目录布局：{project_dir}/pairs/L{landsat_date}_S{sentinel2_date}/{raw,processed,results}
+    未选择配对（搜索阶段）时回退项目级 {project_dir}/{raw,processed,results}。
+    """
+    if not project_dir:
+        return "", "", ""
+    pair = selected_pair if isinstance(selected_pair, dict) else None
+    l = str((pair or {}).get("landsat_date") or "").replace("-", "")
+    s = str((pair or {}).get("sentinel2_date") or "").replace("-", "")
+    if l and s:
+        base = f"{project_dir}/pairs/L{l}_S{s}".replace("\\", "/")
+        return f"{base}/raw", f"{base}/processed", f"{base}/results"
+    return (f"{project_dir}/raw", f"{project_dir}/processed", f"{project_dir}/results")
+
+
+def pair_dates(selected_pair: Optional[dict]) -> dict:
+    """从选中的配对提取 YYYYMMDD 日期；无配对返回空。"""
+    pair = selected_pair if isinstance(selected_pair, dict) else None
+    l = str((pair or {}).get("landsat_date") or "").replace("-", "")
+    s = str((pair or {}).get("sentinel2_date") or "").replace("-", "")
+    return {"landsat": l, "sentinel2": s} if (l and s) else {}
 
 
 def build_experiment_record(exp_state: dict, conv_id: str, project_id: str,
@@ -261,14 +322,28 @@ def execute_plan(agent, plan: dict, on_token=None, on_log=None, pause_callback=N
         emit=_emit, pause_callback=pause_callback, total=total,
     )
 
-    SKILL_PATHS = build_skill_paths(raw_dir, processed_dir, results_dir)
-
     i = 0
     while i < total:
         step = steps[i]
         skill_name = step["skill"]
         skill = agent.registry.get(skill_name)
         ctx.step_index = i
+
+        # ── 每对影像独立目录（升级点 2）：按当前已选配对动态解析路径 ──
+        # 搜索阶段无配对时用项目级目录；用户选择配对后（params.selected_pair 已注入）
+        # 自动切换为该配对的独立目录，同一计划内的所有后续步骤随之生效。
+        _sel_pair = None
+        for _s in steps:
+            if _s.get("skill") == "data_acquisition":
+                _sp = _s.get("params") or {}
+                if _sp.get("selected_pair"):
+                    _sel_pair = _sp["selected_pair"]
+                break
+        if _sel_pair:
+            raw_dir, processed_dir, results_dir = pair_dirs(project_dir, _sel_pair)
+            ctx.raw_dir, ctx.processed_dir, ctx.results_dir = raw_dir, processed_dir, results_dir
+        SKILL_PATHS = build_skill_paths(raw_dir, processed_dir, results_dir,
+                                        dates=pair_dates(_sel_pair), project_dir=project_dir)
 
         # 注入硬编码路径
         if project_dir and skill_name in SKILL_PATHS:
@@ -291,6 +366,33 @@ def execute_plan(agent, plan: dict, on_token=None, on_log=None, pause_callback=N
                     params[k] = v
             step["params"] = params
 
+        # lst_gapfill：输入必须是已存在的 10m LST 产品。SKILL_PATHS 里的默认名
+        # （不带日期）通常不存在，从项目目录递归找最新的 rf_10m_lst_final_*.tif
+        # （排除已填补的 _filled 产物），输出放到同目录并带日期命名。
+        if skill_name == "lst_gapfill" and project_dir:
+            _in = step.get("params", {}).get("input_tif", "")
+            if not _in or not os.path.isfile(_in):
+                _cands = sorted(
+                    glob.glob(os.path.join(project_dir, "**", "rf_10m_lst_final_*.tif"),
+                              recursive=True),
+                    key=lambda p: os.path.getmtime(p), reverse=True)
+                _cands = [c for c in _cands if "_filled" not in os.path.basename(c)]
+                if _cands:
+                    _src = _cands[0].replace("\\", "/")
+                    _dir = os.path.dirname(_src)
+                    _base = os.path.basename(_src)
+                    params = step.setdefault("params", {})
+                    params["input_tif"] = _src
+                    params["output_dir"] = _dir
+                    params["output_tif"] = os.path.join(
+                        _dir, _base.replace("_final_", "_final_filled_")).replace("\\", "/")
+                    params["output_mask"] = os.path.join(
+                        _dir, _base.replace("_final_", "_final_filled_")
+                        .replace(".tif", "_cloud_mask.tif")).replace("\\", "/")
+                else:
+                    # 项目里确实还没有 10m LST 结果：保留原参数，让 skill 报"缺少输入"
+                    _emit(f"  未找到已有的 10m 地表温度产品（{skill_name} 需要先导出 LST）\n")
+
         # 注入用户配置参数（不覆盖 LLM 已指定的值）
         if skill_name == "data_acquisition":
             _cfg = agent._load_config(settings_path).get("data", {})
@@ -298,6 +400,15 @@ def execute_plan(agent, plan: dict, on_token=None, on_log=None, pause_callback=N
                 step.setdefault("params", {})["cloud_threshold"] = _cfg.get("cloud_threshold", 30)
             if "dem_source" not in step.get("params", {}):
                 step.setdefault("params", {})["dem_source"] = _cfg.get("dem_source", "copernicus")
+
+        # data_pipeline：注入研究区 GeoJSON，让像元占比统计按研究区多边形口径计算
+        # （无研究区文件时跳过，预处理回退 bbox 口径）
+        if skill_name == "data_pipeline":
+            _region_file = ""
+            if isinstance(plan.get("region"), dict):
+                _region_file = str(plan["region"].get("study_area_file") or "")
+            if _region_file and not step.get("params", {}).get("study_area_geojson"):
+                step.setdefault("params", {})["study_area_geojson"] = _region_file
 
         if not skill:
             results.append(f"未找到技能: {skill_name}")
@@ -391,9 +502,17 @@ def execute_plan(agent, plan: dict, on_token=None, on_log=None, pause_callback=N
                                 selected = pairs[0]
                                 exp_state["pair_selected_by"] = "auto"
                                 _emit("  " + presentation.pair_auto_selected(1))
-                            # 注入选择，重新执行下载
+                            # 注入选择，重新执行下载（升级点 2：切换为该配对的独立目录）
                             step["params"]["selected_pair"] = selected
                             exp_state["pair"] = selected
+                            raw_dir, processed_dir, results_dir = pair_dirs(project_dir, selected)
+                            ctx.raw_dir, ctx.processed_dir, ctx.results_dir = (
+                                raw_dir, processed_dir, results_dir)
+                            SKILL_PATHS = build_skill_paths(
+                                raw_dir, processed_dir, results_dir,
+                                dates=pair_dates(selected), project_dir=project_dir)
+                            for _k, _v in SKILL_PATHS.get("data_acquisition", {}).items():
+                                step["params"][_k] = _v
                             _emit("  " + presentation.download_started())
                             result = skill.execute(
                                 step.get("params", {}),

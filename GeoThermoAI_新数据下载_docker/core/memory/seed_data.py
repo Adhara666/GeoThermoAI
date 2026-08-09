@@ -137,6 +137,13 @@ SEED_ITEMS = [
         "domain": "theory",
         "content": "由 DEM 用 numpy.gradient 计算：Slope = arctan(√(gx²+gy²))（度）；Aspect = (arctan2(−gx,gy)+360) mod 360（度）；cos(Aspect) 作为 TTRI 回归输入之一。",
     },
+    {
+        "id": "K32",
+        "topic": "10m LST 空洞填补（结果后处理）",
+        "tags": ["结果后处理", "空洞填补", "gap filling", "无空洞", "云", "填洞"],
+        "domain": "theory",
+        "content": "10m 地表温度产品在预处理阶段按联合掩膜（Landsat QA 无云 + Sentinel-2 SCL 类别 4/5/6 + 热红外有效值）剔除了云/云影等像元，因此最终导出的 rf_10m_lst_final_{date}.tif 在云区存在 nodata 空洞。结果后处理（可选）对这些空洞做空间重建（gap filling），只估计空洞像元、绝不改变无云区数值，且填洞值不参与 TCR 与闭合精度评价。算法：空洞占比 <2% 时直接在原始分辨率做 IDW（k 近邻反距离加权，距离幂次默认 2）一次填完；否则用多尺度金字塔——逐级 2× 平均聚合下采样直到空洞占比 <2%（最粗层代表大尺度温度趋势），最粗层对残余小洞做 IDW 填充，再逐层双线性上采样回填（有效像元写真值、空洞像元继承上层趋势值），避免成片云洞中心被拉平成洞口邻域均值。输出两个 GeoTIFF：填洞后的完整产品（rf_10m_lst_final_filled_{date}.tif）与空洞掩膜（rf_10m_lst_final_filled_{date}_cloud_mask.tif，1=估计像元、0=原始有效），供下游区分真实观测与重建值。卫星在云下看不见地表，任何填洞都是估计而非观测。",
+    },
 ]
 
 

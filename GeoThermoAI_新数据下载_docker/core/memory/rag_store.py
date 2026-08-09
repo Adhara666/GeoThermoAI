@@ -13,6 +13,7 @@ ChromaDB 向量记忆封装（RAG 层）
 
 import os
 import logging
+import threading
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -156,6 +157,10 @@ class RAGStore:
         os.makedirs(persist_dir, exist_ok=True)
         self._client = chromadb.PersistentClient(path=persist_dir)
         self._embedding = embedding or EmbeddingFunction()
+        # 记忆加固：ChromaDB 写入/删除/检索的全局读写锁（可重入）。
+        # get→add / get→delete 等多步操作必须原子执行，避免并行时
+        # 「一个对话在写入经验、另一个对话在删除/检索」的竞态。
+        self._lock = threading.RLock()
 
     # ── Collection 管理 ────────────────────────────────────────────
 
@@ -173,10 +178,11 @@ class RAGStore:
         return self._collection("global_knowledge")
 
     def delete_project_collection(self, project_id: str) -> None:
-        try:
-            self._client.delete_collection(f"project_{project_id}")
-        except Exception as e:
-            logger.warning(f"[memory] 删除 Collection project_{project_id} 失败: {e}")
+        with self._lock:
+            try:
+                self._client.delete_collection(f"project_{project_id}")
+            except Exception as e:
+                logger.warning(f"[memory] 删除 Collection project_{project_id} 失败: {e}")
 
     # ── 写入 ───────────────────────────────────────────────────────
 
@@ -191,10 +197,11 @@ class RAGStore:
         meta = _clean_metadata({"kind": "experiment", **(metadata or {})})
         col = self.project_collection(project_id)
         doc_id = str(meta.get("source_exp", "")) or f"exp_{len(text)}"
-        try:
-            col.add(ids=[doc_id], documents=[text], metadatas=[meta])
-        except Exception as e:
-            logger.warning(f"[memory] ChromaDB 写入实验段落失败: {e}")
+        with self._lock:
+            try:
+                col.add(ids=[doc_id], documents=[text], metadatas=[meta])
+            except Exception as e:
+                logger.warning(f"[memory] ChromaDB 写入实验段落失败: {e}")
 
     def save_workflow(self, project_id: str, text: str,
                       metadata: Optional[Dict[str, Any]] = None) -> None:
@@ -204,10 +211,11 @@ class RAGStore:
         meta = _clean_metadata({"kind": "workflow", **(metadata or {})})
         col = self.project_collection(project_id)
         doc_id = str(meta.get("source_workflow", "")) or f"wf_{len(text)}"
-        try:
-            col.add(ids=[doc_id], documents=[text], metadatas=[meta])
-        except Exception as e:
-            logger.warning(f"[memory] ChromaDB 写入工作流段落失败: {e}")
+        with self._lock:
+            try:
+                col.add(ids=[doc_id], documents=[text], metadatas=[meta])
+            except Exception as e:
+                logger.warning(f"[memory] ChromaDB 写入工作流段落失败: {e}")
 
     def save_knowledge(self, items: List[Dict[str, Any]]) -> None:
         """按 id 增量播种领域知识（技术方案 8.4a）。
@@ -217,33 +225,34 @@ class RAGStore:
         内容漂移），只补缺失的。
         """
         col = self.global_collection()
-        try:
-            existing = set(col.get(include=[]).get("ids", []))
-        except Exception as e:
-            logger.warning(f"[memory] 读取已有领域知识 id 失败（按空处理）: {e}")
-            existing = set()
-
-        ids, docs, metas = [], [], []
-        for item in items:
-            kid = item.get("id", "")
-            if not kid or kid in existing:
-                continue
-            ids.append(kid)
-            docs.append(item.get("content", ""))
-            metas.append(_clean_metadata({
-                "topic": item.get("topic", ""),
-                "tags": ",".join(item.get("tags", [])),
-                "kid": kid,
-                # domain 是标量字段，可直接用于 metadata where 过滤
-                # （tags 存成逗号拼接串，$in 对它做不了包含匹配）
-                "domain": item.get("domain", ""),
-                "kind": "knowledge",
-            }))
-        if ids:
+        with self._lock:
             try:
-                col.add(ids=ids, documents=docs, metadatas=metas)
+                existing = set(col.get(include=[]).get("ids", []))
             except Exception as e:
-                logger.warning(f"[memory] 领域知识播种失败: {e}")
+                logger.warning(f"[memory] 读取已有领域知识 id 失败（按空处理）: {e}")
+                existing = set()
+
+            ids, docs, metas = [], [], []
+            for item in items:
+                kid = item.get("id", "")
+                if not kid or kid in existing:
+                    continue
+                ids.append(kid)
+                docs.append(item.get("content", ""))
+                metas.append(_clean_metadata({
+                    "topic": item.get("topic", ""),
+                    "tags": ",".join(item.get("tags", [])),
+                    "kid": kid,
+                    # domain 是标量字段，可直接用于 metadata where 过滤
+                    # （tags 存成逗号拼接串，$in 对它做不了包含匹配）
+                    "domain": item.get("domain", ""),
+                    "kind": "knowledge",
+                }))
+            if ids:
+                try:
+                    col.add(ids=ids, documents=docs, metadatas=metas)
+                except Exception as e:
+                    logger.warning(f"[memory] 领域知识播种失败: {e}")
 
     # ── 检索 ───────────────────────────────────────────────────────
 
@@ -254,30 +263,31 @@ class RAGStore:
         `where` 语法在不同 ChromaDB 版本上有差异，过滤查询异常时自动退回无过滤查询
         （与现有「检索失败返回空列表」的容错风格一致，但不因过滤语法把结果清空）。
         """
-        try:
-            total = col.count()
-            if total == 0:
+        with self._lock:
+            try:
+                total = col.count()
+                if total == 0:
+                    return []
+                res = self._query(col, query, min(n, total), where)
+                if res is None and where:
+                    logger.warning("[memory] metadata 过滤查询失败，退回无过滤查询")
+                    res = self._query(col, query, min(n, total), None)
+                if res is None:
+                    return []
+            except Exception as e:
+                logger.warning(f"[memory] 向量检索失败: {e}")
                 return []
-            res = self._query(col, query, min(n, total), where)
-            if res is None and where:
-                logger.warning("[memory] metadata 过滤查询失败，退回无过滤查询")
-                res = self._query(col, query, min(n, total), None)
-            if res is None:
-                return []
-        except Exception as e:
-            logger.warning(f"[memory] 向量检索失败: {e}")
-            return []
-        items = []
-        docs = (res.get("documents") or [[]])[0]
-        metas = (res.get("metadatas") or [[]])[0]
-        dists = (res.get("distances") or [[]])[0]
-        for i, doc in enumerate(docs):
-            items.append({
-                "text": doc,
-                "metadata": metas[i] if i < len(metas) else {},
-                "distance": dists[i] if i < len(dists) else None,
-            })
-        return items
+            items = []
+            docs = (res.get("documents") or [[]])[0]
+            metas = (res.get("metadatas") or [[]])[0]
+            dists = (res.get("distances") or [[]])[0]
+            for i, doc in enumerate(docs):
+                items.append({
+                    "text": doc,
+                    "metadata": metas[i] if i < len(metas) else {},
+                    "distance": dists[i] if i < len(dists) else None,
+                })
+            return items
 
     def _query(self, col, query: str, n: int, where: Optional[Dict[str, Any]]):
         """执行一次 query；失败返回 None 由调用方决定是否退回无过滤。"""
@@ -306,18 +316,20 @@ class RAGStore:
     # ── 删除 ───────────────────────────────────────────────────────
 
     def delete_by_conv(self, project_id: str, conv_id: str) -> None:
-        try:
-            col = self.project_collection(project_id)
-            got = col.get(where={"source_conv": conv_id})
-            ids = got.get("ids", [])
-            if ids:
-                col.delete(ids=ids)
-        except Exception as e:
-            logger.warning(f"[memory] 删除对话记忆失败: {e}")
+        with self._lock:
+            try:
+                col = self.project_collection(project_id)
+                got = col.get(where={"source_conv": conv_id})
+                ids = got.get("ids", [])
+                if ids:
+                    col.delete(ids=ids)
+            except Exception as e:
+                logger.warning(f"[memory] 删除对话记忆失败: {e}")
 
     def count(self, project_id: str = "", knowledge: bool = False) -> int:
-        try:
-            col = self.global_collection() if knowledge else self.project_collection(project_id)
-            return col.count()
-        except Exception:
-            return 0
+        with self._lock:
+            try:
+                col = self.global_collection() if knowledge else self.project_collection(project_id)
+                return col.count()
+            except Exception:
+                return 0

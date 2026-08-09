@@ -193,7 +193,8 @@ class _FakeAssistant:
             return "API调用失败: 没有更多预设响应"
         return self.responses.pop(0) if len(self.responses) > 1 else self.responses[0]
 
-    def ask_stream(self, question, on_token, context=None, prior_messages=None):
+    def ask_stream(self, question, on_token, context=None, prior_messages=None,
+                   on_thinking=None):
         self.ask_calls += 1
         text = "这是一次纯对话回答。"
         if on_token:
@@ -606,7 +607,7 @@ def test_auto_tuning_rounds():
         _assert(all(c["defer_cleanup"] for c in rf.calls), "各轮都延迟清理中间产物")
         bubble = env.bubble()
         _assert("采用第 3 轮" in bubble, "取误差最小的第 3 轮")
-        _assert("[规则] R7" in bubble, "气泡标注触发的规则编号")
+        _assert("已达上限" in bubble, "气泡说明调优已达上限（升级点 10：不带 [规则] 编号）")
         records = env.memory.experiment_log("p1").all()
         _assert(records[0]["tuning_trace"] and len(records[0]["tuning_trace"]) == 3,
                 "实验记录保留完整调优轨迹")

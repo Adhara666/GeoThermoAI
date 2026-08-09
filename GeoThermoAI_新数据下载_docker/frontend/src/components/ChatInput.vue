@@ -47,10 +47,11 @@ async function submit() {
         <textarea
           v-model="input"
           rows="1"
-          :placeholder="chat.streaming ? '回复生成中…' : '输入指令…（Enter 发送，Shift+Enter 换行）'"
+          :placeholder="chat.streaming ? '回复生成中…' : (chat.chatMode === 'chat' ? 'Chat 模式：只读对话，仅回答问题' : '输入指令…（Enter 发送，Shift+Enter 换行）')"
           @keydown="onKeydown"
         ></textarea>
-        <ExecModeSelect />
+        <!-- 升级点 17：只有 Work 模式显示执行模式（由我批准/完全执行） -->
+        <ExecModeSelect v-if="chat.chatMode === 'work'" />
         <button class="chat-send" :disabled="chat.streaming || !project.currentConv" @click="submit" title="发送">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <line x1="22" y1="2" x2="11" y2="13" />

@@ -82,7 +82,17 @@ class RoleHooks(StageHooks):
     def rank_pairs(self, pairs: List[dict], ctx: Any) -> Optional[List[dict]]:
         if self.data_agent is None:
             return None
-        ranked = self.data_agent.rank(pairs)
+        # 升级点 1/12：读取本项目历史已尝试过的影像对，供排序排除
+        used: set = set()
+        try:
+            mm = getattr(ctx, "memory_manager", None)
+            pid = getattr(ctx, "project_id", "")
+            if mm is not None and pid:
+                used = mm.load_used_pairs(pid)
+        except Exception:
+            used = set()
+        self.used_pairs = used
+        ranked = self.data_agent.rank(pairs, used_pairs=used)
         self.ranked_pairs = ranked
         try:
             ctx.exp_state["pair_candidates"] = self.data_agent.pair_candidates_digest(ranked)
@@ -94,13 +104,18 @@ class RoleHooks(StageHooks):
         """完全执行模式自动选最高分；由我批准模式交回配对卡片让用户决定。"""
         if self.data_agent is None or not is_auto(self.exec_mode):
             return None
-        chosen = self.data_agent.choose(pairs)
+        chosen = self.data_agent.choose(pairs, used_pairs=getattr(self, "used_pairs", set()))
         if chosen is None:
             return None
         index = next((i + 1 for i, p in enumerate(pairs)
                       if p.get("quality_score") == chosen.get("quality_score")), 1)
         ctx.emit(self.data_agent.auto_select_note(chosen, index) + "\n")
         return chosen
+
+    def _all_pairs_tried(self) -> bool:
+        """当前候选是否全部已尝试过（升级点 12：此时不再提示换影像对）。"""
+        ranked = self.ranked_pairs or []
+        return bool(ranked) and all(bool(p.get("tried")) for p in ranked)
 
     def on_no_pair(self, detail: dict, ctx: Any) -> Optional[StepDecision]:
         """搜不到合格配对：两种模式都不许硬跑（技术方案 5.2）。"""
@@ -195,7 +210,9 @@ class RoleHooks(StageHooks):
         if reflection.suggestions:
             lines.append("建议：" + "；".join(reflection.suggestions[:3]))
         if reflection.rule_hits:
-            lines.append(presentation.rule_note("/".join(reflection.rule_hits), "判定不合格"))
+            # 升级点 10：不向前端展示「[规则] D7 判定不合格」类字眼，
+            # 用自然语言说明判定结论即可（规则编号仅供日志追溯）
+            lines.append("已按数据质量检查判定本批数据不合格，请选择下一步")
         return "\n".join(lines)
 
     @staticmethod
@@ -215,7 +232,8 @@ class RoleHooks(StageHooks):
     def _approval_branch(self, node: str, summary: str, ctx: Any) -> StepDecision:
         builder = (approval_proto.build_no_pair if node == Node.NO_PAIR
                    else approval_proto.build_data_quality)
-        payload = builder(summary)
+        # 升级点 12：全部影像对都已尝试过时，不再提供"重新选择影像组合"选项
+        payload = builder(summary, exclude_reselect=self._all_pairs_tried())
         choice = self._ask(payload)
         if choice is None:
             return StepDecision.pause(payload, reason="等待用户在数据阶段做出选择")

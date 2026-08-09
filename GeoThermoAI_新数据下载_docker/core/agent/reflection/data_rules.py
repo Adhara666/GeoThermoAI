@@ -8,6 +8,7 @@ LLM 只负责把失败原因翻译成人话并给出建议排序，不参与放�
 各探针（栅格 / CSV / 元数据）都可注入，便于合成测试零依赖运行。
 """
 
+import glob
 import json
 import logging
 import os
@@ -103,12 +104,22 @@ def default_csv_probe(path: str) -> Dict[str, Any]:
 
 
 def default_meta_probe(path: str) -> Dict[str, Any]:
-    """默认元数据探针：读 30m 网格的 height/width，以及（若存在）直接给出的 valid_ratio。"""
+    """默认元数据探针：读 30m 网格的 height/width，以及有效像元占比。
+
+    占比口径统一：优先读研究区多边形口径（region_pixels>0 时的 region_valid_ratio），
+    未提供研究区时回退 bbox 全网格口径（valid_ratio）。
+    """
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
+        region_pixels = _as_int(data.get("region_pixels"))
+        region_ratio = data.get("region_valid_ratio")
+        if region_pixels > 0 and isinstance(region_ratio, (int, float)):
+            valid_ratio = region_ratio
+        else:
+            valid_ratio = data.get("valid_ratio")
         return {"height": int(data.get("height") or 0), "width": int(data.get("width") or 0),
-                "valid_ratio": data.get("valid_ratio")}
+                "valid_ratio": valid_ratio}
     except Exception:
         return {"height": 0, "width": 0, "valid_ratio": None}
 
@@ -118,10 +129,23 @@ def default_meta_probe(path: str) -> Dict[str, Any]:
 def _check_d1(raw_dir: str, probe: Callable[[str], Tuple[bool, str]]) -> List[str]:
     problems = []
     for name in REQUIRED_RASTERS:
-        ok, reason = probe(os.path.join(raw_dir, name) if raw_dir else name)
+        if raw_dir:
+            # 按文件名前缀匹配实际栅格：兼容固定名 `landsat_lst.tif`
+            # 与带日期后缀 `landsat_lst_20240722.tif` 两种命名
+            matches = sorted(glob.glob(os.path.join(raw_dir, f"{_stem(name)}*.tif")))
+            if not matches:
+                problems.append(f"{_raster_label(name)}：文件不存在")
+                continue
+            ok, reason = probe(matches[0])
+        else:
+            ok, reason = probe(name)
         if not ok:
             problems.append(f"{_raster_label(name)}：{reason}")
     return problems
+
+
+def _stem(name: str) -> str:
+    return name[:-4] if name.endswith(".tif") else name
 
 
 _RASTER_LABELS = {

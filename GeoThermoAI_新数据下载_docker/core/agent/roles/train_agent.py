@@ -39,9 +39,10 @@ class TrainAgent(RoleAgent):
     role_name = "训练"
 
     def __init__(self, assistant, registry, memory_manager=None, project_id: str = "",
-                 on_log=None, max_rounds: Optional[int] = None):
+                 on_log=None, max_rounds: Optional[int] = None, on_thinking=None):
         super().__init__(assistant, memory_manager=memory_manager,
-                         project_id=project_id, on_log=on_log)
+                         project_id=project_id, on_log=on_log,
+                         on_thinking=on_thinking)
         self.registry = registry
         self.max_rounds = train_rules.resolve_max_rounds(max_rounds)
 
@@ -91,10 +92,13 @@ class TrainAgent(RoleAgent):
             self.tuning_started = True
             return None
 
+        ranked = getattr(hooks, "ranked_pairs", None) or []
+        all_tried = bool(ranked) and all(bool(p.get("tried")) for p in ranked)
         payload = approval_proto.build_tuning_decision(
             summary=self._decision_summary(record),
             fields=self._manual_fields(),
             max_rounds=self.max_rounds,
+            exclude_reselect=all_tried,  # 升级点 12：全部已尝试时不再提示换对
         )
         choice = self._ask(hooks, payload)
         if choice is None:
@@ -141,14 +145,8 @@ class TrainAgent(RoleAgent):
             "max_rounds": self.max_rounds,
         })
         if final["note"]:
-            from .. import presentation
-
-            if final["rule_hits"]:
-                ctx.emit(presentation.rule_note("/".join(final["rule_hits"]),
-                                               final["note"]) + "\n")
-            else:
-                # 没有命中规则但改变了动作（例如拿不到调优方向）也要说清原因
-                ctx.emit(final["note"] + "\n")
+            # 升级点 10：不向前端展示「[规则] R7 …」类字眼，直接用自然语言说明调优结论
+            ctx.emit(final["note"] + "\n")
         record["decision"] = final["action"]
         record["rule_hits"] = final["rule_hits"]
 

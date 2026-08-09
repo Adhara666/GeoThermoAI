@@ -27,7 +27,9 @@
     "chunk_size": 500000,
     "train_ratio": 0.6,
     "val_ratio": 0.2,
-    "test_ratio": 0.2
+    "test_ratio": 0.2,
+    "block_size_px": 30,
+    "step2_min_valid_samples": 750000
   },
   "data_space": {},
   "agent": {

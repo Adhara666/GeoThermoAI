@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onMounted } from 'vue'
+import { computed, onMounted, watch } from 'vue'
 import { useChatStore } from '../../stores/chat'
 import { useProjectStore } from '../../stores/project'
 
@@ -16,6 +16,7 @@ const steps = computed(() => {
     { id: 'tcr_compute', label: 'TCR 计算', status: 'pending' },
     { id: 'lst_export', label: 'LST 导出', status: 'pending' },
     { id: 'accuracy_eval', label: '精度评估', status: 'pending' },
+    { id: 'postprocess', label: '结果后处理（可选）', status: 'pending' },
   ]
 })
 
@@ -26,20 +27,27 @@ const ICON_META = {
   failed: { path: '<circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/>', color: '#dc2626' },
   // 上游失败导致本步骤未执行（A-08）：与"失败"区分显示，明确不是"失败后仍继续完成"
   skipped_upstream: { path: '<circle cx="12" cy="12" r="10"/><line x1="8" y1="12" x2="16" y2="12"/>', color: '#9ca3af' },
+  // 可选步骤未执行（结果后处理）：灰色空心圆，明确是"用户未选择执行"
+  skipped: { path: '<circle cx="12" cy="12" r="10"/>', color: '#9ca3af' },
   pending: { path: '<circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>', color: '#9ca3af' },
 }
 
 const STATUS_LABELS = {
   completed: '完成', running: '进行中', failed: '失败',
-  skipped_upstream: '未执行（上游失败）', pending: '等待',
+  skipped_upstream: '未执行（上游失败）', skipped: '未执行（可选）', pending: '等待',
 }
 const STATUS_TAG_CLASS = {
   completed: 'success', running: '', failed: 'danger',
-  skipped_upstream: 'muted', pending: 'muted',
+  skipped_upstream: 'muted', skipped: 'muted', pending: 'muted',
 }
 
 onMounted(() => {
   if (project.currentConv) chat.refreshWorkflow(project.currentConv)
+})
+
+// 升级点 7：切换对话/项目时工作面板进度与当前对话保持一致
+watch(() => project.currentConv, (cid) => {
+  if (cid) chat.refreshWorkflow(cid)
 })
 </script>
 

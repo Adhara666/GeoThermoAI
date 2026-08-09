@@ -33,6 +33,7 @@ STAGE_LABELS: Dict[str, str] = {
     "tcr_compute": "热约束残差计算",
     "lst_export": "地表温度产品导出",
     "accuracy_eval": "闭合精度校核",
+    "lst_gapfill": "结果后处理（空洞填补）",
     "ai_assistant": "智能分析",
 }
 
@@ -45,6 +46,7 @@ WORKFLOW_LABELS: Dict[str, str] = {
     "tcr_compute": "TCR 计算",
     "lst_export": "LST 导出",
     "accuracy_eval": "精度评估",
+    "postprocess": "结果后处理（可选）",
 }
 
 # 平移期（P0–P5）沿用的旧阶段说明，与改造前 `geo_thermo_agent._STEP_DESCRIPTIONS`
@@ -67,6 +69,7 @@ STAGE_DESCRIPTIONS: Dict[str, str] = {
     "tcr_compute": "计算热约束残差，修正跨尺度系统性偏差",
     "lst_export": "计算最终十米地表温度并导出栅格产品",
     "accuracy_eval": "粗尺度均值闭合校核",
+    "lst_gapfill": "填补十米地表温度产品中云像元造成的空洞",
     "ai_assistant": "根据当前结果做智能分析",
 }
 

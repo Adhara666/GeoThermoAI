@@ -27,6 +27,9 @@ _FALLBACK_TASK_KEYWORDS = ("处理", "训练", "下载", "执行", "运行", "�
 # 明确要求全流程的关键词（沿用现有安全网判据）
 _FULL_WORKFLOW_KEYWORDS = ("全流程", "一键", "跑完全流程", "执行全流程")
 
+# 结果后处理关键词（无空洞/填洞等：只对已有结果做后处理，不重跑生产流程）
+_POSTPROCESS_KEYWORDS = ("无空洞", "填洞", "空洞填补", "结果后处理", "去除空洞", "去掉空洞")
+
 
 class PlannerContext:
     """规划 Agent 的输入上下文（技术方案 4.2，必须全给）。"""
@@ -81,9 +84,10 @@ class PlannerAgent(RoleAgent):
     role_name = "规划"
 
     def __init__(self, assistant, registry, memory_manager=None, project_id: str = "",
-                 on_log=None, replan_max: int = REPLAN_MAX):
+                 on_log=None, replan_max: int = REPLAN_MAX, on_thinking=None):
         super().__init__(assistant, memory_manager=memory_manager,
-                         project_id=project_id, on_log=on_log)
+                         project_id=project_id, on_log=on_log,
+                         on_thinking=on_thinking)
         self.registry = registry
         self.replan_max = replan_max
 
@@ -121,7 +125,9 @@ class PlannerAgent(RoleAgent):
                 "product": _as_text(raw_slots.get("product")) or "lst_10m",
                 "model": _as_text(raw_slots.get("model")),
             },
-            "missing": [str(x) for x in (parsed.get("missing") or [])],
+            # model 有默认值（项目偏好 → rf），缺失不是阻塞项：从 missing 中剔除，
+            # 防止轻反思复查阶段把"没提模型"当成必须反问的缺失项
+            "missing": [str(x) for x in (parsed.get("missing") or []) if str(x) != "model"],
             "question": _as_text(parsed.get("question")),
             "source": "llm",
         }
@@ -130,6 +136,18 @@ class PlannerAgent(RoleAgent):
         """LLM 不可用时的关键词兜底路由。"""
         text = ctx.user_input
         pending = str(ctx.session_state.get("pending_question") or "")
+        if any(kw in text for kw in _POSTPROCESS_KEYWORDS):
+            self.log("意图分类退回关键词兜底：intent=postprocess")
+            return {
+                "intent": "postprocess",
+                "intent_confidence": 0.6,
+                "reason": "用户要求对已有结果做后处理（关键词兜底判定）",
+                "slots": {"region_name": "", "time_expression": text,
+                          "product": "lst_10m", "model": ""},
+                "missing": [],
+                "question": "",
+                "source": "keyword",
+            }
         is_task = any(kw in text for kw in _FALLBACK_TASK_KEYWORDS) or bool(pending)
         self.log(f"意图分类退回关键词兜底：intent={'task' if is_task else 'chat'}")
         return {
@@ -290,6 +308,23 @@ class PlannerAgent(RoleAgent):
         }, registry=self.registry)
         return plan
 
+    def build_postprocess_plan(self, ctx: PlannerContext, intent: str) -> Dict[str, Any]:
+        """后处理计划：只对已有 10m LST 结果做空洞填补，不重跑生产流程。
+
+        region/time_range 留空（不需要新输入）；lst_gapfill 的输入路径由执行引擎
+        从项目结果目录自动定位（executor 对 lst_gapfill 做动态查找）。
+        """
+        return plan_schema.parse({
+            "intent": intent,
+            "goal": "对已有十米地表温度产品做空洞填补，生成无空洞产品",
+            "region": {"name": "", "study_area_file": ""},
+            "time_range": {"start": "", "end": ""},
+            "constraints": self._constraints(ctx, {}),
+            "steps": [{"skill": "lst_gapfill", "params": {},
+                       "reason": "对已有 10m LST 结果做空洞填补"}],
+            "memory_refs": [],
+        }, registry=self.registry)
+
     def _plan_request_text(self, ctx: PlannerContext, region: Dict[str, str],
                            time_value: List[str]) -> str:
         return (f"请为「{region.get('name', '')}」在 "
@@ -409,15 +444,50 @@ class PlannerAgent(RoleAgent):
             return PlannerOutcome(PlannerOutcome.ASK, question=question, intent=intent,
                                   slots=merged, note=classified.get("reason", ""))
 
+        if intent == "postprocess":
+            # 结果后处理：对已有 10m LST 结果做空洞填补，不需要新研究区/时间，
+            # 直接出单步 plan（只 lst_gapfill，不重跑生产流程）。
+            if not self._thinking_acc:
+                self._push_thinking(
+                    "用户要求对已有的地表温度结果做后处理（无空洞），"
+                    "不需要重新下载数据或训练模型，只对已导出的 10m 产品做空洞填补即可。"
+                )
+            plan = self.build_postprocess_plan(ctx, intent)
+            reflection = self.reflect(ctx, plan, classified)
+            plan = reflection.data.get("plan") or plan
+            if reflection.action == Action.CHAT_ONLY:
+                return PlannerOutcome(PlannerOutcome.CHAT, intent="qa", slots=merged,
+                                      note=reflection.note, reflection=reflection)
+            if reflection.action == Action.ASK:
+                return PlannerOutcome(PlannerOutcome.ASK, question=reflection.question,
+                                      intent=intent, slots=merged, note=reflection.note,
+                                      reflection=reflection)
+            return PlannerOutcome(PlannerOutcome.PLAN, plan=plan, intent=intent,
+                                  slots=merged, note=reflection.note,
+                                  reflection=reflection)
+
         region = self.resolve_region(ctx, merged)
         if region.get("question"):
+            if not self._thinking_acc:
+                self._push_thinking(
+                    "还没确定用户要处理的研究区，需要先向用户确认具体位置，"
+                    "才能继续检索影像并制定执行计划。"
+                )
             return PlannerOutcome(PlannerOutcome.ASK, question=region["question"],
                                   intent=intent, slots=merged, note="研究区未确定")
 
         time_slot = merged.get("time_range") or {}
         if not slot_utils.is_executable(str(time_slot.get("precision") or "")):
+            # 反问时间前补一段简短思考说明（升级点 15/16）：意图分类若走
+            # 关键词兜底没有 LLM 思考，这里也让反问消息有思考块与用时可展示
+            if not self._thinking_acc:
+                region_name = str(region.get("name") or "") or "该研究区"
+                self._push_thinking(
+                    f"用户想生成{region_name}的地表温度产品，但还没说明影像的"
+                    "时间范围，需要先反问确认具体月份，才能制定完整执行计划。"
+                )
             return PlannerOutcome(PlannerOutcome.ASK,
-                                  question=self._ask_time(time_slot),
+                                  question=self._ask_time(time_slot, region),
                                   intent=intent, slots=merged, note="时间范围未确定")
 
         plan = self.build_plan(ctx, intent, merged, region)
@@ -466,12 +536,13 @@ class PlannerAgent(RoleAgent):
                               reflection=reflection)
 
     @staticmethod
-    def _ask_time(time_slot: Dict[str, Any]) -> str:
+    def _ask_time(time_slot: Dict[str, Any], region: Optional[Dict[str, Any]] = None) -> str:
         """反问时间范围（实现期修订 v1.2：年份先做合理性校验，不合理时不能原样复述）。
 
         例如用户说「125年」，不能直接问「125 年范围比较大，请确认具体月份」——
         那是在不加甄别地复述一个明显异常的输入，得先指出年份本身有问题。
         """
+        region_name = str((region or {}).get("name") or "").strip() or "该研究区"
         year = time_slot.get("year")
         month = time_slot.get("month")
         raw = str(time_slot.get("raw") or "").strip()
@@ -481,10 +552,11 @@ class PlannerAgent(RoleAgent):
                     f"{slot_utils.MIN_DATA_YEAR} 年前后才开始覆盖），你是想说哪一年？"
                     f"请确认具体年份和月份，例如 2025 年 7 月。")
         if year and not month:
-            return f"{year} 年范围比较大，请确认具体月份，例如 {year} 年 7 月。"
+            return f"{region_name}可以，不过 {year} 年范围比较大，请再确认具体到哪个月份，例如 {year} 年 7 月。"
         if month and not year:
-            return f"要处理哪一年的 {month} 月？例如 2025 年 {month} 月。"
-        return "要生成哪个时间段的产品？请给到月份，例如 2025 年 7 月。"
+            return f"要处理的是哪一年的 {month} 月？例如 2025 年 {month} 月。"
+        return (f"好的，生成 {region_name} 的地表温度产品前，我还差一个信息："
+                f"你想要哪个时间段（具体到月份）？例如 2025 年 7 月。")
 
     # ── 内部工具 ──────────────────────────────────────────────────
 

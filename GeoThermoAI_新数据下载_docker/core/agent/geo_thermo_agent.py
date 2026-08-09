@@ -56,7 +56,7 @@ class GeoThermoAgent:
 
     # ── 公开接口 ─────────────────────────────────────────────────────
 
-    def process_command(self, user_input: str, on_token=None, on_log=None, pause_callback=None, project_dir: str = "", workflow_callback=None, settings_path: str = "", study_areas_dir: str = "", conv_id: str = "", project_id: str = "", memory_manager=None, exec_mode: str = "", prior_messages=None, session_state=None) -> str:
+    def process_command(self, user_input: str, on_token=None, on_log=None, pause_callback=None, project_dir: str = "", workflow_callback=None, settings_path: str = "", study_areas_dir: str = "", conv_id: str = "", project_id: str = "", memory_manager=None, exec_mode: str = "", prior_messages=None, session_state=None, on_thinking=None) -> str:
         """处理用户自然语言指令
 
         流程：
@@ -67,6 +67,7 @@ class GeoThermoAgent:
         5. 解析并执行计划（收尾自动写入实验记录）
 
         on_token: 可选回调，用于流式输出执行进度（气泡：阶段开始/完成摘要/最终结果）
+        on_thinking: 可选回调，透传 LLM 思考过程（reasoning_content，升级点 15）
         on_log:   可选回调，用于输出过程日志（日志页：进度百分比/INFO/WARN/详细过程）
         pause_callback: 可选回调，当 Agent 需要用户输入时调用，
                         返回 {"paused": True, "data": {...}} 表示暂停，
@@ -92,7 +93,7 @@ class GeoThermoAgent:
                 study_areas_dir=study_areas_dir, conv_id=conv_id,
                 project_id=project_id, memory_manager=memory_manager,
                 exec_mode=exec_mode, prior_messages=prior_messages,
-                session_state=session_state,
+                session_state=session_state, on_thinking=on_thinking,
             )
 
         # 全局流式缓冲：process_command 与 _execute_plan 共用，
@@ -136,7 +137,8 @@ class GeoThermoAgent:
                     context["memory"] = memory_manager.enrich_prompt(project_id, user_input)
                 except Exception:
                     pass
-            return self.assistant.ask_stream(user_input, on_token, context=context)
+            return self.assistant.ask_stream(user_input, on_token, context=context,
+                                             on_thinking=on_thinking)
 
         # 1. 获取当前软件状态
         context = self._get_context(settings_path=settings_path, study_areas_dir=study_areas_dir)
@@ -160,7 +162,7 @@ class GeoThermoAgent:
         response = self.assistant._call_api([
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_input},
-        ], temperature=0.1, max_tokens=4096)
+        ], temperature=0.1, max_tokens=4096, on_thinking=on_thinking)
 
         # 5. 解析并执行计划（解析失败时用更严格的提示重试一次）
         plan = self._parse_plan(response)
@@ -171,7 +173,7 @@ class GeoThermoAgent:
             response = self.assistant._call_api([
                 {"role": "system", "content": system_prompt + "\n\n## 强制要求\n只输出一个JSON对象，不要任何解释文字、标题或代码块标记。"},
                 {"role": "user", "content": user_input},
-            ], temperature=0.0, max_tokens=4096)
+            ], temperature=0.0, max_tokens=4096, on_thinking=on_thinking)
             plan = self._parse_plan(response)
         if plan is None:
             # 全流程指令最终兜底：用内置完整计划，保证流程可继续执行
@@ -235,7 +237,7 @@ class GeoThermoAgent:
                                    study_areas_dir: str = "", conv_id: str = "",
                                    project_id: str = "", memory_manager=None,
                                    exec_mode: str = "", prior_messages=None,
-                                   session_state=None) -> str:
+                                   session_state=None, on_thinking=None) -> str:
         """多角色路径（薄委托）：规划 Agent 出 plan，总调度按 plan 依次调用执行 Agent。
 
         实现在 `core/agent/orchestrator/role_flow.py`；与旧路径互不影响，
@@ -250,6 +252,7 @@ class GeoThermoAgent:
             study_areas_dir=study_areas_dir, conv_id=conv_id, project_id=project_id,
             memory_manager=memory_manager, exec_mode=exec_mode,
             prior_messages=prior_messages, session_state=session_state,
+            on_thinking=on_thinking,
         )
 
     def _resolved_study_areas_dir(self, study_areas_dir: str = "") -> str:
@@ -384,6 +387,14 @@ class GeoThermoAgent:
         uploaded = list(_study_areas_dir.glob("*.geojson")) if _study_areas_dir.exists() else []
         if not uploaded:
             return None
+        # 用户手动指定了当前研究区（研究区面板「切换」写入 .current.txt 标记）→ 优先使用
+        _mark = _study_areas_dir / ".current.txt"
+        if _mark.exists():
+            _cur = _mark.read_text(encoding="utf-8").strip()
+            if _cur:
+                _p = _study_areas_dir / _cur
+                if _p.is_file():
+                    return str(_p.resolve())
         if preferred_name:
             matched = match_study_area(uploaded, preferred_name)
             if matched is not None:
@@ -546,32 +557,17 @@ class GeoThermoAgent:
 
             # TCR/LST 输出路径（使用 rf_model 的实际 output_dir）
             if skill == "tcr_compute" and "output_path" in params:
-                params["output_path"] = rf_output_dir + "/tcr_result.csv"
+                params["output_path"] = self._find_latest(rf_output_dir, "tcr_result_*.csv",
+                                                          rf_output_dir + "/tcr_result.csv")
             if skill == "lst_export":
                 if "input_csv" in params:
-                    # 搜索实际的 tcr_result.csv
-                    _tcr_path = rf_output_dir + "/tcr_result.csv"
-                    if not os.path.isfile(_tcr_path):
-                        _output_root = os.path.join(os.path.dirname(__file__), "..", "..", "output")
-                        _tcr_files = sorted(
-                            glob.glob(os.path.join(os.path.normpath(_output_root), "**/tcr_result.csv"), recursive=True),
-                            key=lambda p: os.path.getmtime(p), reverse=True
-                        )
-                        if _tcr_files:
-                            _tcr_path = _tcr_files[0]
-                    params["input_csv"] = _tcr_path
+                    # 搜索实际的 tcr_result（文件名带日期，升级点 4）
+                    params["input_csv"] = self._find_latest(rf_output_dir, "tcr_result_*.csv",
+                                                            rf_output_dir + "/tcr_result.csv")
             # accuracy_eval 的 predict_csv 指向 TCR 输出
             if skill == "accuracy_eval" and "predict_csv" in params:
-                _tcr_path = rf_output_dir + "/tcr_result.csv"
-                if not os.path.isfile(_tcr_path):
-                    _output_root = os.path.join(os.path.dirname(__file__), "..", "..", "output")
-                    _tcr_files = sorted(
-                        glob.glob(os.path.join(os.path.normpath(_output_root), "**/tcr_result.csv"), recursive=True),
-                        key=lambda p: os.path.getmtime(p), reverse=True
-                    )
-                    if _tcr_files:
-                        _tcr_path = _tcr_files[0]
-                params["predict_csv"] = _tcr_path
+                params["predict_csv"] = self._find_latest(rf_output_dir, "tcr_result_*.csv",
+                                                          rf_output_dir + "/tcr_result.csv")
 
             # 兜底：如果关键 CSV 参数仍为空，搜索 output 目录
             _csv_search = {
@@ -608,6 +604,23 @@ class GeoThermoAgent:
                 if step.get("skill") == "data_acquisition":
                     step["params"]["region"] = study_area_file
                     break
+
+    def _find_latest(self, directory: str, pattern: str, fallback: str) -> str:
+        """在指定目录及全局 output 下找最新匹配文件（升级点 4：文件名带日期）。
+
+        先精确目录，再兜底搜索 output 根；均未命中回退固定名。
+        """
+        import glob
+        candidates = []
+        if directory:
+            candidates += glob.glob(os.path.join(directory, pattern))
+        _output_root = os.path.join(os.path.dirname(__file__), "..", "..", "output")
+        candidates += glob.glob(os.path.join(os.path.normpath(_output_root), "**", pattern),
+                                recursive=True)
+        if candidates:
+            unique = list({os.path.abspath(p) for p in candidates})
+            return max(unique, key=lambda p: os.path.getmtime(p)).replace("\\", "/")
+        return fallback
 
     # ── 执行引擎 ─────────────────────────────────────────────────────
 

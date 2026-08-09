@@ -230,8 +230,10 @@ def test_no_pair_never_hard_runs():
             "replan 请求带上「放宽云量」的针对性调整")
     options = [o["id"] for o in asked["payload"]["options"]]
     _assert(Option.RELAX_CLOUD in options and Option.WIDEN_TIME in options
-            and Option.CHANGE_SOURCE in options and Option.STOP in options,
-            "no_pair 节点给出放宽云量/扩大时间/换数据源/停止等选项")
+            and Option.STOP in options,
+            "no_pair 节点给出放宽云量/扩大时间/停止等选项")
+    _assert(Option.CHANGE_SOURCE not in options,
+            "提问时不出现「更换数据源」选项（升级点 11）")
 
     # 无 pause_callback（无法询问）→ 挂起，绝不硬跑
     hooks = RoleHooks(exec_mode=ExecMode.APPROVAL, run_state=RunState(replan_max=0),

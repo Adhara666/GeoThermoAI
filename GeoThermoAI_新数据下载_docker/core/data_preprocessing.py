@@ -34,6 +34,7 @@ from rasterio.enums import Resampling
 from rasterio.warp import calculate_default_transform, reproject
 
 from .atomic_io import write_verified
+from .geo_mask import rasterize_region as _rasterize_region
 
 # ── 物理常量 ──────────────────────────────────────────────────────────
 S2_SR_SCALE = 10000.0          # Sentinel-2地表反射率缩放因子 (DN / 10000)
@@ -397,9 +398,11 @@ def process_preprocessing(
     dem_path: str,
     output_dir: str,
     progress_callback=None,
+    step2_min_valid_samples: int = 750000,
+    study_area_geojson: str = "",
 ) -> Dict:
     """
-    数据预处理：生成30m训练特征CSV（step2）、完整30m约束层CSV 和 10m预测特征CSV。
+    数据预处理：生成30m训练特征CSV（采样）、完整30m约束层CSV 和 10m预测特征CSV。
 
     Args:
         landsat_path:   Landsat L2 ST_B10栅格路径
@@ -409,6 +412,11 @@ def process_preprocessing(
         dem_path:       DEM栅格路径（30m）
         output_dir:     输出目录
         progress_callback: 进度回调 callback(step_name, percent, message)
+        step2_min_valid_samples: joint_mask 有效像元达到该数量才做 step=2 等间隔抽样；
+                                 不足时自动降为 step=1（全像元），保住训练样本量。
+        study_area_geojson: 研究区 GeoJSON 路径（可选）。给定时，像元占比统计的
+                            分母改为「研究区多边形内」的像元数，而不是 bbox 外接
+                            矩形全网格；缺失或栅格化失败时自动回退 bbox 口径。
 
     Returns:
         dict: 包含输出文件路径和元数据
@@ -574,13 +582,25 @@ def process_preprocessing(
         # LST 全网格转开尔文（供 step2 抽样与完整约束层共用，只算一次）
         lst_k_full = lst * LST_SCALE + LST_OFFSET_K
 
-        # ==================================================================
-        #  步骤4: 生成30m训练CSV（step2采样，继续保留，不变）
-        # ==================================================================
-        if progress_callback:
-            progress_callback("preprocessing", 0.35, "生成30m训练特征CSV (step2采样)...")
+        # 研究区多边形掩膜（占比口径统一：分母用「研究区多边形内」像元数，可选；
+        # 缺失或栅格化失败时 region30=None，所有 region_* 统计回退为 0，口径回退 bbox）
+        region30 = _rasterize_region(study_area_geojson, landsat_path)
+        region_pixels30 = int(region30.sum()) if region30 is not None else 0
 
-        step = 2  # 步长（用户确认第2条：继续保留，不取消等间隔抽样）
+        # ==================================================================
+        #  步骤4: 生成30m训练CSV（采样）
+        #  有效样本充足（默认 ≥750,000）时 step=2 等间隔抽样，节省算力与存储；
+        #  不足时不采样（step=1 全像元直接进入划分），保住训练样本量。
+        # ==================================================================
+        valid_count = int(joint_mask.sum())
+        step = 2 if valid_count >= step2_min_valid_samples else 1
+        if progress_callback:
+            progress_callback(
+                "preprocessing", 0.35,
+                f"生成30m训练特征CSV (step={step}采样，有效像元 {valid_count:,} 个"
+                f"{'' if step == 1 else '，每4取1'})..."
+            )
+
         mask_ss = joint_mask[::step, ::step]
         rr, cc = np.nonzero(mask_ss)
         rows = rr.astype(np.int32) * step
@@ -639,7 +659,7 @@ def process_preprocessing(
         if progress_callback:
             progress_callback(
                 "preprocessing", 0.42,
-                f"30m训练数据(step2): {len(df_train):,} 行",
+                f"30m训练数据(step{step}): {len(df_train):,} 行",
             )
 
         # ==================================================================
@@ -676,6 +696,12 @@ def process_preprocessing(
 
         write_verified(_build_constraint, constraint_csv, _validate_constraint)
 
+        if region30 is not None:
+            region_valid30 = int(
+                region30[df_constraint["row"].values, df_constraint["col"].values].sum()
+            )
+        else:
+            region_valid30 = 0
         constraint_meta_dict = {
             "height": int(height_30m),
             "width": int(width_30m),
@@ -687,10 +713,16 @@ def process_preprocessing(
             "total_pixels": int(height_30m * width_30m),
             "valid_ratio": round(float(len(df_constraint)) / float(height_30m * width_30m), 6)
             if height_30m * width_30m > 0 else 0.0,
+            # 研究区口径（分母=研究区多边形内像元；region_pixels30=0 表示未提供研究区）
+            "region_pixels": region_pixels30,
+            "region_valid_pixels": region_valid30,
+            "region_valid_ratio": round(region_valid30 / region_pixels30, 6)
+            if region_pixels30 > 0 else 0.0,
             "description": (
                 "覆盖全部有效30m像元（joint_mask，即 Landsat QA + Sentinel SCL 4/5/6 + "
                 "热红外有效值），用于 TTRI 空间化插值网格 / TCR 聚合与回写 / 粗尺度闭合评价的"
-                "统一参考；与 30m_features_step2.csv（训练抽样）互为独立数据流（A-05）"
+                "统一参考；与 30m_features_step2.csv（训练抽样）互为独立数据流（A-05）。"
+                "region_* 字段为研究区多边形口径的占比统计"
             ),
             "output_csv": constraint_csv,
         }
@@ -724,6 +756,10 @@ def process_preprocessing(
         valid_pixels = 0
         scl_valid_pixels = 0
         black_zero_pixels = 0  # 仅诊断计数，不再用于剔除有效像元（见下方说明）
+        # 研究区多边形掩膜（10m 网格，对齐 S2 参考格网；占比分母按研究区内像元）
+        region10 = _rasterize_region(study_area_geojson, sentinel2_path)
+        region_pixels10 = int(region10.sum()) if region10 is not None else 0
+        region_valid_pixels = 0
 
         with rasterio.open(sentinel2_path) as s2_ds, rasterio.open(scl_10m_aligned) as scl_ds:
             profile = s2_ds.profile.copy()
@@ -775,6 +811,8 @@ def process_preprocessing(
                 valid_pixels += int(valid.sum())
                 scl_valid_pixels += int(scl_valid.sum())
                 black_zero_pixels += int((zero_outside & finite).sum())
+                if region10 is not None:
+                    region_valid_pixels += int((valid & region10[start:stop, :]).sum())
 
                 # 计算光谱指数
                 ndvi_arr = (n_arr - r_arr) / (n_arr + r_arr + EPS)
@@ -826,6 +864,11 @@ def process_preprocessing(
             "scl_valid_pixels": int(scl_valid_pixels),
             "black_zero_pixels_diagnostic_only": int(black_zero_pixels),
             "invalid_rule": "feature columns are NaN when SCL is not class 4/5/6 or any band is non-finite (nodata)",
+            # 研究区口径（分母=研究区多边形内像元；region_pixels=0 表示未提供研究区）
+            "region_pixels": region_pixels10,
+            "region_valid_pixels": int(region_valid_pixels),
+            "region_valid_ratio": round(region_valid_pixels / region_pixels10, 6)
+            if region_pixels10 > 0 else 0.0,
             "output_csv": predict_csv,
         }
 
@@ -858,6 +901,11 @@ def process_preprocessing(
             "constraint_rows": int(len(df_constraint)),
             "predict_total_pixels": int(height * width),
             "predict_valid_pixels": int(valid_pixels),
+            # 研究区口径统计（region_pixels10=0 表示未提供研究区，下游应回退 bbox 口径）
+            "region_pixels_10m": region_pixels10,
+            "region_valid_pixels_10m": int(region_valid_pixels),
+            "region_pixels_30m": region_pixels30,
+            "region_valid_pixels_30m": region_valid30,
             "elapsed_seconds": round(elapsed, 1),
         }
     finally:

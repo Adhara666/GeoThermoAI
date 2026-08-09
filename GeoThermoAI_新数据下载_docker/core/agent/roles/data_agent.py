@@ -87,13 +87,28 @@ def score_pair(pair: dict) -> Tuple[float, List[str]]:
     return round(score, 4), _reasons(cloud, coverage, dt, scenes)
 
 
-def rank_pairs(pairs: List[dict]) -> List[dict]:
+def pair_key(pair: dict) -> str:
+    """配对唯一标识：Landsat 日期_Sentinel 日期（YYYYMMDD_YYYYMMDD，升级点 1/12）。"""
+    if not isinstance(pair, dict):
+        return ""
+    l = str(pair.get("landsat_date") or "").replace("-", "")[:8]
+    s = str(pair.get("sentinel2_date") or "").replace("-", "")[:8]
+    return f"{l}_{s}" if (l and s) else ""
+
+
+def rank_pairs(pairs: List[dict], used_pairs=None) -> List[dict]:
     """按质量得分降序排列，并在最优的一组上打推荐标记。
 
     返回**新列表 + 新字典**，不修改入参（不可变约定）。
     只加 `quality_score` / `quality_reasons` / `recommended` / `recommend_reason`
     四个字段，其余字段原样保留，前端旧组件继续可用。
+
+    升级点 1/12：`used_pairs` 为该项目历史已尝试过的配对 key 集合；
+    已尝试的对打 `tried=True` 且**不再参与推荐**（推荐标记只落在未尝试的最高分上）；
+    若全部已尝试，则不给任何推荐标记（Agent 不应再提示换对）。
     """
+    used = {str(k) for k in (used_pairs or [])} if used_pairs else set()
+
     scored: List[Tuple[float, List[str], dict]] = []
     for pair in pairs or []:
         score, reasons = score_pair(pair)
@@ -101,19 +116,35 @@ def rank_pairs(pairs: List[dict]) -> List[dict]:
     scored.sort(key=lambda item: item[0], reverse=True)
 
     out: List[dict] = []
+    recommended_assigned = False
     for i, (score, reasons, pair) in enumerate(scored):
-        item = {**pair, "quality_score": score, "quality_reasons": reasons}
-        if i == 0:
+        key = pair_key(pair)
+        tried = bool(used) and key in used
+        item = {**pair, "quality_score": score, "quality_reasons": reasons,
+                "pair_key": key}
+        if tried:
+            item["tried"] = True
+            item["recommended"] = False
+            item["recommend_reason"] = "这组影像组合已尝试过"
+        elif not recommended_assigned:
             item["recommended"] = True
             item["recommend_reason"] = "、".join(reasons[:3])
+            recommended_assigned = True
         else:
             item["recommended"] = False
         out.append(item)
+
+    # 全部已尝试（升级点 12）：不再推荐任何一组
+    if out and not recommended_assigned:
+        for item in out:
+            item["recommended"] = False
+            item["recommend_reason"] = "当前可选的影像组合都已尝试过"
+        out[0]["all_tried"] = True
     return out
 
 
-def best_pair(pairs: List[dict]) -> Optional[dict]:
-    ranked = rank_pairs(pairs)
+def best_pair(pairs: List[dict], used_pairs=None) -> Optional[dict]:
+    ranked = rank_pairs(pairs, used_pairs=used_pairs)
     return ranked[0] if ranked else None
 
 
@@ -125,15 +156,15 @@ class DataAgent(RoleAgent):
 
     # ── 影像配对 ───────────────────────────────────────────────────
 
-    def rank(self, pairs: List[dict]) -> List[dict]:
-        ranked = rank_pairs(pairs)
+    def rank(self, pairs: List[dict], used_pairs=None) -> List[dict]:
+        ranked = rank_pairs(pairs, used_pairs=used_pairs)
         if ranked:
             self.log(f"配对质量排序完成，最高得分 {ranked[0]['quality_score']}")
         return ranked
 
-    def choose(self, pairs: List[dict]) -> Optional[dict]:
-        """完全执行模式下自动选质量得分最高的一组。"""
-        return best_pair(pairs)
+    def choose(self, pairs: List[dict], used_pairs=None) -> Optional[dict]:
+        """完全执行模式下自动选质量得分最高且未尝试过的一组。"""
+        return best_pair(pairs, used_pairs=used_pairs)
 
     @staticmethod
     def auto_select_note(pair: dict, index: int) -> str:

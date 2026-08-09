@@ -10,6 +10,7 @@ export const useProjectStore = defineStore('project', {
     currentConv: '',
     projectDir: '',
     studyAreas: [],
+    currentStudyArea: '',
     loaded: false,
   }),
 
@@ -32,6 +33,7 @@ export const useProjectStore = defineStore('project', {
       const data = await api.get('/api/bootstrap')
       this.tree = data.projects || []
       this.studyAreas = data.study_areas || []
+      this.currentStudyArea = data.current_study_area || ''
       this.loaded = true
       // 默认选中第一个项目/对话
       if (!this.currentProject && this.tree.length) {
@@ -44,8 +46,15 @@ export const useProjectStore = defineStore('project', {
       const p = this.tree.find((t) => t.project === pid)
       this.projectDir = p?.project_dir || ''
       this.currentConv = ''
+      const chat = useChatStore()
       const convs = p?.conversations || []
-      if (convs.length) await this.selectConv(convs[0].id)
+      if (convs.length) {
+        // 切换项目时自动进入第一个对话，并加载其消息/进度（升级点 13）
+        await this.selectConv(convs[0].id)
+      } else {
+        // 项目没有对话：清空对话区，绝不显示上一个项目的内容（升级点 13）
+        chat.clear()
+      }
     },
 
     async selectConv(cid) {
@@ -53,6 +62,11 @@ export const useProjectStore = defineStore('project', {
       // 刷新项目目录（对话可能带独立 project_dir）
       const p = this.tree.find((t) => t.project === this.currentProject)
       if (p) this.projectDir = p.project_dir || ''
+      // 切换对话时同步加载消息与进度，并恢复仍在运行的流（升级点 13）
+      const chat = useChatStore()
+      await chat.loadMessages(this.currentProject, cid)
+      await chat.resumeIfStreaming(cid)
+      await chat.refreshWorkflow(cid)
     },
 
     async createProject(name) {
@@ -137,6 +151,29 @@ export const useProjectStore = defineStore('project', {
       if (!fileList || !fileList.length) { t.error('请选择文件'); return }
       const r = await api.uploadStudyArea([...fileList])
       this.studyAreas = r.study_areas || []
+      // 首次上传后自动把最新文件设为当前研究区（保持原「取最新」行为）
+      if (this.studyAreas.length && !this.currentStudyArea) {
+        const rr = await api.setCurrentStudyArea(this.studyAreas[0])
+        if (rr.ok) this.currentStudyArea = rr.current || ''
+      }
+      t.success(r.message)
+    },
+
+    async setCurrentStudyArea(name) {
+      const t = useToast()
+      if (!name) { t.error('未指定研究区'); return }
+      const r = await api.setCurrentStudyArea(name)
+      if (!r.ok) { t.error(r.message); return }
+      this.currentStudyArea = r.current || ''
+      t.success(r.message)
+    },
+
+    async deleteStudyArea(name) {
+      const t = useToast()
+      const r = await api.deleteStudyArea(name)
+      if (!r.ok) { t.error(r.message); return }
+      this.studyAreas = r.study_areas || []
+      this.currentStudyArea = r.current || ''
       t.success(r.message)
     },
   },

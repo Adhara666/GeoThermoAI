@@ -383,13 +383,19 @@ def interpolate_grid_to_fine(
     fine_transform: list,
     coarse_transform: list,
     interpolator: RegularGridInterpolator,
+    grid: Optional[np.ndarray] = None,
+    nearest_index=None,
 ) -> np.ndarray:
     """统一仿射映射（core.grid_mapping）+ 双线性插值：把 30m 稠密栅格插值到给定的
     细格 (row, col) 位置。用于 10m TTRI 预测；TCR smooth_recentered 模式复用同一
     底层实现 grid_mapping.interpolate_dense_grid_to_fine（A-06）。
+
+    grid/nearest_index 给定时，约束层覆盖范围外的细像元用最近有效值回退，
+    保证每个预测样本都有 TTRI（口径统一：预测数据只按 S2 去云，不再额外扣点）。
     """
     return grid_mapping.interpolate_dense_grid_to_fine(
-        fine_row, fine_col, fine_transform, coarse_transform, interpolator
+        fine_row, fine_col, fine_transform, coarse_transform, interpolator,
+        grid=grid, nearest_index=nearest_index,
     )
 
 
@@ -447,7 +453,8 @@ def compute_ttri_predict(
     grid, interp, coverage = build_dense_ttri_grid(
         constraint_csv, constraint_meta["height"], constraint_meta["width"], coefficients
     )
-    del grid
+    # 约束层覆盖范围外的预测点用最近有效 TTRI 回退（口径统一：每个预测样本都有 TTRI）
+    nearest_index = grid_mapping.nearest_valid_index(grid)
 
     output_written = False
     total_valid = 0
@@ -472,7 +479,8 @@ def compute_ttri_predict(
             fine_row = valid_chunk["row"].values.astype(np.float64)
             fine_col = valid_chunk["col"].values.astype(np.float64)
             interpolated = interpolate_grid_to_fine(
-                fine_row, fine_col, fine_transform, coarse_transform, interp
+                fine_row, fine_col, fine_transform, coarse_transform, interp,
+                grid=grid, nearest_index=nearest_index,
             )
             ttri_values[valid_mask.values] = interpolated
             out_of_grid += int(np.isnan(interpolated).sum())

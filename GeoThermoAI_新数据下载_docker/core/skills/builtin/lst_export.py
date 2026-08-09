@@ -66,6 +66,9 @@ class LSTExportSkill(BaseSkill):
         meta_10m_json = params.get("meta_10m_json", "")
         output_dir = params.get("output_dir", "")
         chunk_size = params.get("chunk_size", 500000)
+        # 升级点 4：执行引擎注入带日期的输出路径（未注入时回退固定名）
+        lst_final_csv_override = params.get("lst_final_csv", "")
+        output_tif_override = params.get("output_tif", "")
 
         for name, val in [
             ("input_csv", input_csv), ("meta_10m_json", meta_10m_json), ("output_dir", output_dir),
@@ -93,7 +96,7 @@ class LSTExportSkill(BaseSkill):
         if log_callback:
             log_callback("INFO", "开始计算 LST_final = LST_pred + TCR...")
 
-        lst_final_csv = os.path.join(results_dir, "rf_10m_predict.csv")
+        lst_final_csv = lst_final_csv_override or os.path.join(results_dir, "rf_10m_predict.csv")
 
         try:
             lst_result = compute_lst_final(
@@ -115,7 +118,7 @@ class LSTExportSkill(BaseSkill):
         if log_callback:
             log_callback("INFO", "开始导出GeoTIFF...")
 
-        tif_path = os.path.join(results_dir, "rf_10m_lst_final.tif")
+        tif_path = output_tif_override or os.path.join(results_dir, "rf_10m_lst_final.tif")
 
         try:
             tif_result = export_geotiff(

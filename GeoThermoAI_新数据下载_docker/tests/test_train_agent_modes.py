@@ -274,7 +274,7 @@ def test_auto_mode_no_prompt():
         _assert(d2.action == StepDecision.RETRY, "仍在调优")
         d3 = agent.on_trained(_result(0.88, 0.86, 1.25), ctx, hooks=hooks)
         _assert(d3.action == StepDecision.CONTINUE, "达到轮数上限（R7）→ 停止并继续下一步")
-        _assert("[规则] R7" in ctx.text(), "气泡标注 R7")
+        _assert("已达上限" in ctx.text(), "气泡说明调优已达上限（升级点 10：不带 [规则] 编号）")
         _assert("采用第 3 轮" in ctx.text(), "取误差最小的第 3 轮")
         _assert(len(ctx.exp_state["tuning_trace"]) == 3, "调优轨迹写入实验记录草稿")
         _assert(ctx.exp_state["final_params"], "最终生效参数写入实验记录草稿")
@@ -286,7 +286,7 @@ def test_auto_mode_no_prompt():
         decision = TrainAgent(_ScriptedLLM(), _registry()).on_trained(
             _result(0.92, 0.90, 0.95), ctx, hooks=hooks)
         _assert(decision.action == StepDecision.CONTINUE, "首轮已达 0.90（R2）→ 直接继续")
-        _assert("[规则] R2" in ctx.text(), "气泡标注 R2")
+        _assert("不再继续调优" in ctx.text(), "气泡说明精度已达标（升级点 10：不带 [规则] 编号）")
 
         # 大模型不可用：给不出调优方向时不空转，说明原因后继续下一步
         ctx = _Ctx(tmp)
@@ -302,7 +302,8 @@ def test_auto_mode_no_prompt():
         decision = _agent().on_trained(_result(0.62, 0.55, 2.10), ctx, hooks=hooks)
         _assert(decision.action == StepDecision.RETRY,
                 "精度过低时 R1 的兜底方向让调优继续进行")
-        _assert("[规则] R1" in ctx.text(), "气泡标注 R1")
+        _assert("偏低" in ctx.text() or "低于" in ctx.text(),
+                "气泡说明精度偏低（升级点 10：不带 [规则] 编号）")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

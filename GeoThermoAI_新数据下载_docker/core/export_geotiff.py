@@ -180,7 +180,11 @@ def export_geotiff(
         progress_callback("export_geotiff", 0.55, "统计信息计算完成（在线算法，无需复制全幅数组）")
 
     stat_result = stats.finalize()
-    valid_percent = (filled_rows / (height * width)) * 100 if (height * width) > 0 else 0
+    # 有效占比口径：优先用研究区多边形内像元数（meta.region_pixels），
+    # 未提供研究区时回退 bbox 全网格（height*width）
+    region_pixels = int(meta.get("region_pixels") or 0)
+    _denom = region_pixels if region_pixels > 0 else (height * width)
+    valid_percent = (filled_rows / _denom) * 100 if _denom > 0 else 0
 
     if progress_callback:
         _min = stat_result["min"] if stat_result["min"] is not None else float("nan")
@@ -206,6 +210,9 @@ def export_geotiff(
             dst.write(arr, 1)
             dst.set_band_description(1, "LST_final: 10m grid downscaled LST estimate (Kelvin)")
             tag_update = {"UNITS": "K"}
+            if region_pixels > 0:
+                # 研究区口径：记录研究区多边形内像元数，供空洞填补等下游做同口径统计
+                tag_update["REGION_PIXELS"] = str(region_pixels)
             if stat_result["min"] is not None:
                 tag_update["STATISTICS_MINIMUM"] = f"{stat_result['min']:.15g}"
                 tag_update["STATISTICS_MAXIMUM"] = f"{stat_result['max']:.15g}"

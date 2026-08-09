@@ -40,7 +40,7 @@ _DEFAULT_SPLIT_PARAMS = {
     "val_ratio": 0.2,
     "test_ratio": 0.2,
     "seed": 42,
-    "block_size_px": 10,
+    "block_size_px": 30,
     "guard_buffer_m": 100.0,
 }
 _BATCH_SIZE = 500000
@@ -78,11 +78,22 @@ def _load_split_params(project_dir: str) -> dict:
     return dict(_DEFAULT_SPLIT_PARAMS)
 
 
+def _find_raw(raw: str, stem: str) -> str:
+    """在 raw 目录按文件名前缀匹配实际影像（兼容固定名 `landsat_lst.tif`
+    与带日期后缀 `landsat_lst_20240722.tif` 两种命名，与 data_acquisition 输出一致）"""
+    hits = sorted(glob.glob(os.path.join(raw, f"{stem}*.tif")))
+    return hits[0] if hits else os.path.join(raw, f"{stem}.tif")
+
+
 def _ensure_raw(project_dir: str) -> None:
     raw = os.path.join(project_dir, "raw")
     need = ["landsat_lst.tif", "sentinel2_bands.tif", "landsat_qa_pixel.tif",
             "sentinel2_scl.tif", "dem.tif"]
-    missing = [f for f in need if not os.path.isfile(os.path.join(raw, f))]
+    missing = []
+    for f in need:
+        stem = f[:-4] if f.endswith(".tif") else f
+        if not glob.glob(os.path.join(raw, f"{stem}*.tif")):
+            missing.append(f)
     if missing:
         raise RuntimeError(f"原始影像缺失，无法重建中间产物（缺: {missing}）")
 
@@ -95,11 +106,11 @@ def _rebuild_processed(project_dir: str, log_callback=None) -> None:
     os.makedirs(pdir, exist_ok=True)
     _log(log_callback, "重建预处理与数据集划分产物（原始影像仍保留）...")
     process_preprocessing(
-        landsat_path=os.path.join(raw, "landsat_lst.tif"),
-        sentinel2_path=os.path.join(raw, "sentinel2_bands.tif"),
-        qa_path=os.path.join(raw, "landsat_qa_pixel.tif"),
-        scl_path=os.path.join(raw, "sentinel2_scl.tif"),
-        dem_path=os.path.join(raw, "dem.tif"),
+        landsat_path=_find_raw(raw, "landsat_lst"),
+        sentinel2_path=_find_raw(raw, "sentinel2_bands"),
+        qa_path=_find_raw(raw, "landsat_qa_pixel"),
+        scl_path=_find_raw(raw, "sentinel2_scl"),
+        dem_path=_find_raw(raw, "dem"),
         output_dir=pdir,
         progress_callback=_progress(log_callback),
     )
@@ -187,6 +198,16 @@ def _tcr_mode_from_manifest(project_dir: str) -> str:
     return MODE_BLOCK_CONSTANT
 
 
+def _sdate_from_raw(project_dir: str) -> str:
+    """从 raw 目录的 Sentinel-2 影像文件名推导日期后缀（如 20240722），
+    使重建产物与正常流程的带日期命名一致（tcr_result_{sdate}.csv）"""
+    hits = sorted(glob.glob(os.path.join(project_dir, "raw", "sentinel2_bands*.tif")))
+    if not hits:
+        return ""
+    part = os.path.splitext(os.path.basename(hits[0]))[0].split("_")[-1]
+    return part if (len(part) == 8 and part.isdigit()) else ""
+
+
 def _rebuild_tcr(project_dir: str, log_callback=None) -> None:
     """重建 tcr_result.csv（含上游：预处理/划分/TTRI 空间化）。"""
     pdir = os.path.join(project_dir, "processed")
@@ -200,14 +221,16 @@ def _rebuild_tcr(project_dir: str, log_callback=None) -> None:
     if not model_path:
         raise RuntimeError("未找到 RF 模型（results/train/*_model_*.pkl），无法重建 TCR")
     os.makedirs(rdir, exist_ok=True)
-    _log(log_callback, "重建 TCR 中间产物（tcr_result.csv）...")
+    sdate = _sdate_from_raw(project_dir)
+    out_name = f"tcr_result_{sdate}.csv" if sdate else "tcr_result.csv"
+    _log(log_callback, f"重建 TCR 中间产物（{out_name}）...")
     compute_tcr(
         constraint_csv=os.path.join(pdir, "30m_constraint_grid.csv"),
         constraint_meta_json=os.path.join(pdir, "30m_constraint_grid_meta.json"),
         predict_10m_csv=os.path.join(pdir, "10m_predict_features.csv"),
         meta_10m_json=os.path.join(pdir, "10m_predict_features_meta.json"),
         model_path=model_path,
-        output_path=os.path.join(rdir, "tcr_result.csv"),
+        output_path=os.path.join(rdir, out_name),
         mode=_tcr_mode_from_manifest(project_dir),
         batch_size=_BATCH_SIZE,
         progress_callback=_progress(log_callback),
@@ -265,7 +288,7 @@ def ensure_stage_inputs(project_dir: str, stage: str, log_callback=None) -> None
         return
 
     if stage == "lst_export":
-        if not os.path.isfile(os.path.join(rdir, "tcr_result.csv")):
+        if not glob.glob(os.path.join(rdir, "tcr_result*.csv")):
             _rebuild_tcr(project_dir, log_callback)
         return
 
@@ -274,6 +297,6 @@ def ensure_stage_inputs(project_dir: str, stage: str, log_callback=None) -> None
             "30m_constraint_grid.csv", "30m_constraint_grid_meta.json",
             "10m_predict_features_meta.json",
         ], log_callback)
-        if not os.path.isfile(os.path.join(rdir, "tcr_result.csv")):
+        if not glob.glob(os.path.join(rdir, "tcr_result*.csv")):
             _rebuild_tcr(project_dir, log_callback)
         return

@@ -59,9 +59,11 @@ class EvalAgent(RoleAgent):
     role = "eval"
     role_name = "评估"
 
-    def __init__(self, assistant, memory_manager=None, project_id: str = "", on_log=None):
+    def __init__(self, assistant, memory_manager=None, project_id: str = "",
+                 on_log=None, on_thinking=None):
         super().__init__(assistant, memory_manager=memory_manager,
-                         project_id=project_id, on_log=on_log)
+                         project_id=project_id, on_log=on_log,
+                         on_thinking=on_thinking)
         self.bundle: Dict[str, Any] = {}
         self.report = ""
         self.degraded = False
@@ -112,7 +114,9 @@ class EvalAgent(RoleAgent):
                 pass
             if option_id == Option.MORE_ANALYSIS:
                 ctx.emit("好的，请说明你想做的分析。\n")
-        return StepDecision.cont()
+
+        # ── 结果后处理（可选）：询问是否对 10m LST 空洞做填补 ──
+        return self._handle_postprocess(ctx, hooks)
 
     # ── 读取真实结果（不重算任何指标） ─────────────────────────────
 
@@ -203,19 +207,25 @@ class EvalAgent(RoleAgent):
         return "自动解读未通过表述检查"
 
     def _generate(self, knowledge: str, facts: str, expected: str) -> str:
-        # 实现期修订 v1.2：与其它角色一致放宽预算，避免报告被截断成半句话
+        # 实现期修订 v1.5：关闭思考链（thinking={"type":"disabled"}）。
+        # 结果解读是「单步结构化输出」任务，不需要推理链；思考链的 reasoning_content
+        # 计入 max_tokens，会占满预算导致正文为空而降级。数值准确性由 E-R1~E-R7
+        # 确定性规则兜底，不依赖模型思考。budget 保留 8192 作双保险。
         text = self.call_text(eval_prompts.report_prompt(knowledge, facts, expected),
-                             "请撰写结果说明。", temperature=0.2, max_tokens=2048)
+                             "请撰写结果说明。", temperature=0.2, max_tokens=8192,
+                             thinking={"type": "disabled"})
         from .base_role import is_api_failure
 
         return "" if is_api_failure(text) else text.strip()
 
     def _rewrite(self, knowledge: str, facts: str, draft: str, violations: List[str],
                  expected: str) -> str:
+        # 与 _generate 同因：关闭思考链，只输出重写正文
         text = self.call_text(
             eval_prompts.rewrite_prompt(knowledge, facts, draft,
                                         "\n".join(f"- {v}" for v in violations), expected),
-            "请按修改要求重写。", temperature=0.1, max_tokens=2048)
+            "请按修改要求重写。", temperature=0.1, max_tokens=8192,
+            thinking={"type": "disabled"})
         from .base_role import is_api_failure
 
         return "" if is_api_failure(text) else text.strip()
@@ -306,6 +316,101 @@ class EvalAgent(RoleAgent):
             f"- 口径依据：{_cut_at_sentence(closure_note, 180)}",
         ]
         return "\n".join(lines)
+
+    # ── 结果后处理（可选，升级点：10m LST 空洞填补） ─────────────
+
+    def _handle_postprocess(self, ctx: Any, hooks=None) -> StepDecision:
+        """全流程结果生成后：询问是否对 10m LST 空洞做填补。
+
+        由我批准模式：弹审批卡片让用户选择（执行填洞 / 不需要结束流程）；
+        完全执行模式：默认跳过不询问，并在气泡中提示默认不执行、需要时可告知。
+        """
+        exec_mode = getattr(hooks, "exec_mode", "") if hooks is not None else ""
+
+        if is_auto(exec_mode):
+            # 完全执行模式：默认不执行结果后处理，完成后提示用户可随时告知
+            try:
+                ctx.exp_state.setdefault("approval_choices", {})[Node.POSTPROCESS] = Option.SKIP_POSTPROCESS
+            except Exception:
+                pass
+            ctx.emit("（本次为完全执行模式，默认不执行结果后处理；"
+                     "如需要无空洞的 10m 地表温度产品，告诉我即可对结果做空洞填补。）\n")
+            return StepDecision.cont()
+
+        summary = self._postprocess_summary()
+        payload = approval_proto.build_postprocess(summary)
+        choice = hooks._ask(payload) if hooks is not None else None
+        if choice is None:
+            return StepDecision.pause(payload, reason="等待用户确认是否结果后处理")
+        option_id = choice.get("option_id", Option.SKIP_POSTPROCESS)
+        if getattr(hooks, "run_state", None) is not None:
+            hooks.run_state.record_approval(Node.POSTPROCESS, option_id)
+        try:
+            ctx.exp_state.setdefault("approval_choices", {})[Node.POSTPROCESS] = option_id
+        except Exception:
+            pass
+
+        if option_id != Option.RUN_POSTPROCESS:
+            ctx.emit("好的，保留当前带空洞的原始 10m 地表温度产品，本次流程到此结束。\n")
+            return StepDecision.cont()
+        return self._run_gapfill(ctx)
+
+    def _postprocess_summary(self) -> str:
+        stats = self.bundle.get("lst_stats") or {}
+        valid_pct = stats.get("valid_percent")
+        head = "当前 10m 地表温度产品存在因云像元扣除造成的空洞。"
+        if valid_pct is not None:
+            head = f"当前 10m 地表温度产品有效像元占比约 {valid_pct:.1f}%，其余为云像元造成的空洞。"
+        return (head + "是否对这些空洞做填补，生成无空洞的 10m 地表温度产品？"
+                "（只估计空洞像元，不改变无云区数值）")
+
+    def _run_gapfill(self, ctx: Any) -> StepDecision:
+        """执行 lst_gapfill skill（空洞填补），结果写入气泡与阶段清单。"""
+        skill = ctx.registry.get("lst_gapfill")
+        if skill is None:
+            ctx.emit("结果后处理组件未注册，本次跳过。\n")
+            return StepDecision.cont()
+        try:
+            from ..executor import build_skill_paths, pair_dates
+
+            dates = pair_dates(ctx.exp_state.get("pair") or {})
+            paths = build_skill_paths(
+                getattr(ctx, "raw_dir", ""), getattr(ctx, "processed_dir", ""),
+                getattr(ctx, "results_dir", ""), dates=dates,
+                project_dir=getattr(ctx, "project_dir", ""),
+            )
+            params = paths.get("lst_gapfill") or {}
+        except Exception as e:
+            ctx.emit(f"结果后处理路径解析失败：{e}\n")
+            return StepDecision.cont()
+
+        ctx.emit("开始结果后处理：填补 10m 地表温度产品中的云像元空洞…\n")
+        try:
+            result = skill.execute(
+                params,
+                progress_callback=lambda sn, pct, msg: None,
+                log_callback=lambda lvl, msg: self.log(msg),
+            )
+        except Exception as e:
+            ctx.emit(f"结果后处理执行失败：{e}\n")
+            return StepDecision.cont()
+
+        try:
+            ctx.exp_state.setdefault("step_success", {})["lst_gapfill"] = bool(getattr(result, "success", False))
+        except Exception:
+            pass
+
+        if getattr(result, "success", False):
+            data = getattr(result, "data", None)
+            data = data if isinstance(data, dict) else {}
+            ctx.emit(getattr(result, "message", "结果后处理完成") + "\n")
+            filled_tif = data.get("filled_tif", "")
+            mask_tif = data.get("mask_tif", "")
+            ctx.emit(f"无空洞的 10m 地表温度产品已生成（{filled_tif}）"
+                     f"{f'，空洞掩膜：{mask_tif}' if mask_tif else ''}\n")
+        else:
+            ctx.emit(f"结果后处理未完成：{getattr(result, 'message', '未知原因')}\n")
+        return StepDecision.cont()
 
     def _final_summary(self) -> str:
         from .. import presentation

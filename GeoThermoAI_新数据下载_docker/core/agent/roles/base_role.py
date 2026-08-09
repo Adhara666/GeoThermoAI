@@ -125,11 +125,15 @@ class RoleAgent:
     role_name = "角色"
 
     def __init__(self, assistant, memory_manager=None, project_id: str = "",
-                 on_log=None):
+                 on_log=None, on_thinking=None):
         self.assistant = assistant
         self.memory = memory_manager
         self.project_id = project_id
         self._on_log = on_log
+        # 思考过程累积缓冲（升级点 15/16）：规划/反思等同步 LLM 调用的
+        # reasoning_content 也会累积透传，让气泡思考块实时展示"在想什么"
+        self._on_thinking = on_thinking
+        self._thinking_acc = ""
 
     # ── 日志 ───────────────────────────────────────────────────────
 
@@ -138,6 +142,20 @@ class RoleAgent:
         if self._on_log:
             try:
                 self._on_log(f"  [{self.role}] {message}\n")
+            except Exception:
+                pass
+
+    # ── 思考过程透传（升级点 15）───────────────────────────────────
+
+    def _push_thinking(self, text: str) -> None:
+        """累积一次 LLM 调用的思考内容并透传（覆盖式回调，保持最新全量）。"""
+        text = (text or "").strip()
+        if not text:
+            return
+        self._thinking_acc = (self._thinking_acc + "\n\n" + text).strip()
+        if self._on_thinking:
+            try:
+                self._on_thinking(self._thinking_acc)
             except Exception:
                 pass
 
@@ -160,7 +178,8 @@ class RoleAgent:
 
     def call_text(self, system_prompt: str, user_content: str,
                   temperature: float = 0.2, max_tokens: int = 2048,
-                  history: Optional[List[dict]] = None) -> str:
+                  history: Optional[List[dict]] = None,
+                  thinking: Optional[dict] = None) -> str:
         messages: List[Dict[str, str]] = [{"role": "system", "content": system_prompt}]
         for item in history or []:
             role = "assistant" if item.get("role") in ("ai", "assistant") else "user"
@@ -170,7 +189,9 @@ class RoleAgent:
         messages.append({"role": "user", "content": user_content})
         try:
             return self.assistant._call_api(messages, temperature=temperature,
-                                            max_tokens=max_tokens)
+                                            max_tokens=max_tokens,
+                                            thinking=thinking,
+                                            on_thinking=self._push_thinking)
         except Exception as e:
             logger.warning(f"[{self.role}] LLM 调用异常: {e}")
             return f"API调用失败: {e}"

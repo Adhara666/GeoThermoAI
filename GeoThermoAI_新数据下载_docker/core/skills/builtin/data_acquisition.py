@@ -22,6 +22,7 @@
 
 import os
 import json
+import re
 import time
 import shutil
 import tempfile
@@ -402,6 +403,100 @@ class DataAcquisitionSkill(BaseSkill):
         selected_landsat_date = selected_pair.get("landsat_date", "")
         selected_sentinel_date = selected_pair.get("sentinel2_date", "")
         selected_satellite = selected_pair.get("landsat_satellite", "")
+        # 升级点 4：本地 LST / Sentinel-2 文件名带 YYYYMMDD 日期；DEM 不带日期
+        _ldate = str(selected_landsat_date).replace("-", "")
+        _sdate = str(selected_sentinel_date).replace("-", "")
+        # 升级点 3：项目根目录（由执行引擎注入），用于已下载对跳过 / 重复影像复制 / DEM 复用
+        _project_dir = str(params.get("project_dir") or "").strip()
+        # 方案 A：对话级独立工作目录。对话 project_dir = {项目根}/convs/{对话id}，
+        # 已下载影像/DEM 缓存在项目根共享目录，跨对话复用不重复下载。
+        # 若路径不以 /convs/ 结尾（旧对话或兜底），则视为项目根本身。
+        _shared_root = _project_dir
+        if _project_dir:
+            _pdir_norm = _project_dir.replace("\\", "/").rstrip("/")
+            _parts = _pdir_norm.split("/")
+            if len(_parts) >= 2 and _parts[-2] == "convs":
+                _shared_root = "/".join(_parts[:-2])
+
+        # 研究区标识：共享缓存必须按研究区隔离。缓存里存的是按当前研究区
+        # GeoJSON 裁剪 + 重投影（UTM）后的影像，同日期缓存不能跨研究区复用，
+        # 否则换研究区跑会拿到上一个研究区的范围/投影（D1 同类隐患）。
+        # 保留中文（研究区文件名多为中文，如 鄂州市_市），仅替换路径分隔符等
+        _region_key = "bbox"
+        if study_area_geojson:
+            _region_key = re.sub(r"[^A-Za-z0-9_\-\u4e00-\u9fff]", "_",
+                                 os.path.splitext(os.path.basename(study_area_geojson))[0]) or "region"
+
+        def _land(name: str) -> str:
+            return f"{name}_{_ldate}.tif" if _ldate else f"{name}.tif"
+
+        def _sent(name: str) -> str:
+            return f"{name}_{_sdate}.tif" if _sdate else f"{name}.tif"
+
+        def _cache_to_shared(filename: str, path: str) -> None:
+            """下载完成后把影像缓存到项目级共享目录（方案 A），供其他对话复用。"""
+            if not _shared_root or _shared_root == _project_dir:
+                return
+            if not (os.path.isfile(path) and os.path.getsize(path) > 0):
+                return
+            cache_dir = os.path.join(_shared_root, "pairs", _region_key,
+                                     f"L{_ldate}_S{_sdate}", "raw")
+            try:
+                os.makedirs(cache_dir, exist_ok=True)
+                target = os.path.join(cache_dir, filename)
+                if not (os.path.isfile(target) and os.path.getsize(target) > 0):
+                    shutil.copy2(path, target)
+            except OSError:
+                pass
+
+        def _reuse_local(path: str, desc: str) -> bool:
+            """目标已存在且非空 → 跳过下载，直接复用本地文件（升级点 3）。"""
+            if os.path.isfile(path) and os.path.getsize(path) > 0:
+                if log_callback:
+                    log_callback("INFO", f"{desc} 已存在（{os.path.basename(path)}），跳过下载")
+                return True
+            return False
+
+        def _copy_from_other_pair(filename: str, path: str, desc: str) -> bool:
+            """其他配对/共享缓存中已有同名影像 → 直接复制，无需重复下载（升级点 3）。
+
+            方案 A：扫描项目级共享缓存（{项目根}/pairs/...）与当前对话目录的配对，
+            跨对话复用已下载的原始影像。
+            """
+            if os.path.isfile(path):
+                return False
+            candidates = []
+            if _shared_root:
+                candidates.append(os.path.join(_shared_root, "pairs"))
+            if _project_dir and _project_dir != _shared_root:
+                candidates.append(os.path.join(_project_dir, "pairs"))
+            for pairs_root in candidates:
+                if os.path.dirname(pairs_root).replace("\\", "/").rstrip("/").endswith("/convs"):
+                    # 对话内配对目录（无研究区层级，本对话研究区固定，直接扫描）
+                    _region_roots = [pairs_root]
+                else:
+                    # 项目级共享缓存：限定当前研究区子目录，禁止跨研究区复用
+                    _region_roots = [os.path.join(pairs_root, _region_key)]
+                for _rr in _region_roots:
+                    if not os.path.isdir(_rr):
+                        continue
+                    for _d in sorted(os.listdir(_rr)):
+                        cand = os.path.join(_rr, _d, "raw", filename)
+                        if os.path.isfile(cand) and os.path.getsize(cand) > 0:
+                            os.makedirs(os.path.dirname(path), exist_ok=True)
+                            shutil.copy2(cand, path)
+                            if log_callback:
+                                log_callback("INFO", f"{desc} 复用已下载影像（{filename}）")
+                            return True
+            return False
+
+        def _need_download(path: str, filename: str, desc: str) -> bool:
+            """返回 True 表示需要真正下载；否则已复用本地/其他配对文件。"""
+            if _reuse_local(path, desc):
+                return False
+            if _copy_from_other_pair(filename, path, desc):
+                return False
+            return True
 
         def _satellite_match(item, target_sat):
             if not target_sat:
@@ -432,45 +527,53 @@ class DataAcquisitionSkill(BaseSkill):
         if progress_callback:
             progress_callback("data_acquisition", 0.13, "下载 Landsat lwir11 (地表温度)...")
 
-        landsat_path = os.path.join(output_dir, "landsat_lst.tif")
-        self._download_composite(
-            items=landsat_items, band="lwir11", output_path=landsat_path,
-            bbox=bbox, scale=30, progress_callback=progress_callback, log_callback=log_callback,
-            progress_range=(0.13, 0.26), skill_name="data_acquisition",
-            study_area_geojson=study_area_geojson,
-        )
+        landsat_path = os.path.join(output_dir, _land("landsat_lst"))
+        if _need_download(landsat_path, os.path.basename(landsat_path), "Landsat LST"):
+            self._download_composite(
+                items=landsat_items, band="lwir11", output_path=landsat_path,
+                bbox=bbox, scale=30, progress_callback=progress_callback, log_callback=log_callback,
+                progress_range=(0.13, 0.26), skill_name="data_acquisition",
+                study_area_geojson=study_area_geojson,
+            )
+            _cache_to_shared(os.path.basename(landsat_path), landsat_path)
         output_paths["landsat_path"] = landsat_path
 
         # ── 下载 Landsat qa_pixel ────────────────────────────────────
         if progress_callback:
             progress_callback("data_acquisition", 0.26, "下载 Landsat qa_pixel...")
 
-        qa_path = os.path.join(output_dir, "landsat_qa_pixel.tif")
-        self._download_composite(
-            items=landsat_items, band="qa_pixel", output_path=qa_path,
-            bbox=bbox, scale=30, progress_callback=progress_callback, log_callback=log_callback,
-            progress_range=(0.26, 0.36), skill_name="data_acquisition",
-            study_area_geojson=study_area_geojson,
-        )
+        qa_path = os.path.join(output_dir, _land("landsat_qa_pixel"))
+        if _need_download(qa_path, os.path.basename(qa_path), "Landsat QA"):
+            self._download_composite(
+                items=landsat_items, band="qa_pixel", output_path=qa_path,
+                bbox=bbox, scale=30, progress_callback=progress_callback, log_callback=log_callback,
+                progress_range=(0.26, 0.36), skill_name="data_acquisition",
+                study_area_geojson=study_area_geojson,
+            )
+            _cache_to_shared(os.path.basename(qa_path), qa_path)
         output_paths["qa_path"] = qa_path
 
         # ── 下载 Sentinel-2 多光谱（按景定标 BOA_ADD_OFFSET）────
         if progress_callback:
             progress_callback("data_acquisition", 0.42, "下载 Sentinel-2 多光谱...")
 
-        sentinel2_path = os.path.join(output_dir, "sentinel2_bands.tif")
-        s2_provenance = self._download_composite(
-            items=sentinel2_items, band=["B02", "B03", "B04", "B08", "B11"],
-            output_path=sentinel2_path, bbox=bbox, scale=10,
-            progress_callback=progress_callback, log_callback=log_callback,
-            progress_range=(0.42, 0.62), skill_name="data_acquisition",
-            study_area_geojson=study_area_geojson, apply_s2_calibration=True,
-            auth_headers=ds_headers, s3_creds=s3_creds,
-        )
+        sentinel2_path = os.path.join(output_dir, _sent("sentinel2_bands"))
+        s2_provenance = None
+        if _need_download(sentinel2_path, os.path.basename(sentinel2_path), "Sentinel-2 多光谱"):
+            s2_provenance = self._download_composite(
+                items=sentinel2_items, band=["B02", "B03", "B04", "B08", "B11"],
+                output_path=sentinel2_path, bbox=bbox, scale=10,
+                progress_callback=progress_callback, log_callback=log_callback,
+                progress_range=(0.42, 0.62), skill_name="data_acquisition",
+                study_area_geojson=study_area_geojson, apply_s2_calibration=True,
+                auth_headers=ds_headers, s3_creds=s3_creds,
+            )
+            _cache_to_shared(os.path.basename(sentinel2_path), sentinel2_path)
         output_paths["sentinel2_path"] = sentinel2_path
 
         if s2_provenance:
-            provenance_path = os.path.join(output_dir, "sentinel2_provenance.json")
+            provenance_path = os.path.join(output_dir, f"sentinel2_provenance_{_sdate}.json"
+                                           if _sdate else "sentinel2_provenance.json")
             with open(provenance_path, "w", encoding="utf-8") as f:
                 json.dump({
                     "formula": "reflectance = (DN + BOA_ADD_OFFSET) / BOA_QUANTIFICATION_VALUE; DN==0 仍是 NoData",
@@ -482,14 +585,16 @@ class DataAcquisitionSkill(BaseSkill):
         if progress_callback:
             progress_callback("data_acquisition", 0.62, "下载 Sentinel-2 SCL...")
 
-        scl_path = os.path.join(output_dir, "sentinel2_scl.tif")
-        self._download_composite(
-            items=sentinel2_items, band="SCL", output_path=scl_path,
-            bbox=bbox, scale=20, progress_callback=progress_callback, log_callback=log_callback,
-            progress_range=(0.62, 0.72), skill_name="data_acquisition",
-            study_area_geojson=study_area_geojson,
-            auth_headers=ds_headers, s3_creds=s3_creds,
-        )
+        scl_path = os.path.join(output_dir, _sent("sentinel2_scl"))
+        if _need_download(scl_path, os.path.basename(scl_path), "Sentinel-2 SCL"):
+            self._download_composite(
+                items=sentinel2_items, band="SCL", output_path=scl_path,
+                bbox=bbox, scale=20, progress_callback=progress_callback, log_callback=log_callback,
+                progress_range=(0.62, 0.72), skill_name="data_acquisition",
+                study_area_geojson=study_area_geojson,
+                auth_headers=ds_headers, s3_creds=s3_creds,
+            )
+            _cache_to_shared(os.path.basename(scl_path), scl_path)
         output_paths["scl_path"] = scl_path
 
         # ── 下载 DEM（优先 Copernicus Data Space，失败/未配置回退 Planetary Computer）──
@@ -498,39 +603,54 @@ class DataAcquisitionSkill(BaseSkill):
 
         dem_path = os.path.join(output_dir, "dem.tif")
         dem_collection = "cop-dem-glo-30"
+        # 升级点 3 + 方案 A：DEM 项目级共享缓存（{项目根}/dem_{研究区}.tif），
+        # 各对话独立目录均从共享缓存复制，全项目只下载一次；缓存按研究区隔离，
+        # 避免换研究区复用上一个研究区已裁剪的 DEM
+        _project_dem = os.path.join(_shared_root, f"dem_{_region_key}.tif") if _shared_root else ""
+        if _project_dem and os.path.isfile(_project_dem) and os.path.getsize(_project_dem) > 0:
+            os.makedirs(output_dir, exist_ok=True)
+            shutil.copy2(_project_dem, dem_path)
+            if log_callback:
+                log_callback("INFO", "DEM 复用项目级本地文件，跳过下载")
+            output_paths["dem_path"] = dem_path
+        else:
+            _dem_target = _project_dem or dem_path
 
-        dem_items = []
-        dem_from_ds = False  # DEM 瓦片是否来自 CDSE（决定下载时是否附加 CDSE 认证）
-        # DEM 属 CCM（Contributing Missions）数据：CDSE 下载仅支持 S3 SigV4 签名
-        # （Bearer token 会 403，已实测），因此只有配置了 S3 密钥时才走 CDSE
-        if ds_token and s3_creds:
-            try:
-                dem_items = list(ds_catalog.search(
-                    collections=[_DS_DEM_COLLECTION_GLO30], bbox=bbox, max_items=10,
-                ).items())
-                dem_from_ds = len(dem_items) > 0
-                if log_callback and not selected_pair:
-                    log_callback("INFO", f"[Data Space] 找到 {len(dem_items)} 个 DEM 瓦片")
-            except Exception as e:
-                dem_items = []
-                if log_callback:
-                    log_callback("WARN", f"Data Space DEM 搜索失败: {e}，DEM 回退 Planetary Computer")
+            dem_items = []
+            dem_from_ds = False  # DEM 瓦片是否来自 CDSE（决定下载时是否附加 CDSE 认证）
+            # DEM 属 CCM（Contributing Missions）数据：CDSE 下载仅支持 S3 SigV4 签名
+            # （Bearer token 会 403，已实测），因此只有配置了 S3 密钥时才走 CDSE
+            if ds_token and s3_creds:
+                try:
+                    dem_items = list(ds_catalog.search(
+                        collections=[_DS_DEM_COLLECTION_GLO30], bbox=bbox, max_items=10,
+                    ).items())
+                    dem_from_ds = len(dem_items) > 0
+                    if log_callback and not selected_pair:
+                        log_callback("INFO", f"[Data Space] 找到 {len(dem_items)} 个 DEM 瓦片")
+                except Exception as e:
+                    dem_items = []
+                    if log_callback:
+                        log_callback("WARN", f"Data Space DEM 搜索失败: {e}，DEM 回退 Planetary Computer")
 
-        if not dem_items:
-            dem_items = _search_items(
-                catalog, log_callback, "DEM",
-                collections=[dem_collection], bbox=bbox, max_items=10,
+            if not dem_items:
+                dem_items = _search_items(
+                    catalog, log_callback, "DEM",
+                    collections=[dem_collection], bbox=bbox, max_items=10,
+                )
+
+            self._download_composite(
+                items=dem_items, band="data", output_path=_dem_target,
+                bbox=bbox, scale=30, progress_callback=progress_callback, log_callback=log_callback,
+                progress_range=(0.72, 0.95), skill_name="data_acquisition",
+                study_area_geojson=study_area_geojson,
+                auth_headers=ds_headers if dem_from_ds else None,
+                s3_creds=s3_creds if dem_from_ds else None,
             )
-
-        self._download_composite(
-            items=dem_items, band="data", output_path=dem_path,
-            bbox=bbox, scale=30, progress_callback=progress_callback, log_callback=log_callback,
-            progress_range=(0.72, 0.95), skill_name="data_acquisition",
-            study_area_geojson=study_area_geojson,
-            auth_headers=ds_headers if dem_from_ds else None,
-            s3_creds=s3_creds if dem_from_ds else None,
-        )
-        output_paths["dem_path"] = dem_path
+            if _project_dem:
+                os.makedirs(output_dir, exist_ok=True)
+                shutil.copy2(_project_dem, dem_path)
+            output_paths["dem_path"] = dem_path
 
         elapsed = time.time() - t_start
 
@@ -551,12 +671,21 @@ class DataAcquisitionSkill(BaseSkill):
 
     @staticmethod
     def _load_dataspace_config() -> dict:
-        """从 config/settings.json 读取 data_space 配置"""
+        """读取当前用户的 data_space 配置
+
+        前端"数据源"面板把凭据保存在 data/users/{uid}/settings.json 的
+        data_space 段，凭据只跟用户走，不读全局 config/settings.json。
+        单用户部署取第一个非空配置即可。
+        """
         try:
-            cfg_path = _ROOT / "config" / "settings.json"
-            if cfg_path.is_file():
-                with open(cfg_path, "r", encoding="utf-8") as f:
-                    return json.load(f).get("data_space", {})
+            users_dir = _ROOT / "data" / "users"
+            if users_dir.is_dir():
+                for up in sorted(users_dir.iterdir()):
+                    sp = up / "settings.json"
+                    if sp.is_file():
+                        ucfg = json.loads(sp.read_text(encoding="utf-8")).get("data_space", {}) or {}
+                        if ucfg.get("username") or ucfg.get("client_id") or ucfg.get("s3_key"):
+                            return ucfg
         except Exception:
             pass
         return {}
@@ -1131,7 +1260,14 @@ class DataAcquisitionSkill(BaseSkill):
                         else:
                             headers = auth_headers
                     else:
-                        asset = scene_item.assets.get(b)
+                        # Planetary Computer：每波段下载前重新签名（SAS 短时效，
+                        # 长下载后旧签名可能已过期返回 403 —— B02/B03/B04 先下载
+                        # 成功、B08/B11 等靠后波段 403，就是签名过期所致）
+                        signed_item = self._sign_item(item)
+                        if signed_item is None:
+                            download_errors.append(f"{item.id}: 签名失败")
+                            continue
+                        asset = signed_item.assets.get(b)
                         if not asset:
                             download_errors.append(f"{item.id}: 缺少波段 {b}")
                             continue
@@ -1445,9 +1581,20 @@ class DataAcquisitionSkill(BaseSkill):
 
         Planetary Computer 要求对 Blob 存储的 asset 进行 SAS token 签名。
         如果未安装 planetary_computer 包，则使用内部 API 手动签名。
+
+        注意：planetary_computer 对同一存储账户/容器有进程级 TOKEN_CACHE
+        （剩余有效期 >60s 时不刷新，token 有效期约 24h45m）。长驻服务里
+        缓存的旧 token 会在长时间下载中途过期 → 后段波段全部 403
+        （B02/B03/B04 成功、B08/B11 403 即此现象）。因此每次签名前
+        清空缓存，强制向 token 服务取全新 token（st=当前时刻，有效期
+        24h45m，单次下载内绝不会过期）。
         """
         try:
             import planetary_computer
+            from planetary_computer import sas as pc_sas
+            cache = getattr(pc_sas, "TOKEN_CACHE", None)
+            if cache is not None:
+                cache.clear()
             return planetary_computer.sign(item)
         except ImportError:
             pass

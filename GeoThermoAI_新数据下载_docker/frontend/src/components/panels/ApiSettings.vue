@@ -93,7 +93,10 @@ async function save() {
         </div>
       </div>
     </details>
-    <button class="btn btn--primary btn--block" @click="save">保存并应用</button>
+    <button class="btn btn--primary btn--block" @click="save">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>
+      保存并应用
+    </button>
     <p v-if="saved" class="form-hint" style="margin-top:8px;color:var(--success)">✅ 已保存并热更新模型</p>
   </div>
 </template>

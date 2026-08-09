@@ -32,6 +32,7 @@ STAGE_OF_SKILL: Dict[str, str] = {
     "rf_model": "train",
     "tcr_compute": "eval",
     "lst_export": "eval",
+    "lst_gapfill": "eval",
     "accuracy_eval": "eval",
     "ai_assistant": "chat",
 }
@@ -39,8 +40,8 @@ STAGE_OF_SKILL: Dict[str, str] = {
 # 产品类型枚举（城市热岛等新功能只在此预留位置，本次不实现）
 PRODUCTS = ("lst_10m",)
 
-# 意图取值（技术方案 4.3）
-INTENTS = ("chat", "qa", "task", "modify", "unclear")
+# 意图取值（技术方案 4.3；postprocess 为结果后处理，如对已有 10m LST 做空洞填补）
+INTENTS = ("chat", "qa", "task", "modify", "unclear", "postprocess")
 
 DEFAULT_APPROVAL_NODES = ("pair_selection", "tuning_decision", "final_report")
 

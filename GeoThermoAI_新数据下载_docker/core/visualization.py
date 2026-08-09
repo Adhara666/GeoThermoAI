@@ -10,8 +10,10 @@ v3.2 变更：
 - Sentinel-2 RGB 改用分位数拉伸，兼容 0-255 与 0-10000 等不同量纲，避免全黑不显示
 """
 
+import glob
 import math
 import os
+import re
 from functools import lru_cache
 from typing import List, Optional, Tuple
 
@@ -101,9 +103,51 @@ class LayerVisualizer:
             "opacity": 0.7,
             "visible": True,
         },
+        {
+            "id": "lst_10m_filled",
+            "label": "10m LST（填洞后）",
+            "group": "结果",
+            "file": "results/rf_10m_lst_final_filled.tif",
+            "band": 1,
+            "colormap": "RdYlBu_r",
+            "opacity": 0.7,
+            "visible": False,
+        },
     ]
 
     # ── 内部工具 ───────────────────────────────────────────────
+
+    @staticmethod
+    def _resolve_layer_path(project_dir: str, layer_def: dict) -> str:
+        """解析图层文件实际路径（升级点 2/4）。
+
+        优先取项目下最近修改的影像对目录（project_dir/pairs/L{date}_S{date}）中的文件；
+        文件名带日期（如 landsat_lst_20240701.tif）时按前缀 glob 匹配最新的一个；
+        兼容无 pairs 目录 / 无日期的旧布局。
+        """
+        if not project_dir:
+            return ""
+        base = project_dir
+        pairs_root = os.path.join(project_dir, "pairs")
+        if os.path.isdir(pairs_root):
+            pair_dirs = [os.path.join(pairs_root, d) for d in sorted(os.listdir(pairs_root))
+                         if os.path.isdir(os.path.join(pairs_root, d))]
+            if pair_dirs:
+                base = max(pair_dirs, key=lambda p: os.path.getmtime(p))
+        fixed = os.path.join(base, layer_def.get("file", ""))
+        if os.path.isfile(fixed):
+            return fixed
+        name, ext = os.path.splitext(os.path.basename(fixed))
+        directory = os.path.dirname(fixed)
+        if directory and os.path.isdir(directory):
+            # 只匹配纯 8 位日期后缀（YYYYMMDD），避免 glob 的 * 误匹配
+            # 到 _cloud_mask 等派生产物（升级点：结果后处理填洞图层隔离）
+            pattern = re.compile(re.escape(name) + r"_[0-9]{8}" + re.escape(ext) + r"$")
+            matches = [p for p in glob.glob(os.path.join(directory, f"{name}_[0-9]*{ext}"))
+                       if pattern.match(os.path.basename(p))]
+            if matches:
+                return max(matches, key=lambda p: os.path.getmtime(p))
+        return fixed
 
     @staticmethod
     def _bounds_to_wgs84(src) -> List[List[float]]:
@@ -360,7 +404,7 @@ class LayerVisualizer:
         layer_def = next((d for d in LayerVisualizer.LAYER_DEFS if d["id"] == layer_id), None)
         if layer_def is None:
             return None
-        file_path = os.path.join(project_dir, layer_def["file"])
+        file_path = LayerVisualizer._resolve_layer_path(project_dir, layer_def)
         if not os.path.isfile(file_path):
             return None
         n = 2 ** z
@@ -481,7 +525,7 @@ class LayerVisualizer:
         layer_def = next((d for d in LayerVisualizer.LAYER_DEFS if d["id"] == layer_id), None)
         if layer_def is None:
             return None
-        file_path = os.path.join(project_dir, layer_def["file"])
+        file_path = LayerVisualizer._resolve_layer_path(project_dir, layer_def)
         if not os.path.isfile(file_path):
             return None
         try:
@@ -513,11 +557,27 @@ class LayerVisualizer:
             return None
 
     @staticmethod
+    def _layer_label_with_date(layer_def: dict, file_path: str) -> str:
+        """图层标签附带影像日期（升级点 4：地图界面显示影像日期，DEM 除外）。
+
+        从带日期的文件名（如 landsat_lst_20240701.tif）提取 YYYYMMDD 并
+        格式化为 YYYY-MM-DD 追加到标签后；无日期或 DEM 保持原名。
+        """
+        label = layer_def.get("label", "")
+        if layer_def.get("id") == "dem":
+            return label
+        m = re.search(r"_(\d{8})(?=\.)", os.path.basename(file_path or ""))
+        if not m:
+            return label
+        d = m.group(1)
+        return f"{label}（{d[:4]}-{d[4:6]}-{d[6:]}）"
+
+    @staticmethod
     def list_available_layers(project_dir: str) -> List[dict]:
         """列出所有图层：可用性、默认透明度、默认可见性、WGS84 边界、分组、原生缩放级别"""
         result = []
         for layer_def in LayerVisualizer.LAYER_DEFS:
-            file_path = os.path.join(project_dir, layer_def["file"]) if project_dir else ""
+            file_path = LayerVisualizer._resolve_layer_path(project_dir, layer_def)
             available = bool(file_path) and os.path.isfile(file_path)
             bounds = None
             max_native_zoom = None
@@ -527,7 +587,7 @@ class LayerVisualizer:
                     bounds, max_native_zoom = meta
             result.append({
                 "id": layer_def["id"],
-                "label": layer_def["label"],
+                "label": LayerVisualizer._layer_label_with_date(layer_def, file_path),
                 "group": layer_def.get("group", "图层"),
                 "visible": layer_def.get("visible", False),
                 "opacity": layer_def.get("opacity", 0.7),
@@ -553,7 +613,7 @@ class LayerVisualizer:
         first_layer = True
 
         for layer_def in LayerVisualizer.LAYER_DEFS:
-            if not os.path.isfile(os.path.join(project_dir, layer_def["file"])):
+            if not os.path.isfile(LayerVisualizer._resolve_layer_path(project_dir, layer_def)):
                 continue
             result = LayerVisualizer.render_layer_rgba(layer_def["id"], project_dir)
             if result is None:

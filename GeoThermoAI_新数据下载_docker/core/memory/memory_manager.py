@@ -68,6 +68,29 @@ class MemoryManager:
     def experiment_log(self, project_id: str) -> ExperimentLog:
         return ExperimentLog(str(self.project_memory_dir(project_id) / "experiments.json"))
 
+    def load_used_pairs(self, project_id: str) -> set:
+        """该项目历史使用过的影像对 key 集合（升级点 1/12）。
+
+        从 experiments.json 提取每次实验的 pair（landsat_date + sentinel2_date），
+        用于「已尝试过的影像对不再作为推荐 / 不再提示换对」。key 形如
+        ``20240701_20240702``（Landsat 日期_Sentinel 日期）。
+        """
+        if not project_id:
+            return set()
+        keys = set()
+        try:
+            for rec in self.experiment_log(project_id).all():
+                pair = rec.get("pair")
+                if not isinstance(pair, dict):
+                    continue
+                l = str(pair.get("landsat_date") or "").replace("-", "")[:8]
+                s = str(pair.get("sentinel2_date") or "").replace("-", "")[:8]
+                if l and s:
+                    keys.add(f"{l}_{s}")
+        except Exception as e:
+            logger.warning(f"[memory] 读取已使用配对失败: {e}")
+        return keys
+
     def preferences(self, project_id: str) -> Preferences:
         return Preferences(str(self.project_memory_dir(project_id) / "preferences.json"))
 
@@ -218,7 +241,62 @@ class MemoryManager:
                     f"- {best.get('region', '?')} | {best.get('model', '?')} | "
                     f"R²={test.get('R2')} | 参数 {json.dumps(best.get('params', {}), ensure_ascii=False)}"
                 )
+
+        # 4. 结构化精确查询：从 query 提取研究区/时间/影像对日期 → 历史实验指标
+        block = self.structured_experiment_block(project_id, query)
+        if block:
+            blocks.append(block)
         return "\n\n".join(blocks)
+
+    def structured_experiment_block(self, project_id: str, query: str) -> str:
+        """结构化查询层：从用户 query 提取研究区/时间/影像对日期，
+        精确查历史实验指标并组装为注入文本（不再依赖语义检索猜测）。"""
+        if not project_id or not query:
+            return ""
+        import re as _re
+
+        text = (query or "").strip()
+        start = end = ""
+        m = _re.search(r"(\d{4})\s*年\s*(\d{1,2})\s*月", text)
+        if m:
+            year, month = int(m.group(1)), int(m.group(2))
+            start = f"{year:04d}-{month:02d}-01"
+            end = f"{year:04d}-{month:02d}-31"
+        else:
+            m = _re.search(r"(\d{4})\s*年", text)
+            if m:
+                year = int(m.group(1))
+                start = f"{year:04d}-01-01"
+                end = f"{year:04d}-12-31"
+        # 影像对日期：8 位 YYYYMMDD（Landsat/Sentinel 同日均按此过滤）
+        md = _re.search(r"(?:19|20)\d{2}(?:0[1-9]|1[0-2])(?:[0-2]\d|3[01])", text)
+        pair_date = md.group(0) if md else ""
+        # 研究区：常见地名后缀（省/市/自治州/县/区/镇/乡）
+        rm = _re.search(r"[\u4e00-\u9fa5]{2,8}?(?:省|市|自治州|县|区|镇|乡)", text)
+        region = rm.group(0) if rm else ""
+        if not region and not start and not pair_date:
+            return ""
+        try:
+            hits = self.experiment_log(project_id).query(
+                region=region, start=start, end=end,
+                landsat_date=pair_date, sentinel2_date=pair_date)
+        except Exception as e:
+            logger.warning(f"[memory] 结构化查询失败（已忽略）: {e}")
+            return ""
+        if not hits:
+            return ""
+        lines = []
+        for r in hits[:5]:
+            pair = r.get("pair") or {}
+            test = (r.get("metrics") or {}).get("test") or {}
+            dr = r.get("date_range") or ["", ""]
+            lines.append(
+                f"- {r.get('region', '?')}（{dr[0]} ~ {dr[1]}）："
+                f"测试集 R²={test.get('R2')}，"
+                f"影像对 Landsat {pair.get('landsat_date', '?')} + "
+                f"Sentinel-2 {pair.get('sentinel2_date', '?')}，"
+                f"实验时间 {r.get('timestamp', '?')}")
+        return "## 历史实验精确匹配\n" + "\n".join(lines)
 
     # ── 读取：按角色定制的注入（enrich_prompt 保持原样不动） ──────
 
@@ -266,6 +344,11 @@ class MemoryManager:
                 if prefs:
                     blocks.append("## 用户偏好\n" + "\n".join(
                         f"- {k}：{v}" for k, v in prefs.items()))
+
+            # 结构化查询层：精确查历史实验指标（region/时间/影像对日期）
+            block = self.structured_experiment_block(project_id, query)
+            if block:
+                blocks.append(block)
 
         return "\n\n".join(blocks)
 

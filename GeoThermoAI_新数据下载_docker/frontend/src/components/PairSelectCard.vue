@@ -1,6 +1,7 @@
 <script setup>
 // 影像配对选择卡片（技术方案 9.3）
-// 数据 Agent 打过分时：最优的一组带「（推荐）」并默认选中，但决定权完全在用户，系统不代选。
+// 数据 Agent 打过分时：最优且未尝试过的一组带「（推荐）」并默认选中，但决定权完全在用户，系统不代选。
+// 升级点 1/12：已尝试过的组合带「已尝试」标记且不再带推荐；全部已尝试时不作推荐。
 import { computed, ref, watch } from 'vue'
 import { useChatStore } from '../stores/chat'
 
@@ -10,6 +11,10 @@ const recommendedIndex = computed(() => {
   const i = chat.pairs.findIndex((p) => p.recommended)
   return i >= 0 ? i : 0
 })
+
+const allTried = computed(() =>
+  chat.pairs.length > 0 && chat.pairs.every((p) => p.tried)
+)
 
 const selected = ref(recommendedIndex.value)
 
@@ -44,13 +49,16 @@ function scenesRows(scenes) {
 <template>
   <div class="pair-card">
     <div class="pair-card__title">找到 {{ chat.pairs.length }} 组影像配对，请选择一组</div>
+    <div v-if="allTried" class="pair-card__hint">以上影像组合都已尝试过，请考虑调整其他条件或更换时间范围</div>
     <div class="pair-options">
       <label v-for="(p, i) in chat.pairs" :key="i" class="pair-option" :class="{ 'pair-option--selected': selected === i }">
         <input type="radio" :value="i" v-model="selected" />
         <span class="pair-option__text">
-          {{ i + 1 }}. {{ pairText(p) }}<span v-if="p.recommended" class="pair-option__badge">（推荐）</span>
+          {{ i + 1 }}. {{ pairText(p) }}
+          <span v-if="p.recommended" class="pair-option__badge">（推荐）</span>
+          <span v-else-if="p.tried" class="pair-option__badge pair-option__badge--tried">（已尝试）</span>
         </span>
-        <div v-if="p.recommended && p.recommend_reason" class="pair-option__reason">
+        <div v-if="p.recommend_reason" class="pair-option__reason">
           {{ p.recommend_reason }}
         </div>
         <div class="pair-option__detail">

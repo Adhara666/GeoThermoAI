@@ -221,12 +221,16 @@ def check(plan: Dict[str, Any], *, registry=None, study_areas_dir: str = "",
             note="计划中没有可执行步骤", rule_hits=rule_hits + ["P4"],
             violations=[RULES["P4"]])
 
-    for result in (
-        check_replan_budget(replan_count, replan_max),
-        check_region(plan, study_areas_dir, study_areas),
-        check_time_range(plan, today=today),
-        check_replan_difference(plan, previous_plan),
-    ):
+    checks = [check_replan_budget(replan_count, replan_max)]
+    if plan.get("intent") != "postprocess":
+        # 后处理针对已有结果，不需要新的研究区文件与时间范围，跳过 P1/P2
+        checks += [
+            check_region(plan, study_areas_dir, study_areas),
+            check_time_range(plan, today=today),
+        ]
+    checks.append(check_replan_difference(plan, previous_plan))
+
+    for result in checks:
         if result is not None:
             return plan, ReflectionResult(
                 ok=result.ok, action=result.action, question=result.question,

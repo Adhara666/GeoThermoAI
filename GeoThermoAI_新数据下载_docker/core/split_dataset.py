@@ -24,7 +24,9 @@ from typing import Dict, Optional, Tuple
 from .atomic_io import atomic_write_json
 
 # 默认值均可通过参数覆盖，并非"先验硬写不可更改"；实际取值与依据写入 split_info.json
-DEFAULT_BLOCK_SIZE_PX = 10
+# 实现期修订 v1.3：块边长 10→30（实测鄂州 2024-07 数据：100m 缓冲下排除率 73.6%→27.3%，
+# 进入样本 ×2.75，实际比例 83/8/8→67/16/17，更接近配置 60/20/20；100m 缓冲依据不变）
+DEFAULT_BLOCK_SIZE_PX = 30
 # ≈ Landsat Collection 2 ST_B10 (TIRS) 原生约100m热像元支持尺度（USGS Landsat 8/9
 # 波段说明），作为默认缓冲带宽度的物理依据，而不是随意拍脑袋的数字；可用 guard_buffer_m 覆盖。
 DEFAULT_GUARD_BUFFER_M = 100.0

@@ -297,6 +297,9 @@ def compute_tcr(
     }
 
     tcr_grid_2d = tcr_dense.reshape(coarse_height, coarse_width)
+    # 无 TCR 的 30m 格（约束层外/无子像元）用最近有效 TCR 回退，
+    # 保证每个预测样本都有 TCR（预测数据只按 S2 去云，不再额外扣点）
+    tcr_nearest = grid_mapping.nearest_valid_index(tcr_grid_2d)
     lst_pred_all = np.concatenate(lst_pred_cache) if lst_pred_cache else np.array([], dtype=np.float32)
     del lst_pred_cache, sum_pred, count_pred, mean_pred, lst_true_dense
 
@@ -406,10 +409,23 @@ def compute_tcr(
             if mode == MODE_BLOCK_CONSTANT:
                 if inside.any():
                     local_tcr[inside] = tcr_grid_2d[coarse_row[inside], coarse_col[inside]]
+                # 非 inside 或对应30m格无 TCR（约束层外/无子像元）的预测像元，
+                # 用最近有效 TCR 回退，保证每个预测样本都有 TCR
+                # （预测数据只按 S2 去云，不再额外扣点）。
+                missing = ~np.isfinite(local_tcr)
+                if tcr_nearest is not None and missing.any():
+                    r_c = np.clip(coarse_row[missing], 0, coarse_height - 1)
+                    c_c = np.clip(coarse_col[missing], 0, coarse_width - 1)
+                    local_tcr[missing] = tcr_grid_2d[
+                        tcr_nearest[0][r_c, c_c], tcr_nearest[1][r_c, c_c]
+                    ]
             else:  # smooth_recentered
                 smooth_vals = grid_mapping.interpolate_dense_grid_to_fine(
-                    fine_row_f, fine_col_f, fine_transform, coarse_transform, smooth_interp
+                    fine_row_f, fine_col_f, fine_transform, coarse_transform, smooth_interp,
+                    grid=tcr_grid_2d, nearest_index=tcr_nearest,
                 )
+                # 插值 NaN 已被最近邻回退填平，非 inside 像元直接取回退后的平滑值
+                local_tcr = np.where(np.isfinite(smooth_vals), smooth_vals, np.nan)
                 if inside.any():
                     block_fallback = tcr_grid_2d[coarse_row[inside], coarse_col[inside]]
                     corr = correction_dense[coarse_row[inside], coarse_col[inside]]
