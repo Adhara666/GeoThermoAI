@@ -124,6 +124,8 @@ input, select, textarea { font-family: inherit; }
 .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
 /* 小号确认弹窗（删除项目/删除对话） */
 .modal-card--sm { max-width: 380px; }
+/* 中号确认弹窗（删除项目文案较长，略加宽） */
+.modal-card--md { max-width: 410px; }
 .modal-text { margin: 0 0 6px; font-size: 13px; line-height: 1.6; color: var(--text-secondary); }
 
 /* ── 整体布局 ────────────────────────────────────────────── */
@@ -588,6 +590,8 @@ input, select, textarea { font-family: inherit; }
 .wf-item--running { border-color: var(--primary); background: var(--primary-soft); }
 .wf-item--failed { border-color: #f5c2c2; background: #fdf0f0; }
 .wf-item__icon { width: 18px; text-align: center; }
+/* svg 默认按文本基线对齐会偏上，改为 block 后由 flex align-items:center 垂直居中 */
+.wf-item__icon svg { display: block; margin: 0 auto; }
 .wf-item__label { flex: 1; }
 
 /* ── 响应式 ─────────────────────────────────────────────── */

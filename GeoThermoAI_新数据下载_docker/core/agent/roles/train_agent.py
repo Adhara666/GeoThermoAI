@@ -199,7 +199,8 @@ class TrainAgent(RoleAgent):
             return
 
         ctx.exp_state["tuning_trace"] = [
-            {"round": r["round"], "test_r2": r.get("test_r2"), "rmse": r.get("rmse")}
+            {"round": r["round"], "test_r2": r.get("test_r2"),
+             "rmse": r.get("rmse"), "mae": r.get("mae")}
             for r in self.rounds
         ]
         ctx.exp_state["final_params"] = dict(best.get("params") or {})
@@ -211,7 +212,7 @@ class TrainAgent(RoleAgent):
 
         ctx.emit(f"调优结束（{rounds_text}），采用第 {best['round'] + 1} 轮的结果："
                  f"测试集决定系数 {presentation.fmt_num(best.get('test_r2'))}，"
-                 f"均方根误差 {presentation.fmt_num(best.get('rmse'))} 开尔文\n")
+                 f"均方根误差 {presentation.fmt_num(best.get('rmse'))} K\n")
         if not promoted:
             self.log("最佳轮产物复制未完成，下游将使用最近一次训练的模型")
 
@@ -292,6 +293,7 @@ class TrainAgent(RoleAgent):
             "train_r2": train.get("R2"),
             "test_r2": test.get("R2"),
             "rmse": test.get("RMSE"),
+            "mae": test.get("MAE"),
             "mb": test.get("MB"),
             "output_dir": self._round_dir(ctx, index),
             "raw": dict(data),
@@ -305,14 +307,14 @@ class TrainAgent(RoleAgent):
 
         ctx.emit(f"第 {record['round'] + 1} 轮训练完成：测试集决定系数 "
                  f"{presentation.fmt_num(record.get('test_r2'))}，均方根误差 "
-                 f"{presentation.fmt_num(record.get('rmse'))} 开尔文\n")
+                 f"{presentation.fmt_num(record.get('rmse'))} K\n")
 
     def _decision_summary(self, record: dict) -> str:
         from .. import presentation
 
         parts = [f"测试集决定系数 {presentation.fmt_num(record.get('test_r2'))}"
                  f"（{train_rules.grade(record.get('test_r2'))}）",
-                 f"均方根误差 {presentation.fmt_num(record.get('rmse'))} 开尔文"]
+                 f"均方根误差 {presentation.fmt_num(record.get('rmse'))} K"]
         top = self._top_features(record.get("raw") or {})
         if top:
             parts.append(f"贡献最大的特征是 {top}")
@@ -327,7 +329,7 @@ class TrainAgent(RoleAgent):
         text = (f"第 {record['round'] + 1} 轮：测试集决定系数 "
                 f"{presentation.fmt_num(record.get('test_r2'))}"
                 f"（{train_rules.grade(record.get('test_r2'))}），均方根误差 "
-                f"{presentation.fmt_num(record.get('rmse'))} 开尔文。")
+                f"{presentation.fmt_num(record.get('rmse'))} K。")
         if final.get("note"):
             text += f"规则判定：{final['note']}。"
         return text

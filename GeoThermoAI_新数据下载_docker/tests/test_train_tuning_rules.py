@@ -27,8 +27,9 @@ def _assert(cond, msg):
     print(f"  ✓ {msg}")
 
 
-def _round(i, train_r2, test_r2, rmse, params=None):
+def _round(i, train_r2, test_r2, rmse, params=None, mae=None):
     return {"round": i, "train_r2": train_r2, "test_r2": test_r2, "rmse": rmse,
+            "mae": mae,
             "params": params or {"n_estimators": 200, "max_depth": 25,
                                  "min_samples_leaf": 8}}
 
@@ -120,20 +121,50 @@ def test_r4_clamp():
 
 
 def test_r5_converged():
-    print("[6] R5 收敛提前停")
-    rounds = [_round(0, 0.85, 0.800, 1.40), _round(1, 0.86, 0.805, 1.38)]
-    current = _round(2, 0.86, 0.808, 1.37)
+    print("[6] R5 收敛提前停（R²/MAE/RMSE 三指标都无提升才停）")
+    # 三指标最近两轮提升都 < 0.01 → 收敛停止
+    rounds = [_round(0, 0.85, 0.800, 1.40, mae=2.00),
+              _round(1, 0.86, 0.805, 1.392, mae=1.992)]
+    current = _round(2, 0.86, 0.808, 1.385, mae=1.985)
     out = _guard({"action": Decision.ADJUST, "new_params": {"n_estimators": 400}},
                  current, rounds=rounds)
-    _assert(out["action"] == Decision.STOP, "两轮提升都小于 0.01 → 强制停止")
+    _assert(out["action"] == Decision.STOP, "三指标提升均 < 0.01 → 强制停止")
     _assert("R5" in out["rule_hits"], "命中 R5")
 
-    rounds = [_round(0, 0.85, 0.70, 1.8), _round(1, 0.86, 0.78, 1.5)]
-    current = _round(2, 0.87, 0.84, 1.3)
+    # RMSE 提升 0.02 ≥ 0.01 → 不收敛，继续调优
+    rounds = [_round(0, 0.85, 0.800, 1.40, mae=2.00),
+              _round(1, 0.86, 0.805, 1.38, mae=1.992)]
+    current = _round(2, 0.86, 0.808, 1.37, mae=1.985)
+    out = _guard({"action": Decision.ADJUST, "new_params": {"n_estimators": 400}},
+                 current, rounds=rounds)
+    _assert(out["action"] == Decision.ADJUST, "均方根误差有明显提升 → 继续调优")
+
+    # MAE 提升 0.02 ≥ 0.01 → 不收敛
+    rounds = [_round(0, 0.85, 0.800, 1.40, mae=2.00),
+              _round(1, 0.86, 0.805, 1.392, mae=1.98)]
+    current = _round(2, 0.86, 0.808, 1.385, mae=1.97)
+    out = _guard({"action": Decision.ADJUST, "new_params": {"n_estimators": 400}},
+                 current, rounds=rounds)
+    _assert(out["action"] == Decision.ADJUST, "平均绝对误差有明显提升 → 继续调优")
+
+    # R² 提升 0.015 ≥ 0.01 → 不收敛
+    rounds = [_round(0, 0.85, 0.800, 1.40, mae=2.00),
+              _round(1, 0.86, 0.800, 1.392, mae=1.992)]
+    current = _round(2, 0.86, 0.815, 1.385, mae=1.985)
+    out = _guard({"action": Decision.ADJUST, "new_params": {"n_estimators": 400}},
+                 current, rounds=rounds)
+    _assert(out["action"] == Decision.ADJUST, "决定系数有明显提升 → 继续调优")
+
+    # 提升明显（大跨度）→ 继续
+    rounds = [_round(0, 0.85, 0.70, 1.8, mae=2.6), _round(1, 0.86, 0.78, 1.5, mae=2.2)]
+    current = _round(2, 0.87, 0.84, 1.3, mae=1.9)
     out = _guard({"action": Decision.ADJUST, "new_params": {"n_estimators": 400}},
                  current, rounds=rounds)
     _assert(out["action"] == Decision.ADJUST, "提升明显时继续调优")
     _assert(not train_rules.converged([_round(0, 0.8, 0.8, 1.0)]), "轮数不足不判收敛")
+    _assert(not train_rules.converged(
+        [_round(0, 0.8, 0.80, 1.0, mae=1.5), _round(1, 0.8, 0.80, 1.0, mae=1.5)]),
+        "两轮数据不足三指标比较，不判收敛")
 
 
 def test_r6_deteriorating():
@@ -201,8 +232,10 @@ def test_scripted_loop():
 
     def run_loop(sequence, max_rounds=5, llm_action=Decision.ADJUST):
         rounds = []
-        for i, (train_r2, test_r2, rmse) in enumerate(sequence):
-            current = _round(i, train_r2, test_r2, rmse)
+        for i, item in enumerate(sequence):
+            train_r2, test_r2, rmse = item[0], item[1], item[2]
+            mae = item[3] if len(item) > 3 else None
+            current = _round(i, train_r2, test_r2, rmse, mae=mae)
             out = train_rules.rule_safeguard(
                 {"action": llm_action, "new_params": {"n_estimators": 200 + i * 50}},
                 {"rounds": list(rounds), "current": current, "max_rounds": max_rounds})
@@ -211,14 +244,14 @@ def test_scripted_loop():
                 return i, out, rounds
         return len(sequence) - 1, out, rounds
 
-    # 收敛：三轮提升都很小 → 第 3 轮停
-    stop_at, out, rounds = run_loop([(0.85, 0.800, 1.40), (0.86, 0.805, 1.38),
-                                     (0.86, 0.808, 1.37), (0.86, 0.809, 1.36)])
-    _assert(stop_at == 2 and "R5" in out["rule_hits"], "收敛时在第 3 轮提前停")
+    # 收敛：R²/MAE/RMSE 三轮提升都很小 → 第 3 轮停
+    stop_at, out, rounds = run_loop([(0.85, 0.800, 1.40, 2.00), (0.86, 0.805, 1.395, 1.995),
+                                     (0.86, 0.808, 1.392, 1.992), (0.86, 0.809, 1.390, 1.990)])
+    _assert(stop_at == 2 and "R5" in out["rule_hits"], "三指标收敛时在第 3 轮提前停")
 
     # 恶化：连续下降 → 提前停
-    stop_at, out, rounds = run_loop([(0.88, 0.84, 1.30), (0.87, 0.81, 1.45),
-                                     (0.86, 0.78, 1.55), (0.85, 0.75, 1.70)])
+    stop_at, out, rounds = run_loop([(0.88, 0.84, 1.30, 2.0), (0.87, 0.81, 1.45, 2.2),
+                                     (0.86, 0.78, 1.55, 2.4), (0.85, 0.75, 1.70, 2.6)])
     _assert(stop_at == 2 and "R6" in out["rule_hits"], "恶化时在第 3 轮提前停")
     _assert(train_rules.best_round(rounds)["round"] == 0,
             "最终取误差最低的第 1 轮")

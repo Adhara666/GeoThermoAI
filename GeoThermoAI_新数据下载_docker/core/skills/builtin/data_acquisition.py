@@ -36,6 +36,7 @@ import numpy as np
 from ..base_skill import BaseSkill, SkillParameter, SkillResult
 from ...geo_transform import bbox_wgs84_to_utm_bounds, enable_gdal_osr_exceptions, utm_epsg_for_lonlat
 from ...atomic_io import write_verified
+from ... import manifest as run_manifest
 from . import sentinel2_calibration as s2cal
 
 # 项目根目录
@@ -54,6 +55,29 @@ _DS_DEM_COLLECTION_GLO30 = "cop-dem-glo-30-dged-cog"
 
 # 超时设置
 SAT_API_TIMEOUT = 30  # STAC API 请求超时(秒)
+
+# Data Space STAC 搜索结果短缓存：月度模式「搜索阶段 → 下载阶段」间隔仅数秒，
+# 两阶段查询完全一致，直接复用可彻底避免下载阶段的重复查询（CDSE 网关偶发 504）
+_DS_SEARCH_CACHE: Dict[str, tuple] = {}  # key -> (items, timestamp)
+_DS_SEARCH_CACHE_TTL = 600  # 10 分钟内复用
+_DS_SEARCH_CACHE_LOCK = threading.Lock()  # 模块级 dict 在请求线程间共享，读写加锁
+
+
+def _ds_search_cache_key(bbox, datetime_range: str, cloud_threshold) -> str:
+    """缓存 key：bbox（6 位小数归一）+ 时间范围串 + 云量阈值。"""
+    try:
+        key_bbox = tuple(round(float(x), 6) for x in bbox)
+    except (TypeError, ValueError):
+        key_bbox = tuple(bbox or ())
+    return f"{key_bbox}|{datetime_range}|{cloud_threshold}"
+
+
+def _cloud_threshold_from_query(query) -> float:
+    """从 STAC query 里提取云量阈值（缓存 key 用）；取不到返回 -1.0。"""
+    try:
+        return float((query or {}).get("eo:cloud_cover", {}).get("lt"))
+    except (TypeError, ValueError):
+        return -1.0
 
 # STAC 搜索重试次数与单次 HTTP 请求超时
 _SEARCH_ATTEMPTS = 3
@@ -100,6 +124,19 @@ def _search_items(catalog, log_callback, label: str, attempts: int = _SEARCH_ATT
                 log_callback("WARN", f"{label} 搜索失败（第{i+1}/{attempts}次）: {e}")
             time.sleep(2 * (i + 1))
     return []
+
+
+def _record_manifest_success(output_dir: str, output_paths: Dict[str, str]):
+    """数据下载真正完成后写入 run_manifest（data_acquisition 是唯一不写 manifest 的
+    stage；不写会导致进度面板在容器重启后始终显示"等待"）。"""
+    try:
+        project_root = run_manifest.project_root_from_stage_output_dir(output_dir)
+        run_manifest.record_stage(
+            project_root, "data_acquisition", run_manifest.STATUS_COMPLETED,
+            artifacts={k: v for k, v in (output_paths or {}).items() if v},
+        )
+    except Exception:
+        pass
 
 
 class BandAcquisitionError(RuntimeError):
@@ -215,6 +252,14 @@ class DataAcquisitionSkill(BaseSkill):
         end_date = params.get("end_date", "")
         output_dir = params.get("output_dir", "")
         cloud_threshold = params.get("cloud_threshold", 30)
+        # 月度合成模式：不再强制压低景级云量门槛（原先强制 ≤ 20% 会把"整景云量
+        # 略高于 20%"的角区影像整景滤掉，导致月度合成缺角）。云像元由合成阶段
+        # 的逐像元 SCL/QA 晴空掩膜剔除，景级门槛放宽不影响"无云"。
+        if str(params.get("composite") or "") == "monthly":
+            try:
+                cloud_threshold = int(cloud_threshold or 30)
+            except (TypeError, ValueError):
+                cloud_threshold = 30
         dem_source = params.get("dem_source", "copernicus")
 
         if not region:
@@ -319,19 +364,22 @@ class DataAcquisitionSkill(BaseSkill):
                 log_callback("INFO", "Sentinel-2 下载方式: eodata S3 签名（SigV4）")
 
         sentinel2_items = []
+        ds_catalog = None
         if ds_token:
             try:
-                ds_catalog = Client.open(_DS_STAC_URL, headers={"Authorization": f"Bearer {ds_token}"})
-                s2_search = ds_catalog.search(
-                    collections=[_DS_SENTINEL2_COLLECTION],
-                    bbox=bbox,
-                    datetime=f"{start_date}/{end_date}",
-                    query={"eo:cloud_cover": {"lt": cloud_threshold}},
-                    max_items=100,
+                # timeout=90：避免网关挂起时请求无期等待；搜索失败另有 3 次退避重试
+                ds_catalog = Client.open(
+                    _DS_STAC_URL,
+                    headers={"Authorization": f"Bearer {ds_token}"},
+                    timeout=90,
                 )
-                sentinel2_items = list(s2_search.items())
-                if log_callback and not selected_pair:
-                    log_callback("INFO", f"[Data Space] 找到 {len(sentinel2_items)} 景 Sentinel-2 影像")
+                sentinel2_items = self._search_ds_items(
+                    ds_catalog, [_DS_SENTINEL2_COLLECTION], bbox,
+                    f"{start_date}/{end_date}",
+                    {"eo:cloud_cover": {"lt": cloud_threshold}}, 100,
+                    log_callback, label="Sentinel-2",
+                )
+                if log_callback and not selected_pair and sentinel2_items:
                     from collections import Counter
                     s2_dates = Counter(i.properties.get("datetime", "")[:10] for i in sentinel2_items)
                     for dt, cnt in sorted(s2_dates.items()):
@@ -339,7 +387,7 @@ class DataAcquisitionSkill(BaseSkill):
             except Exception as e:
                 sentinel2_items = []
                 if log_callback:
-                    log_callback("WARN", f"Data Space 搜索失败: {e}，Sentinel-2 回退 Planetary Computer")
+                    log_callback("WARN", f"Data Space 初始化失败: {e}，Sentinel-2 回退 Planetary Computer")
 
         if not sentinel2_items:
             sentinel2_items = _search_items(
@@ -357,32 +405,63 @@ class DataAcquisitionSkill(BaseSkill):
                 for dt, cnt in sorted(s2_dates.items()):
                     log_callback("INFO", f"  {dt}: {cnt} 景")
 
+        # ── 月度合成模式：覆盖度不足时放宽云量门槛自适应补搜（根治缺角）──
+        # 研究区某角区若被"整景云量略高于阈值"的影像覆盖，初始搜索会把它整体
+        # 滤掉，合成结果在该角区为空洞。这里求"研究区 − 已找到影像并集"的缺口
+        # bbox，仅在该角区放宽云量门槛补搜，把下载量限制在缺口范围内。
+        if str(params.get("composite") or "") == "monthly":
+            landsat_items = self._expand_monthly_coverage(
+                landsat_items, label="Landsat", catalog=catalog, ds_catalog=None,
+                collections=["landsat-c2-l2"], bbox=bbox,
+                start_date=start_date, end_date=end_date, cloud_override=90,
+                study_area_geojson=study_area_geojson, ds_token="",
+                log_callback=log_callback)
+            sentinel2_items = self._expand_monthly_coverage(
+                sentinel2_items, label="Sentinel-2", catalog=catalog,
+                ds_catalog=ds_catalog, collections=["sentinel-2-l2a"], bbox=bbox,
+                start_date=start_date, end_date=end_date, cloud_override=90,
+                study_area_geojson=study_area_geojson, ds_token=ds_token,
+                log_callback=log_callback)
+
         # CDSE 下载请求头（Sentinel-2 下载时使用；失败回退时行星计算机不需要）
         ds_headers = {"Authorization": f"Bearer {ds_token}"} if ds_token else None
 
-        # ── 搜索模式：构建配对并返回 ──────────────────────────────
+        # ── 搜索模式：构建配对并返回（月度模式不涉及"配对"，改说由几景合成）──
         if not selected_pair:
+            is_monthly = str(params.get("composite") or "") == "monthly"
             if log_callback:
-                log_callback("INFO", f"开始构建配对: Landsat {len(landsat_items)} 景, Sentinel {len(sentinel2_items)} 景")
+                log_callback("INFO",
+                             ("开始统计该月影像" if is_monthly else "开始构建配对")
+                             + f": Landsat {len(landsat_items)} 景, Sentinel {len(sentinel2_items)} 景")
                 if landsat_items:
                     dates = sorted(set(i.properties.get("datetime","")[:10] for i in landsat_items))
                     log_callback("INFO", f"Landsat 日期: {dates}")
                 if sentinel2_items:
                     dates = sorted(set(i.properties.get("datetime","")[:10] for i in sentinel2_items))
                     log_callback("INFO", f"Sentinel 日期: {dates}")
-            image_pairs = self._build_pairs(
-                landsat_items, sentinel2_items,
-                bbox=bbox, study_area_geojson=study_area_geojson,
-                log_callback=log_callback,
-            )
-            if log_callback:
-                log_callback("INFO", f"配对结果: {len(image_pairs)} 组")
+            if is_monthly:
+                image_pairs = []
+            else:
+                image_pairs = self._build_pairs(
+                    landsat_items, sentinel2_items,
+                    bbox=bbox, study_area_geojson=study_area_geojson,
+                    log_callback=log_callback,
+                )
+                if log_callback:
+                    log_callback("INFO", f"配对结果: {len(image_pairs)} 组")
 
             elapsed = time.time() - t_start
+            if is_monthly:
+                message = (f"找到 {len(landsat_items)} 景 Landsat、{len(sentinel2_items)} 景 Sentinel-2；"
+                           f"当月 Landsat 合成影像由 {len(landsat_items)} 景合成，"
+                           f"Sentinel-2 合成影像由 {len(sentinel2_items)} 景合成"
+                           f"（耗时 {elapsed:.1f}s）")
+            else:
+                message = (f"找到 {len(landsat_items)} 景 Landsat、{len(sentinel2_items)} 景 Sentinel-2，"
+                           f"配对 {len(image_pairs)} 组（耗时 {elapsed:.1f}s）")
             return SkillResult(
                 success=True,
-                message=f"找到 {len(landsat_items)} 景 Landsat、{len(sentinel2_items)} 景 Sentinel-2，"
-                        f"配对 {len(image_pairs)} 组（耗时 {elapsed:.1f}s）",
+                message=message,
                 data={
                     "image_pairs": image_pairs,
                     "landsat_count": len(landsat_items),
@@ -395,10 +474,18 @@ class DataAcquisitionSkill(BaseSkill):
             )
 
         # ── 下载模式：根据用户选择的配对下载 ────────────────────────
+        # 月度模式的 selected_pair 只是「该月代表日」的伪配对，不能对用户说
+        # 「已选择配对 Landsat 2024-07-31 + Sentinel 2024-07-31」（会造成月度
+        # 合成其实是配对 7 月 31 日的误解），改说当月的合成口径。
         if log_callback:
-            lsat_date = selected_pair.get("landsat_date", "")
-            s2_date = selected_pair.get("sentinel2_date", "")
-            log_callback("INFO", f"用户已选择配对: Landsat {lsat_date} + Sentinel {s2_date}")
+            if str(params.get("composite") or "") == "monthly":
+                log_callback("INFO",
+                             "月度合成模式：开始下载该月全部符合云量阈值的影像，"
+                             "逐像元合成当月 Landsat 与 Sentinel-2 月度产品")
+            else:
+                lsat_date = selected_pair.get("landsat_date", "")
+                s2_date = selected_pair.get("sentinel2_date", "")
+                log_callback("INFO", f"用户已选择配对: Landsat {lsat_date} + Sentinel {s2_date}")
 
         selected_landsat_date = selected_pair.get("landsat_date", "")
         selected_sentinel_date = selected_pair.get("sentinel2_date", "")
@@ -426,6 +513,62 @@ class DataAcquisitionSkill(BaseSkill):
         if study_area_geojson:
             _region_key = re.sub(r"[^A-Za-z0-9_\-\u4e00-\u9fff]", "_",
                                  os.path.splitext(os.path.basename(study_area_geojson))[0]) or "region"
+
+        # ── 月度合成模式：该月全部符合云量阈值的影像 → 逐波段月度合成 ──
+        if str(params.get("composite") or "") == "monthly":
+            if log_callback:
+                log_callback("INFO",
+                             f"月度合成模式：将该月全部符合云量阈值（{cloud_threshold}%）的影像"
+                             f"逐像元合成月度产品（合成阶段用 SCL/QA 掩膜剔除云像元）")
+            monthly_paths = self._download_monthly(
+                landsat_items, sentinel2_items, output_dir=output_dir, bbox=bbox,
+                study_area_geojson=study_area_geojson or "",
+                start_date=start_date, end_date=end_date,
+                ds_headers=ds_headers, s3_creds=s3_creds,
+                progress_callback=progress_callback, log_callback=log_callback,
+            )
+            if not monthly_paths.get("ok"):
+                return SkillResult(success=False,
+                                   message=monthly_paths.get("message", "月度合成失败"))
+            paths = monthly_paths.get("output_paths", {})
+            # DEM（共享缓存优先，全项目只下载一次；缓存文件名与配对模式一致）
+            dem_path = os.path.join(output_dir, "dem.tif")
+            _project_dem = os.path.join(_shared_root, f"dem_{_region_key}.tif") if _shared_root else ""
+            if _project_dem and os.path.isfile(_project_dem) and os.path.getsize(_project_dem) > 0:
+                os.makedirs(output_dir, exist_ok=True)
+                shutil.copy2(_project_dem, dem_path)
+                if log_callback:
+                    log_callback("INFO", "DEM 复用项目级共享缓存，跳过下载")
+                paths["dem_path"] = dem_path
+            else:
+                dem_items = _search_items(
+                    catalog, log_callback, "DEM",
+                    collections=["cop-dem-glo-30"], bbox=bbox, max_items=10,
+                )
+                if dem_items:
+                    _dem_target = _project_dem or dem_path
+                    self._download_composite(
+                        items=dem_items, band="data", output_path=_dem_target,
+                        bbox=bbox, scale=30, progress_callback=progress_callback,
+                        log_callback=log_callback, progress_range=(0.72, 0.95),
+                        skill_name="data_acquisition",
+                        study_area_geojson=study_area_geojson,
+                        # DEM 从 Planetary Computer 搜索，不附加 CDSE 凭据
+                    )
+                    if _project_dem and os.path.isfile(_project_dem):
+                        os.makedirs(output_dir, exist_ok=True)
+                        shutil.copy2(_project_dem, dem_path)
+                    paths["dem_path"] = dem_path
+            elapsed = time.time() - t_start
+            _record_manifest_success(output_dir, paths)
+            return SkillResult(
+                success=True,
+                message=f"月度合成完成（{len(landsat_items)} 景 Landsat + "
+                        f"{len(sentinel2_items)} 景 Sentinel-2，耗时 {elapsed:.1f}s）",
+                data={"output_paths": paths, "monthly_composite": True},
+            )
+
+        # 研究区标识（_region_key 已在上面统一计算，供月度/配对共用）
 
         def _land(name: str) -> str:
             return f"{name}_{_ldate}.tif" if _ldate else f"{name}.tif"
@@ -657,6 +800,7 @@ class DataAcquisitionSkill(BaseSkill):
         if progress_callback:
             progress_callback("data_acquisition", 1.0, f"数据下载完成，耗时 {elapsed:.1f}s")
 
+        _record_manifest_success(output_dir, output_paths)
         return SkillResult(
             success=True,
             message=f"数据下载完成: Landsat、Sentinel-2、DEM，耗时 {elapsed:.1f}s",
@@ -1133,6 +1277,62 @@ class DataAcquisitionSkill(BaseSkill):
 
     # ── 下载与合成（GDAL 实现）──────────────────────────────────────
 
+    def _warp_cloud_to_grid(self, url: str, out_path: str, *,
+                            headers: Optional[dict] = None,
+                            bbox: Optional[List[float]] = None,
+                            scale: float = 30, utm_epsg: Optional[int] = None,
+                            study_area_geojson: str = "",
+                            resample: str = "bilinear",
+                            src_nodata=None, dst_nodata: float = 0,
+                            progress_callback=None, label: str = "") -> None:
+        """从云端 COG 按研究区按需读取并 warp 到统一网格（不整景下载）。
+
+        GDAL 对 COG 只拉取 warp 输出窗口（研究区 bbox）覆盖的数据块，
+        传输量 ≈ 研究区大小而非整景。认证方式：
+        - Planetary Computer：URL 已带 SAS 签名，直接读；
+        - Copernicus Data Space：用 /vsicurl/http_header= 内联 Bearer 头。
+        失败抛 BandAcquisitionError（调用方回退整文件下载）。
+        """
+        from osgeo import gdal
+
+        src = url
+        if headers and str(headers.get("Authorization", "")).startswith("Bearer"):
+            import urllib.parse as _up
+            token = str(headers["Authorization"]).replace("Bearer ", "").strip()
+            hdr = f"Authorization: Bearer {token}"
+            src = "/vsicurl/http_header=" + _up.quote(hdr, safe="") + "/" + url
+
+        center_lon = (bbox[0] + bbox[2]) / 2
+        center_lat = (bbox[1] + bbox[3]) / 2
+        utm = utm_epsg or utm_epsg_for_lonlat(center_lon, center_lat)
+        x1, y1, x2, y2 = bbox_wgs84_to_utm_bounds(bbox, utm)
+
+        warp_kwargs = dict(
+            format="GTiff",
+            dstSRS=f"EPSG:{utm}",
+            outputBounds=(x1, y1, x2, y2),
+            xRes=scale,
+            yRes=scale,
+            resampleAlg=resample,
+            srcNodata=src_nodata,
+            dstNodata=dst_nodata,
+            creationOptions=["COMPRESS=LZW", "TILED=YES", "BIGTIFF=YES"],
+            multithread=True,
+        )
+        if study_area_geojson and os.path.isfile(study_area_geojson):
+            warp_kwargs["cutlineDSName"] = study_area_geojson
+            warp_kwargs["cropToCutline"] = True
+
+        ds = None
+        try:
+            ds = gdal.Warp(out_path, src, options=gdal.WarpOptions(**warp_kwargs))
+        except Exception as e:
+            raise BandAcquisitionError(f"云端按需读取失败 ({label}): {e}") from e
+        if ds is None or ds.RasterXSize < 1 or ds.RasterYSize < 1:
+            raise BandAcquisitionError(f"云端按需读取返回空 ({label})")
+        ds.FlushCache()
+        ds = None
+
     def _download_composite(
         self,
         items: list,
@@ -1211,7 +1411,17 @@ class DataAcquisitionSkill(BaseSkill):
             band_files = {b: [] for b in bands_list}
             download_errors = []
 
+            if log_callback:
+                log_callback("INFO",
+                             f"  开始逐景下载（{len(items_sorted)} 景 × {band_count} 个波段，"
+                             f"按云量从低到高）...")
+
             for idx, item in enumerate(items_sorted):
+                if log_callback:
+                    _cloud = (item.properties.get("eo:cloud_cover") or 0) or 0
+                    log_callback("INFO",
+                                 f"  第 {idx + 1}/{len(items_sorted)} 景 {item.id}"
+                                 f"（云量 {float(_cloud):.0f}%）...")
                 if s3_creds or auth_headers:
                     # Copernicus Data Space：asset 无需 SAS 签名，直接带 Bearer/S3 下载
                     scene_item = item
@@ -1245,20 +1455,36 @@ class DataAcquisitionSkill(BaseSkill):
 
                 for b in bands_list:
                     if s3_creds or auth_headers:
-                        # Data Space：asset 名带分辨率后缀（如 B02_10m），前缀匹配
+                        # Data Space：asset 名带分辨率后缀（如 B02_10m），前缀匹配。
+                        # 仅 eodata 域名的资产（S3 桶）才算 CDSE；非 eodata 资产
+                        # （如 Planetary Computer 的 DEM/Landsat）回退 PC 签名，
+                        # 避免把 Azure URL 当 eodata 拆分导致越界。
                         asset = self._find_ds_asset(scene_item.assets, b)
                         if not asset:
                             download_errors.append(f"{item.id}: 缺少波段 {b}")
                             continue
                         url = self._ds_https_url(asset.href)
-                        if s3_creds:
+                        _is_eodata = "eodata.dataspace.copernicus.eu" in url
+                        if _is_eodata and s3_creds:
                             path = url.split("eodata.dataspace.copernicus.eu", 1)[1]
                             headers = self._sign_s3_headers(
                                 s3_creds["access_key"], s3_creds["secret_key"],
                                 "GET", "eodata.dataspace.copernicus.eu", path,
                             )
-                        else:
+                        elif _is_eodata:
                             headers = auth_headers
+                        else:
+                            # 非 eodata 资产：改走 Planetary Computer 签名
+                            signed_item = self._sign_item(item)
+                            if signed_item is None:
+                                download_errors.append(f"{item.id}: 签名失败")
+                                continue
+                            asset = signed_item.assets.get(b)
+                            if not asset:
+                                download_errors.append(f"{item.id}: 缺少波段 {b}")
+                                continue
+                            url = asset.href
+                            headers = None
                     else:
                         # Planetary Computer：每波段下载前重新签名（SAS 短时效，
                         # 长下载后旧签名可能已过期返回 403 —— B02/B03/B04 先下载
@@ -1293,10 +1519,22 @@ class DataAcquisitionSkill(BaseSkill):
                             progress_callback(skill_name, p, f"下载 {label} ({mb:.0f}MB)")
 
                     raw_path = os.path.join(tmp_dir, f"{idx:03d}_{b}_raw.tif")
-                    data_bytes = self._fetch_asset(
+                    # PC 源与 CDSE 统一走「并发分块下载 → 本地 warp」。
+                    # 实测 Azure Blob 对单连接限速（约 0.05MB/s），GDAL 云端按需 warp
+                    # 同样受限于单连接串行 Range 请求；并发分块下载（8 连接）可到
+                    # 约 3.7MB/s，因此不再对 PC 源做 GDAL 云端按需读取。
+                    data_bytes = self._fetch_asset_parallel(
                         url, log_callback, headers=headers,
-                        progress_callback=_dl_progress, progress_label=f"{b} / {item.id}",
+                        progress_callback=_dl_progress,
+                        progress_label=f"{b} / {item.id}",
                     )
+                    if data_bytes is None:
+                        # 并发失败回退单连接流式下载
+                        data_bytes = self._fetch_asset(
+                            url, log_callback, headers=headers,
+                            progress_callback=_dl_progress,
+                            progress_label=f"{b} / {item.id}",
+                        )
                     if data_bytes is None:
                         download_errors.append(f"{item.id}/{b}: 下载失败")
                         continue
@@ -1466,6 +1704,553 @@ class DataAcquisitionSkill(BaseSkill):
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
 
+    # ── 月度合成模式 ────────────────────────────────────────────────
+
+    @staticmethod
+    def _study_area_geometry(geojson_path: str):
+        """加载研究区多边形并集（shapely）；失败或为空返回 None。"""
+        if not geojson_path or not os.path.isfile(geojson_path):
+            return None
+        try:
+            import json
+            from shapely.geometry import shape
+            from shapely.ops import unary_union
+
+            with open(geojson_path, "r", encoding="utf-8") as f:
+                gj = json.load(f)
+            polys = _extract_polygons(gj)
+            if not polys:
+                return None
+            geoms = []
+            for p in polys:
+                try:
+                    g = shape(p)
+                    if g.is_valid and not g.is_empty:
+                        geoms.append(g)
+                except Exception:
+                    pass
+            if not geoms:
+                return None
+            study = unary_union(geoms)
+            return None if study.is_empty else study
+        except Exception:
+            return None
+
+    @staticmethod
+    def _items_footprint(items: list):
+        """影像并集足迹；无有效几何返回 None。"""
+        try:
+            from shapely.geometry import shape
+            from shapely.ops import unary_union
+
+            polys = []
+            for item in items:
+                geom = getattr(item, "geometry", None)
+                if geom and geom.get("type"):
+                    try:
+                        polys.append(shape(geom))
+                    except Exception:
+                        pass
+            if not polys:
+                return None
+            return unary_union(polys)
+        except Exception:
+            return None
+
+    def _coverage_ratio(self, items: list, geojson_path: str,
+                        log_callback=None) -> float:
+        """研究区被给定影像并集覆盖的比例（0~1）；无法计算时返回 1.0（不阻碍流程）。"""
+        if not items or not geojson_path or not os.path.isfile(geojson_path):
+            return 1.0
+        study = self._study_area_geometry(geojson_path)
+        if study is None or study.area <= 0:
+            return 1.0
+        footprint = self._items_footprint(items)
+        if footprint is None or footprint.is_empty:
+            return 0.0
+        try:
+            inter = footprint.intersection(study)
+            ratio = inter.area / study.area if study.area > 0 else 1.0
+            return min(1.0, max(0.0, ratio))
+        except Exception as e:
+            if log_callback:
+                log_callback("WARN", f"覆盖度计算失败: {e}")
+            return 1.0
+
+    @staticmethod
+    def _coverage_gap_bbox(items: list, geojson_path: str):
+        """研究区减去影像并集后剩余区域的 bbox；无缺口返回 None。"""
+        if not items:
+            return None
+        study = DataAcquisitionSkill._study_area_geometry(geojson_path)
+        if study is None:
+            return None
+        footprint = DataAcquisitionSkill._items_footprint(items)
+        if footprint is None or footprint.is_empty:
+            return [float(v) for v in study.bounds]
+        try:
+            gap = study.difference(footprint)
+            if gap.is_empty:
+                return None
+            return [float(v) for v in gap.bounds]
+        except Exception:
+            return None
+
+    def _search_ds_items(self, ds_catalog, collections, bbox, datetime,
+                         query, max_items, log_callback, label="影像",
+                         retries: int = 3) -> list:
+        """Data Space STAC 搜索：短缓存 + 请求超时 + 指数退避重试。
+
+        CDSE 的 STAC 网关（nginx 上游）偶发 504 Gateway Time-out：搜索阶段成功、
+        下载阶段同一条查询再搜却超时。一次失败就回退 Planetary Computer 会让两个
+        阶段数据源不一致（PC item 走 DS 认证 → 403）。这里两条防线：
+          1. 短缓存：月度模式「搜索阶段 → 下载阶段」间隔仅数秒、查询完全一致，
+             命中直接返回，彻底避开下载阶段的重复查询（504 高发场景）；
+          2. 失败后按 2s/4s 退避重试，超时才真正放弃。
+        """
+        import time as _time
+        # 1) 先查缓存（空结果不缓存，保持「无影像 → 回退 Planetary Computer」的行为）
+        key = _ds_search_cache_key(bbox, datetime, _cloud_threshold_from_query(query))
+        with _DS_SEARCH_CACHE_LOCK:
+            hit = _DS_SEARCH_CACHE.get(key)
+            if hit and _time.time() - hit[1] < _DS_SEARCH_CACHE_TTL:
+                if log_callback:
+                    log_callback("INFO",
+                                 f"[Data Space] 使用缓存命中 {len(hit[0])} 景 {label} 影像")
+                return hit[0]
+        # 2) 未命中：带退避重试执行真实搜索
+        last_err = None
+        for attempt in range(retries):
+            try:
+                s = ds_catalog.search(
+                    collections=collections, bbox=bbox, datetime=datetime,
+                    query=query, max_items=max_items,
+                )
+                items = list(s.items())
+                if items:
+                    with _DS_SEARCH_CACHE_LOCK:
+                        _DS_SEARCH_CACHE[key] = (items, _time.time())
+                if log_callback:
+                    log_callback("INFO", f"[Data Space] 找到 {len(items)} 景 {label} 影像")
+                return items
+            except Exception as e:
+                last_err = e
+                if log_callback:
+                    log_callback("WARN",
+                                 f"[Data Space] {label} 搜索失败（第 {attempt + 1}/{retries} 次）: {str(e)[:140]}")
+                if attempt < retries - 1:
+                    _time.sleep(2 * (attempt + 1))
+        if log_callback:
+            log_callback("WARN",
+                         f"[Data Space] {label} 搜索最终失败（{str(last_err)[:140]}），回退 Planetary Computer")
+        return []
+
+    def _search_monthly_extra(self, *, label, catalog, ds_catalog, collections,
+                              bbox, datetime, cloud_threshold, ds_token,
+                              log_callback) -> list:
+        """按缺口 bbox 放宽云量阈值搜索：Sentinel-2 优先 Data Space，其余走 Planetary Computer。"""
+        if ds_catalog is not None and ds_token:
+            return self._search_ds_items(
+                ds_catalog, [_DS_SENTINEL2_COLLECTION], bbox, datetime,
+                {"eo:cloud_cover": {"lt": cloud_threshold}}, 200,
+                log_callback, label=f"{label} 补搜",
+            )
+        if catalog is not None:
+            return _search_items(
+                catalog, log_callback, f"{label} 补搜",
+                collections=collections, bbox=bbox, datetime=datetime,
+                query={"eo:cloud_cover": {"lt": cloud_threshold}},
+                max_items=200,
+            )
+        return []
+
+    def _expand_monthly_coverage(self, items, *, label, catalog, ds_catalog,
+                                 collections, bbox, start_date, end_date,
+                                 cloud_override, study_area_geojson, ds_token,
+                                 log_callback) -> list:
+        """月度模式覆盖度不足时放宽云量门槛补搜（只并入新景），根治月度合成缺角。
+
+        研究区某角区若被"整景云量略高于阈值"的影像覆盖，初始搜索会把它整体滤掉，
+        合成结果在该角区出现空洞。这里求"研究区 − 已找到影像并集"的缺口 bbox，
+        仅在该角区放宽云量门槛（cloud_override）补搜并按 item.id 去重，把额外
+        下载量限制在缺口范围内。
+        """
+        coverage = self._coverage_ratio(items, study_area_geojson, log_callback)
+        if coverage >= 0.95:
+            return items
+        gap = self._coverage_gap_bbox(items, study_area_geojson)
+        if not gap:
+            return items
+        if log_callback:
+            log_callback("WARN",
+                         f"[月度] {label} 覆盖度 {coverage*100:.1f}% < 95%，"
+                         f"缺口角区 bbox {gap}，放宽云量门槛（< {cloud_override}%）补搜")
+        extra = self._search_monthly_extra(
+            label=label, catalog=catalog, ds_catalog=ds_catalog,
+            collections=collections, bbox=gap,
+            datetime=f"{start_date}/{end_date}",
+            cloud_threshold=cloud_override, ds_token=ds_token,
+            log_callback=log_callback,
+        )
+        seen = {getattr(i, "id", "") for i in items}
+        added = [i for i in extra if getattr(i, "id", "") not in seen]
+        if added and log_callback:
+            log_callback("INFO", f"[月度] 补搜并入 {len(added)} 景 {label}（补齐缺口角区）")
+        return items + added
+
+    def _download_monthly(self, landsat_items: list, sentinel2_items: list, *,
+                          output_dir: str, bbox: List[float],
+                          study_area_geojson: str = "",
+                          start_date: str = "", end_date: str = "",
+                          ds_headers: Optional[dict] = None,
+                          s3_creds: Optional[dict] = None,
+                          progress_callback=None, log_callback=None) -> dict:
+        """月度合成模式：把该月全部符合云量阈值的影像逐波段合成一张月度影像。
+
+        每景经下载 → 本地 warp 到统一网格，再做**像元级中位数合成**；
+        合成阶段用逐景晴空掩膜（Landsat QA_PIXEL / Sentinel-2 SCL）只统计无云像元，
+        保证月度产品无云；某像元全月无任何无云观测时才置 NoData。
+        产物文件名带该月代表日（月末日），与配对模式下游完全同构；
+        并在配对目录根写 `.monthly_composite` 标记，供图层标签显示为 YYYY-M。
+        """
+        from osgeo import gdal
+        from ...monthly_composite import composite_median
+
+        rep_date = (end_date or start_date or "")[:10] or ""
+        _lbl = rep_date.replace("-", "")
+        if not _lbl:
+            _lbl = "month"
+        # 需求 4：文件名带 YYYYMMDD 日期（月度合成用该月代表日）
+        landsat_lst_file = f"landsat_lst_{_lbl}.tif" if _lbl else "landsat_lst.tif"
+        landsat_qa_file = f"landsat_qa_pixel_{_lbl}.tif" if _lbl else "landsat_qa_pixel.tif"
+        sentinel2_bands_file = f"sentinel2_bands_{_lbl}.tif" if _lbl else "sentinel2_bands.tif"
+        sentinel2_scl_file = f"sentinel2_scl_{_lbl}.tif" if _lbl else "sentinel2_scl.tif"
+
+        center_lon = (bbox[0] + bbox[2]) / 2
+        center_lat = (bbox[1] + bbox[3]) / 2
+        utm_epsg = utm_epsg_for_lonlat(center_lon, center_lat)
+
+        tmp_dir = tempfile.mkdtemp(prefix="gdal_monthly_")
+        output_paths: Dict[str, str] = {}
+        try:
+            def _scene_url(item, band_key, scale, resample):
+                """返回 (url, headers)；无法解析返回 None。
+
+                Landsat 永远从 Planetary Computer 取（SAS 签名 URL）；Sentinel-2
+                配置了 CDSE 凭据时优先 Copernicus Data Space（S3 SigV4 或 Bearer）。
+                关键：**只有资产 href 确实是 eodata/DS 域名才走 DS 认证**；DS 搜索
+                失败回退 Planetary Computer 后，item 是 PC 的（Azure blob URL），
+                此时必须走 PC 签名，否则把 DS 的 Authorization 头带到 Azure blob
+                会被拒（403 Server failed to authenticate）。
+                """
+                _cid = str(getattr(item, "collection_id", "") or "").lower()
+                _is_landsat = "landsat" in _cid
+                if (s3_creds or ds_headers) and not _is_landsat:
+                    asset = self._find_ds_asset(item.assets, band_key)
+                    url = self._ds_https_url(getattr(asset, "href", "") or "") if asset is not None else ""
+                    if asset is not None and "eodata.dataspace.copernicus.eu" in url:
+                        # 真 Data Space 资产：S3 SigV4 或 Bearer
+                        if s3_creds:
+                            path = url.split("eodata.dataspace.copernicus.eu", 1)[1]
+                            hdrs = self._sign_s3_headers(
+                                s3_creds["access_key"], s3_creds["secret_key"],
+                                "GET", "eodata.dataspace.copernicus.eu", path,
+                            )
+                        else:
+                            hdrs = ds_headers
+                        return url, hdrs
+                    # 非 eodata 资产（含 DS 回退 Planetary Computer 后的 item）：
+                    # 落到下方走 PC 签名
+                signed = self._sign_item(item)
+                if signed is None:
+                    return None, None
+                asset = signed.assets.get(band_key)
+                if asset is None:
+                    return None, None
+                return asset.href, None
+
+            def _qa_clear(qa):
+                """Landsat Collection 2 QA_PIXEL 晴空像元：无 fill/云/阴影/卷云/积雪扩展。"""
+                qa = np.asarray(qa, dtype=np.uint16)
+                cloud_bits = np.uint16((1 << 1) | (1 << 2) | (1 << 3) | (1 << 4))
+                return ((qa & cloud_bits) == 0) & ((qa & np.uint16(1)) == 0)
+
+            def _scl_clear(scl):
+                """Sentinel-2 SCL 晴空像元：植被(4)/裸土(5)/水体(6)。"""
+                return np.isin(np.asarray(scl), (4, 5, 6))
+
+            def _write_mask_like(grid_path, mask_path, mask):
+                """按 grid 的地理参考写出 uint8 掩膜（1=晴空，0=云/无效）。"""
+                src = gdal.Open(grid_path)
+                if src is None:
+                    return False
+                gt = src.GetGeoTransform()
+                prj = src.GetProjection()
+                w, h = src.RasterXSize, src.RasterYSize
+                src = None
+                ds = gdal.GetDriverByName("GTiff").Create(
+                    mask_path, w, h, 1, gdal.GDT_Byte,
+                    options=["COMPRESS=LZW", "TILED=YES"])
+                if ds is None:
+                    return False
+                ds.SetGeoTransform(gt)
+                ds.SetProjection(prj)
+                band = ds.GetRasterBand(1)
+                band.WriteArray(np.asarray(mask, dtype=np.uint8))
+                band.FlushCache()
+                ds = None
+                return True
+
+            def _build_clear_masks(items, band_key, scales, clear_fn,
+                                   nodata_pair=(0, 0)):
+                """为每景生成统一网格上的晴空掩膜（1=晴空，0=云/无效）。
+
+                每景只下载一次质量波段（QA_PIXEL / SCL），按 scales 中每个目标
+                分辨率各 warp 一次并出掩膜。返回 {scale: {idx: mask_path}}。
+                """
+                masks_by_scale = {s: {} for s in scales}
+                for idx, item in enumerate(items):
+                    url, headers = _scene_url(item, band_key, scales[0], "near")
+                    if url is None:
+                        continue
+                    raw_path = os.path.join(tmp_dir, f"{idx:03d}_{band_key}_mask_raw.tif")
+                    _mask_label = f"晴空掩膜 第 {idx + 1}/{len(items)} 景"
+                    data_bytes = self._fetch_asset_parallel(
+                        url, log_callback, headers=headers,
+                        progress_callback=None,
+                        progress_label=_mask_label,
+                    )
+                    if data_bytes is None:
+                        data_bytes = self._fetch_asset(
+                            url, log_callback, headers=headers,
+                            progress_callback=None,
+                            progress_label=_mask_label,
+                        )
+                    if data_bytes is None:
+                        if log_callback:
+                            log_callback("WARN", f"  {_mask_label}（{item.id}）: 掩膜数据下载失败，跳过")
+                        continue
+                    with open(raw_path, "wb") as f:
+                        f.write(data_bytes)
+                    for s in scales:
+                        grid_path = os.path.join(tmp_dir, f"{idx:03d}_{band_key}_mask_s{s}.tif")
+                        try:
+                            self._warp_cloud_to_grid(
+                                raw_path, grid_path, headers=None, bbox=bbox, scale=s,
+                                utm_epsg=utm_epsg,
+                                study_area_geojson=study_area_geojson or "",
+                                resample="near", src_nodata=nodata_pair[0],
+                                dst_nodata=nodata_pair[1],
+                                progress_callback=None,
+                                label=_mask_label,
+                            )
+                        except Exception as e:
+                            if log_callback:
+                                log_callback("WARN", f"  {_mask_label}（{item.id}）: 掩膜网格化失败，跳过: {str(e)[:120]}")
+                            continue
+                        src = gdal.Open(grid_path)
+                        if src is None:
+                            continue
+                        arr = src.GetRasterBand(1).ReadAsArray()
+                        src = None
+                        if arr is None:
+                            continue
+                        mask_path = os.path.join(tmp_dir, f"{idx:03d}_{band_key}_mask{s}.tif")
+                        if _write_mask_like(grid_path, mask_path, clear_fn(arr)):
+                            masks_by_scale[s][idx] = mask_path
+                return masks_by_scale
+
+            # ── 预生成逐景晴空掩膜：Landsat QA_PIXEL(30m)；Sentinel-2 SCL(10m 供
+            # 多光谱、20m 供 SCL 波段自身) ──
+            if log_callback:
+                log_callback("INFO",
+                             f"  开始生成 Landsat 晴空掩膜（QA_PIXEL 云标记，{len(landsat_items)} 景，30m）...")
+            landsat_masks_30m = _build_clear_masks(
+                landsat_items, "qa_pixel", (30,), clear_fn=_qa_clear, nodata_pair=(1, 1))[30]
+            if log_callback:
+                log_callback("INFO",
+                             f"  开始生成 Sentinel-2 晴空掩膜（SCL 场景分类，{len(sentinel2_items)} 景，10m/20m）...")
+            s2_masks = _build_clear_masks(
+                sentinel2_items, "SCL", (10, 20), clear_fn=_scl_clear, nodata_pair=(0, 0))
+            s2_masks_10m, s2_masks_20m = s2_masks[10], s2_masks[20]
+
+            def _monthly_band(items, band_key, out_path, scale, resample,
+                              s2_cal: bool = False, nodata_pair=(0, 0),
+                              clear_masks=None, label: str = "") -> bool:
+                """该波段月度合成：每景 warp 到统一网格 → 云掩膜中位数。返回是否成功。"""
+                if log_callback:
+                    log_callback("INFO",
+                                 f"  开始处理{label}：逐景下载 {len(items)} 景并合成该月月度影像...")
+                grid_files = []
+                mask_files = []
+                for idx, item in enumerate(items):
+                    url, headers = _scene_url(item, band_key, scale, resample)
+                    if url is None:
+                        if log_callback:
+                            log_callback("WARN", f"  {item.id}: 缺少波段 {band_key}，跳过")
+                        continue
+                    raw_path = os.path.join(tmp_dir, f"{idx:03d}_{band_key}_raw.tif")
+                    grid_path = os.path.join(tmp_dir, f"{idx:03d}_{band_key}_grid.tif")
+                    # 统一走「并发分块下载 → 本地 warp 到统一网格」：
+                    # 实测 Azure Blob 对单连接限速（约 0.05MB/s），GDAL 云端按需 warp
+                    # 同样受限于单连接串行 Range 请求；并发分块下载（8 连接）约 3.7MB/s，
+                    # 因此 PC 源（COG）与 CDSE（JP2 等）都不再依赖 GDAL 云端按需读取。
+                    _dl_label = f"{label} 第 {idx + 1}/{len(items)} 景"
+                    data_bytes = self._fetch_asset_parallel(
+                        url, log_callback, headers=headers,
+                        progress_callback=None,
+                        progress_label=_dl_label,
+                    )
+                    if data_bytes is None:
+                        data_bytes = self._fetch_asset(
+                            url, log_callback, headers=headers,
+                            progress_callback=None,
+                            progress_label=_dl_label,
+                        )
+                    if data_bytes is None:
+                        if log_callback:
+                            log_callback("WARN", f"  {item.id}/{band_key}: 下载失败，跳过")
+                        continue
+                    with open(raw_path, "wb") as f:
+                        f.write(data_bytes)
+                    try:
+                        self._warp_cloud_to_grid(
+                            raw_path, grid_path, headers=None, bbox=bbox, scale=scale,
+                            utm_epsg=utm_epsg, study_area_geojson=study_area_geojson or "",
+                            resample=resample, src_nodata=nodata_pair[0],
+                            dst_nodata=nodata_pair[1],
+                            progress_callback=progress_callback,
+                            label=f"{band_key} / {item.id} (本地)",
+                        )
+                    except Exception as e:
+                        if log_callback:
+                            log_callback("WARN", f"  {item.id}/{band_key}: 网格化失败，跳过: {str(e)[:120]}")
+                        continue
+                    if s2_cal:
+                        try:
+                            # product-metadata 的认证与 _download_composite 一致：
+                            # eodata 的 MTD XML 用 S3 SigV4 签名（Bearer 对 S3 无效→403）
+                            pm = (item.assets.get("product-metadata")
+                                  or item.assets.get("product_metadata"))
+                            xml_headers = None
+                            if (pm is not None
+                                    and getattr(pm, "href", "").startswith("s3://eodata/")):
+                                if s3_creds:
+                                    _pm_url = self._ds_https_url(pm.href)
+                                    _pm_path = _pm_url.split(
+                                        "eodata.dataspace.copernicus.eu", 1)[1]
+                                    xml_headers = self._sign_s3_headers(
+                                        s3_creds["access_key"], s3_creds["secret_key"],
+                                        "GET", "eodata.dataspace.copernicus.eu", _pm_path)
+                                elif ds_headers:
+                                    xml_headers = ds_headers
+                            cal = s2cal.fetch_scene_calibration(
+                                item, log_callback=log_callback, headers=xml_headers)
+                            offset = s2cal.offset_for_band(cal, band_key)
+                            corr = grid_path.replace(".tif", "_corr.tif")
+                            self._apply_s2_offset_correction(grid_path, corr, offset)
+                            grid_files.append(corr)
+                        except Exception as e:
+                            if log_callback:
+                                log_callback("WARN", f"  {item.id}/{band_key}: 按景定标失败，跳过: {e}")
+                            continue
+                    else:
+                        grid_files.append(grid_path)
+                    mask_files.append((clear_masks or {}).get(idx))
+                if not grid_files:
+                    if log_callback:
+                        log_callback("ERROR", f"  月度合成 {label}: 没有任何可用景")
+                    return False
+                if log_callback:
+                    log_callback("INFO",
+                                 f"  {label}：{len(grid_files)}/{len(items)} 景已就绪，"
+                                 f"开始像元级中位数合成（晴空掩膜剔除云像元）...")
+                composite_median(
+                    grid_files, out_path, mask_paths=mask_files,
+                    progress_callback=lambda _s, _p, _m: (
+                        progress_callback("data_acquisition", 0.5 + 0.3 * _p, _m)
+                        if progress_callback else None),
+                )
+                self._build_overviews(
+                    out_path, "NEAREST" if band_key in ("SCL", "qa_pixel", "QA_PIXEL") else "AVERAGE",
+                    log_callback=log_callback, band_label=label,
+                )
+                if log_callback:
+                    log_callback("INFO", f"  {label}：月度合成完成")
+                return True
+
+            # ── Landsat 月度合成（ST_B10 + QA，30m，QA 云掩膜）──
+            if progress_callback:
+                progress_callback("data_acquisition", 0.13, f"月度合成 Landsat 地表温度（{len(landsat_items)} 景）...")
+            landsat_lst_path = os.path.join(output_dir, landsat_lst_file)
+            if _monthly_band(landsat_items, "lwir11", landsat_lst_path, 30, "bilinear",
+                             nodata_pair=(0, 0), clear_masks=landsat_masks_30m,
+                             label="Landsat 地表温度"):
+                output_paths["landsat_path"] = landsat_lst_path
+            landsat_qa_path = os.path.join(output_dir, landsat_qa_file)
+            if _monthly_band(landsat_items, "qa_pixel", landsat_qa_path, 30, "near",
+                             nodata_pair=(1, 1), clear_masks=landsat_masks_30m,
+                             label="Landsat 质量标记"):
+                output_paths["qa_path"] = landsat_qa_path
+
+            # ── Sentinel-2 月度合成（多光谱 10m + SCL 20m，SCL 云掩膜）──
+            if progress_callback:
+                progress_callback("data_acquisition", 0.42, f"月度合成 Sentinel-2 多光谱（{len(sentinel2_items)} 景）...")
+            s2_bands_path = os.path.join(output_dir, sentinel2_bands_file)
+            # 多波段合并：逐波段合成后 BuildVRT 合并
+            band_srcs = []
+            for b in ("B02", "B03", "B04", "B08", "B11"):
+                tmp_band = os.path.join(tmp_dir, f"monthly_{b}.tif")
+                if _monthly_band(sentinel2_items, b, tmp_band, 10, "bilinear",
+                                 s2_cal=True, clear_masks=s2_masks_10m,
+                                 label=f"Sentinel-2 波段 {b}"):
+                    band_srcs.append(tmp_band)
+            if band_srcs:
+                vrt_path = os.path.join(tmp_dir, "monthly_s2.vrt")
+                vrt_ds = gdal.BuildVRT(vrt_path, band_srcs, separate=True, resolution="highest")
+                if vrt_ds is None:
+                    raise BandAcquisitionError("月度 Sentinel-2 多波段 BuildVRT 失败")
+                vrt_ds = None
+                trans_ds = gdal.Translate(
+                    s2_bands_path, vrt_path,
+                    format="GTiff",
+                    creationOptions=["COMPRESS=LZW", "TILED=YES", "BIGTIFF=YES",
+                                    "BLOCKXSIZE=256", "BLOCKYSIZE=256"],
+                )
+                if trans_ds is None:
+                    raise BandAcquisitionError("月度 Sentinel-2 多波段 Translate 失败")
+                trans_ds = None
+                self._build_overviews(s2_bands_path, "AVERAGE",
+                                      log_callback=log_callback, band_label="B02+...")
+                output_paths["sentinel2_path"] = s2_bands_path
+
+            s2_scl_path = os.path.join(output_dir, sentinel2_scl_file)
+            if _monthly_band(sentinel2_items, "SCL", s2_scl_path, 20, "near",
+                             nodata_pair=(0, 0), clear_masks=s2_masks_20m,
+                             label="Sentinel-2 场景分类"):
+                output_paths["scl_path"] = s2_scl_path
+
+            if not output_paths:
+                return {"ok": False, "message": "月度合成失败：没有生成任何波段",
+                        "output_paths": output_paths}
+
+            # ── 月度合成标记：配对目录根写 .monthly_composite，供图层标签识别 ──
+            _marker_dir = output_dir.rstrip("/\\")
+            if os.path.basename(_marker_dir) == "raw":
+                _marker_dir = os.path.dirname(_marker_dir)
+            try:
+                os.makedirs(_marker_dir, exist_ok=True)
+                with open(os.path.join(_marker_dir, ".monthly_composite"), "w",
+                          encoding="utf-8") as _mf:
+                    _mf.write("")
+            except Exception as e:
+                if log_callback:
+                    log_callback("WARN", f"写入月度合成标记文件失败: {e}")
+
+            return {"ok": True, "message": "月度合成完成", "output_paths": output_paths}
+        finally:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
     # ── 内建 overview 金字塔 ────────────────────────────────────
 
     @staticmethod
@@ -1511,6 +2296,8 @@ class DataAcquisitionSkill(BaseSkill):
         """
         import time as _time
         last_err = None
+        # 下载日志统一带 progress_label（波段/景）前缀，日志里能直接看出在下载什么
+        _tag = f"{progress_label}: " if progress_label else ""
         for attempt in range(5):
             t0 = _time.time()
             timeout = min(120 + attempt * 45, 300)
@@ -1526,7 +2313,7 @@ class DataAcquisitionSkill(BaseSkill):
                 ))
                 sess.trust_env = False
                 if log_callback and attempt == 0:
-                    log_callback("INFO", f"  开始下载 ({timeout}s超时): {url[:70]}...")
+                    log_callback("INFO", f"  {_tag}开始下载 ({timeout}s超时): {url[:70]}...")
                 resp = sess.get(url, timeout=timeout, headers=headers, stream=True)
                 resp.raise_for_status()
                 try:
@@ -1551,7 +2338,7 @@ class DataAcquisitionSkill(BaseSkill):
                 sess.close()
                 elapsed = _time.time() - t0
                 if log_callback:
-                    log_callback("INFO", f"  下载完成 ({elapsed:.1f}s, {len(data)/1024/1024:.1f}MB)")
+                    log_callback("INFO", f"  {_tag}下载完成 ({elapsed:.1f}s, {len(data)/1024/1024:.1f}MB)")
                 return data
             except requests.exceptions.RequestException as e:
                 elapsed = _time.time() - t0
@@ -1564,14 +2351,133 @@ class DataAcquisitionSkill(BaseSkill):
                 ))
                 if log_callback:
                     if is_network_flap and attempt < 4:
-                        log_callback("WARN", f"  网络抖动 ({type(e).__name__}), 第{attempt+1}/5次重试...")
+                        log_callback("WARN", f"  {_tag}网络抖动 ({type(e).__name__}), 第{attempt+1}/5次重试...")
                     else:
-                        log_callback("WARN", f"  下载失败 ({elapsed:.1f}s, 第{attempt+1}次): {e}")
+                        log_callback("WARN", f"  {_tag}下载失败 ({elapsed:.1f}s, 第{attempt+1}次): {e}")
                 sleep_sec = min(2 ** attempt, 15)
                 _time.sleep(sleep_sec)
         if log_callback:
-            log_callback("WARN", f"  下载最终失败 (5次重试): {last_err}")
+            log_callback("WARN", f"  {_tag}下载最终失败 (5次重试): {last_err}")
         return None
+
+    @staticmethod
+    def _fetch_asset_parallel(url: str, log_callback, headers: Optional[dict] = None,
+                              workers: int = 8, chunk_mb: int = 4,
+                              progress_callback=None, progress_label: str = "") -> Optional[bytes]:
+        """并发分块 Range 下载（多连接绕过 Azure 对单连接限速）。
+
+        实测（Planetary Computer 的 Azure Blob）：单连接持续传输仅约 0.05MB/s
+        （90MB 需约 30 分钟，GDAL 云端按需 warp 也因单连接串行请求而极慢）；
+        8 连接 × 4MB 块可达约 3.7MB/s（90MB 约 23 秒）。因此大文件统一走
+        并发分块下载后本地 warp，不再依赖 GDAL 云端按需读取。
+
+        小文件（≤16MB）回退单连接流式下载（_fetch_asset），避免分块开销。
+        任一块重试后仍失败则返回 None，由调用方回退 _fetch_asset 单连接。
+        """
+        import time as _time
+        import concurrent.futures
+        from requests.adapters import HTTPAdapter
+
+        def _make_session() -> requests.Session:
+            s = requests.Session()
+            s.trust_env = False
+            adapter = HTTPAdapter(pool_connections=0, pool_maxsize=0, max_retries=0)
+            s.mount("https://", adapter)
+            s.mount("http://", adapter)
+            return s
+
+        # 探测文件大小（GET + Range(0-0)）：S3 SigV4 签名按 HTTP 方法签名，
+        # HEAD 请求的签名与 GET 不匹配会 403（eodata 的 S3 签名 URL）。
+        # GET Range 与分块下载同方法，签名一致；Content-Range 里带总大小。
+        # 探测带 3 次重试：CDSE/网络偶发 SSL EOF、连接被中断（如
+        # SSLEOFError）时不能一次失败就放弃并发下载。
+        size = 0
+        probe_err = None
+        _tag = f"{progress_label}: " if progress_label else ""
+        for probe_attempt in range(3):
+            try:
+                s0 = _make_session()
+                try:
+                    probe_headers = dict(headers or {})
+                    probe_headers["Range"] = "bytes=0-0"
+                    resp = s0.get(url, headers=probe_headers, timeout=30)
+                    resp.raise_for_status()
+                    size = int(resp.headers.get("Content-Length") or 0)
+                    cr = resp.headers.get("Content-Range") or ""
+                    if "/" in cr:
+                        size = int(cr.rsplit("/", 1)[-1])
+                    if size <= 0:
+                        raise RuntimeError(f"无法获取文件大小 (Content-Length={size})")
+                    break
+                finally:
+                    s0.close()
+            except Exception as e:
+                probe_err = e
+                if log_callback and probe_attempt < 2:
+                    log_callback("WARN", f"  {_tag}并发下载探测失败（第{probe_attempt+1}/3次，将重试）: {str(e)[:100]}")
+                _time.sleep(1 + probe_attempt)
+        if size <= 0:
+            if log_callback:
+                log_callback("WARN", f"  {_tag}并发下载探测最终失败（回退单连接下载）: {str(probe_err)[:120]}")
+            return None
+        if size <= 16 * 1024 * 1024:
+            return DataAcquisitionSkill._fetch_asset(
+                url, log_callback, headers=headers,
+                progress_callback=progress_callback, progress_label=progress_label)
+
+        chunk = chunk_mb * 1024 * 1024
+        n = (size + chunk - 1) // chunk
+        buf = bytearray(size)
+        if log_callback:
+            log_callback("INFO", f"  {_tag}并发下载 {size/1024/1024:.0f}MB（{n} 块 × {workers} 连接）")
+
+        def _dl_block(idx: int):
+            start = idx * chunk
+            end = min(start + chunk - 1, size - 1)
+            req_headers = dict(headers or {})
+            req_headers["Range"] = f"bytes={start}-{end}"
+            last_err = ""
+            for attempt in range(3):
+                s = _make_session()
+                try:
+                    r = s.get(url, headers=req_headers, timeout=180)
+                    if r.status_code in (200, 206) and len(r.content) == end - start + 1:
+                        return idx, r.content
+                    last_err = f"块{idx} status={r.status_code} len={len(r.content)}"
+                except Exception as e:
+                    last_err = f"块{idx}: {e}"
+                finally:
+                    s.close()
+                _time.sleep(1 + attempt)
+            raise RuntimeError(last_err)
+
+        t0 = _time.time()
+        done_bytes = 0
+        try:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+                futs = {ex.submit(_dl_block, i): i for i in range(n)}
+                for fut in concurrent.futures.as_completed(futs):
+                    idx, data = fut.result()
+                    buf[idx * chunk: idx * chunk + len(data)] = data
+                    done_bytes += len(data)
+                    if progress_callback:
+                        progress_callback(done_bytes, size, progress_label)
+        except Exception as e:
+            if log_callback:
+                log_callback(
+                    "WARN",
+                    f"  并发下载失败（{n} 块，已 {done_bytes/1024/1024:.0f}MB）: {str(e)[:120]}",
+                )
+            return None
+        elapsed = _time.time() - t0
+        if log_callback:
+            log_callback(
+                "INFO",
+                f"  并发下载完成 ({elapsed:.1f}s, {size/1024/1024:.1f}MB, "
+                f"{size/1024/1024/max(elapsed, 0.01):.1f}MB/s)",
+            )
+        return bytes(buf)
+
 
     # ── SAS Token 签名 ──────────────────────────────────────────────
 

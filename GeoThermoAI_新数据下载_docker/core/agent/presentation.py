@@ -6,7 +6,7 @@
 1. 气泡文案一律中文，不出现英文技能名（如 data_acquisition）、变量名（如 train_csv）、
    JSON、文件路径、堆栈。
 2. 气泡文案不使用表情符号。状态用中文词表达：开始 / 完成 / 未通过 / 已暂停 / 已停止。
-3. 数字保留，但要带中文单位与含义：测试集决定系数 0.87、均方根误差 1.23 开尔文、
+3. 数字保留，但要带中文单位与含义：测试集决定系数 0.87、均方根误差 1.23 K、
    有效像元 4,231,905 个。
 4. 一切技术细节（路径、参数字典、进度百分比、原始报错）只走 on_log 进日志面板，
    不进气泡。执行引擎的 `_emit(text, to_log=True)` 机制已支持。
@@ -62,7 +62,7 @@ LEGACY_STEP_DESCRIPTIONS: Dict[str, str] = {
 }
 
 STAGE_DESCRIPTIONS: Dict[str, str] = {
-    "data_acquisition": "搜索并下载陆地卫星、哨兵二号与数字高程数据",
+    "data_acquisition": "搜索并下载 Landsat 8/9、Sentinel-2 与 DEM 数据",
     "data_pipeline": "预处理并划分数据集，生成训练数据、约束层与预测格网",
     "ttri_compute": "拟合地形热响应指数并空间化到粗细两套格网",
     "rf_model": "训练降尺度模型并输出独立预测精度",
@@ -193,7 +193,7 @@ def _summarize_data_acquisition(data: Dict[str, Any]) -> str:
     if pairs:
         return f"影像检索完成：找到 {fmt_count(len(pairs))} 组可用的影像组合"
     if data.get("landsat_path"):
-        return "影像下载完成：陆地卫星地表温度、哨兵二号多光谱与数字高程数据均已就位"
+        return "影像下载完成：Landsat 8/9 地表温度、Sentinel-2 多光谱与 DEM 数据均已就位"
     return "影像检索完成"
 
 
@@ -221,12 +221,12 @@ def _summarize_ttri(data: Dict[str, Any]) -> str:
 def _summarize_rf_model(data: Dict[str, Any]) -> str:
     test = data.get("test_metrics") or {}
     return (f"模型训练完成：测试集决定系数 {fmt_num(test.get('R2'))}，"
-            f"均方根误差 {fmt_num(test.get('RMSE'))} 开尔文")
+            f"均方根误差 {fmt_num(test.get('RMSE'))} K")
 
 
 def _summarize_tcr(data: Dict[str, Any]) -> str:
     stats = data.get("tcr_statistics") or {}
-    return (f"热约束残差计算完成：平均残差 {fmt_num(stats.get('mean'))} 开尔文，"
+    return (f"热约束残差计算完成：平均残差 {fmt_num(stats.get('mean'))} K，"
             f"有效格网 {fmt_count(stats.get('n_valid_blocks'))} 个")
 
 
@@ -242,8 +242,8 @@ def _summarize_accuracy_eval(data: Dict[str, Any]) -> str:
     full = data.get("closure_metrics") or {}
     closure = full.get("closure") or {}
     metrics = closure.get("metrics") or {}
-    return (f"闭合校核完成：平均偏差 {fmt_num(metrics.get('MB_K'))} 开尔文，"
-            f"平均绝对误差 {fmt_num(metrics.get('MAE_K'))} 开尔文，共比对 "
+    return (f"闭合校核完成：平均偏差 {fmt_num(metrics.get('MB_K'))} K，"
+            f"平均绝对误差 {fmt_num(metrics.get('MAE_K'))} K，共比对 "
             f"{fmt_count(closure.get('n_matched_cells'))} 个格网"
             f"（这是均值闭合校核，不是十米独立精度）")
 
@@ -331,6 +331,20 @@ def download_started() -> str:
     return "**开始下载所选影像**\n"
 
 
+def monthly_composite_started(landsat_count: int = 0, sentinel_count: int = 0) -> str:
+    """月度合成模式开始提示：说清当月两套合成影像分别由哪几景合成（不说"配对几景"）。"""
+    detail = ""
+    if landsat_count and sentinel_count:
+        detail = (f"当月 Landsat 合成影像由 {landsat_count} 景合成，"
+                  f"Sentinel-2 合成影像由 {sentinel_count} 景合成。")
+    elif landsat_count:
+        detail = f"当月 Landsat 合成影像由 {landsat_count} 景合成。"
+    elif sentinel_count:
+        detail = f"当月 Sentinel-2 合成影像由 {sentinel_count} 景合成。"
+    return (f"**月度合成模式**：{detail}"
+            f"将该月全部符合云量阈值的影像合成为一张月度产品后再处理\n")
+
+
 def waiting_for_user() -> str:
     return "已暂停，等待你的选择\n"
 
@@ -343,8 +357,8 @@ def no_pair_reason(detail: Dict[str, Any]) -> str:
     """无合格配对时说清「搜到了什么、为什么都不合格」（技术方案 5.2）。"""
     detail = detail or {}
     lines = [
-        f"没有找到符合条件的影像组合：陆地卫星 {fmt_count(detail.get('landsat_count'))} 景，"
-        f"哨兵二号 {fmt_count(detail.get('sentinel_count'))} 景。"
+        f"没有找到符合条件的影像组合：Landsat 8/9 {fmt_count(detail.get('landsat_count'))} 景，"
+        f"Sentinel-2 {fmt_count(detail.get('sentinel_count'))} 景。"
     ]
     reasons: List[str] = []
     if detail.get("rejected_by_coverage"):

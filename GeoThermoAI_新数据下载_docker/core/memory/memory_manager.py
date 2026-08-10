@@ -249,8 +249,12 @@ class MemoryManager:
         return "\n\n".join(blocks)
 
     def structured_experiment_block(self, project_id: str, query: str) -> str:
-        """结构化查询层：从用户 query 提取研究区/时间/影像对日期，
-        精确查历史实验指标并组装为注入文本（不再依赖语义检索猜测）。"""
+        """结构化查询层：从用户 query 提取研究区/时间/影像对日期/获取方式，
+        精确查历史实验指标并组装为注入文本（不再依赖语义检索猜测）。
+
+        获取方式：query 含「月度合成/合成模式/整月」→ monthly；含「配对模式/逐对」
+        → pair；都无则不限。展示时每行标注（月度合成 / 配对模式），月度记录注明代表日。
+        """
         if not project_id or not query:
             return ""
         import re as _re
@@ -274,12 +278,19 @@ class MemoryManager:
         # 研究区：常见地名后缀（省/市/自治州/县/区/镇/乡）
         rm = _re.search(r"[\u4e00-\u9fa5]{2,8}?(?:省|市|自治州|县|区|镇|乡)", text)
         region = rm.group(0) if rm else ""
-        if not region and not start and not pair_date:
+        # 影像获取方式：月度合成 / 配对模式
+        composite = ""
+        if _re.search(r"月度合成|合成模式|整月|该月", text):
+            composite = "monthly"
+        elif _re.search(r"配对模式|逐对|单日", text):
+            composite = "pair"
+        if not region and not start and not pair_date and not composite:
             return ""
         try:
             hits = self.experiment_log(project_id).query(
                 region=region, start=start, end=end,
-                landsat_date=pair_date, sentinel2_date=pair_date)
+                landsat_date=pair_date, sentinel2_date=pair_date,
+                composite=composite)
         except Exception as e:
             logger.warning(f"[memory] 结构化查询失败（已忽略）: {e}")
             return ""
@@ -290,9 +301,12 @@ class MemoryManager:
             pair = r.get("pair") or {}
             test = (r.get("metrics") or {}).get("test") or {}
             dr = r.get("date_range") or ["", ""]
+            _mode = str(r.get("acquisition_mode")
+                        or pair.get("composite") or "")
+            _mode_label = "月度合成" if _mode == "monthly" else "配对模式"
             lines.append(
                 f"- {r.get('region', '?')}（{dr[0]} ~ {dr[1]}）："
-                f"测试集 R²={test.get('R2')}，"
+                f"测试集 R²={test.get('R2')}，{_mode_label}，"
                 f"影像对 Landsat {pair.get('landsat_date', '?')} + "
                 f"Sentinel-2 {pair.get('sentinel2_date', '?')}，"
                 f"实验时间 {r.get('timestamp', '?')}")

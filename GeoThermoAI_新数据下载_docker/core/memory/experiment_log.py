@@ -112,12 +112,14 @@ class ExperimentLog:
 
     def query(self, region: str = "", start: str = "", end: str = "",
               landsat_date: str = "", sentinel2_date: str = "",
-              model: str = "") -> List[Dict[str, Any]]:
+              model: str = "", composite: str = "") -> List[Dict[str, Any]]:
         """精确查询历史实验（结构化过滤，结构化查询层）。
 
         支持按研究区（子串）、时间范围（date_range 区间相交）、
-        影像对日期（pair.landsat_date / pair.sentinel2_date）、模型组合过滤，
+        影像对日期（pair.landsat_date / pair.sentinel2_date）、模型、
+        影像获取方式（composite="monthly" 月度合成 / "pair" 配对模式）过滤，
         返回匹配的成功实验列表（按时间倒序）。全部条件可选，为空表示不限制。
+        composite 兼容旧记录：同时检查顶层 acquisition_mode 与 pair.composite。
         """
         results = []
         for r in self._load():
@@ -129,6 +131,15 @@ class ExperimentLog:
                 continue
             if (start or end) and not _ranges_overlap(r.get("date_range"), start, end):
                 continue
+            if composite:
+                _mode = str(r.get("acquisition_mode")
+                            or (r.get("pair") or {}).get("composite") or "")
+                if composite == "pair":
+                    # 配对模式：显式标记缺失（旧记录）或值非 monthly 均视为配对
+                    if _mode == "monthly":
+                        continue
+                elif _mode != composite:
+                    continue
             pair = r.get("pair") or {}
             if landsat_date and _norm_date(pair.get("landsat_date")) != _norm_date(landsat_date):
                 continue

@@ -7,6 +7,7 @@ const chat = useChatStore()
 const box = ref(null)
 const autoscroll = ref(true)
 const usage = ref(null) // { mem_gb, disk_gb }
+const copied = ref(false)
 
 // 实时资源占用：内存每 5 秒刷新，磁盘后端 30 秒缓存
 let usageTimer = null
@@ -49,7 +50,28 @@ function onScroll() {
 
 function clearLog() {
   chat.logLines = []
+  chat.logAll = []
   autoscroll.value = true
+}
+
+/** 复制完整日志（logAll 是完整副本，不受渲染窗口限制）；剪贴板 API 不可用时降级 */
+async function copyLog() {
+  const full = chat.logAll.length ? chat.logAll.join('\n') : chat.logLines.join('\n')
+  if (!full) return
+  try {
+    await navigator.clipboard.writeText(full)
+  } catch (_) {
+    const ta = document.createElement('textarea')
+    ta.value = full
+    ta.style.position = 'fixed'
+    ta.style.opacity = '0'
+    document.body.appendChild(ta)
+    ta.select()
+    try { document.execCommand('copy') } catch (_) {}
+    ta.remove()
+  }
+  copied.value = true
+  setTimeout(() => (copied.value = false), 1600)
 }
 </script>
 
@@ -57,8 +79,9 @@ function clearLog() {
   <div class="log-panel">
     <div class="log-panel__head">
       <span class="log-panel__title">实时日志</span>
-      <span class="log-panel__count">{{ chat.logLines.length }} 行</span>
-      <button class="log-panel__clear" :disabled="!chat.logLines.length" @click="clearLog">清除</button>
+      <span class="log-panel__count">{{ chat.logAll.length || chat.logLines.length }} 行</span>
+      <button class="log-panel__clear" :disabled="!chat.logAll.length && !chat.logLines.length" @click="copyLog">{{ copied ? '已复制' : '复制' }}</button>
+      <button class="log-panel__clear" :disabled="!chat.logAll.length && !chat.logLines.length" @click="clearLog">清除</button>
       <span v-if="usage" class="log-panel__usage" title="本软件实时占用（含所有项目数据）">内存 {{ usage.mem_gb.toFixed(2) }}G · 磁盘 {{ usage.disk_gb.toFixed(2) }}G</span>
     </div>
     <div ref="box" class="log-panel__box" @scroll="onScroll">

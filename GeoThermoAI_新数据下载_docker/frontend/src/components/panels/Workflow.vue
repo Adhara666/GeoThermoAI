@@ -27,8 +27,8 @@ const ICON_META = {
   failed: { path: '<circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/>', color: '#dc2626' },
   // 上游失败导致本步骤未执行（A-08）：与"失败"区分显示，明确不是"失败后仍继续完成"
   skipped_upstream: { path: '<circle cx="12" cy="12" r="10"/><line x1="8" y1="12" x2="16" y2="12"/>', color: '#9ca3af' },
-  // 可选步骤未执行（结果后处理）：灰色空心圆，明确是"用户未选择执行"
-  skipped: { path: '<circle cx="12" cy="12" r="10"/>', color: '#9ca3af' },
+  // 可选步骤未执行（结果后处理）：沿用时钟图标，与"等待"视觉一致，明确"未做"
+  skipped: { path: '<circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>', color: '#9ca3af' },
   pending: { path: '<circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>', color: '#9ca3af' },
 }
 

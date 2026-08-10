@@ -24,10 +24,12 @@ class Node:
     TUNING_ROUND = "tuning_round"
     FINAL_REPORT = "final_report"
     POSTPROCESS = "postprocess"
+    ACQUISITION_MODE = "acquisition_mode"  # 影像获取方式：配对模式 / 月度合成模式
 
 
 ALL_NODES = (Node.PLAN_CONFIRM, Node.PAIR_SELECTION, Node.NO_PAIR, Node.DATA_QUALITY,
-             Node.TUNING_DECISION, Node.TUNING_ROUND, Node.FINAL_REPORT, Node.POSTPROCESS)
+             Node.TUNING_DECISION, Node.TUNING_ROUND, Node.FINAL_REPORT, Node.POSTPROCESS,
+             Node.ACQUISITION_MODE)
 
 
 # ── 选项 id ────────────────────────────────────────────────────────
@@ -50,6 +52,8 @@ class Option:
     MORE_ANALYSIS = "more_analysis"  # 做其他分析
     RUN_POSTPROCESS = "run_postprocess"   # 执行结果后处理（空洞填补）
     SKIP_POSTPROCESS = "skip_postprocess" # 不需要结果后处理，结束流程
+    PAIR_MODE = "pair_mode"       # 影像获取：配对模式（逐对影像）
+    MONTHLY_MODE = "monthly_mode" # 影像获取：月度合成模式（该月影像合成一张）
 
 
 # AUTO（完全执行）模式下各节点的默认策略（技术方案 3.2 最后一列）。
@@ -64,6 +68,9 @@ AUTO_DEFAULT_STRATEGY: Dict[str, Optional[str]] = {
     Node.FINAL_REPORT: Option.DONE,
     # 结果后处理（可选）：完全执行模式默认跳过，不暂停询问
     Node.POSTPROCESS: Option.SKIP_POSTPROCESS,
+    # 影像获取方式（配对/月度合成）：整月时由 role_flow 直接弹窗询问，
+    # 不经过本表（AUTO 也会弹），这里补占位保证节点完整性。
+    Node.ACQUISITION_MODE: None,
 }
 
 # 手动调参表单排除的超参：随机种子是可复现性开关，不是调优旋钮

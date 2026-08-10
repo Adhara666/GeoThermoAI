@@ -47,9 +47,12 @@ function initMap() {
   for (const k in overlayMap) delete overlayMap[k]
 
   map = L.map(mapEl.value, { zoomControl: false, attributionControl: true, zoom: 10 })
-  // 缩放控件放到左下角，避免与左上角的图层控制面板重叠
+  // 缩放控件放到左下角，避免与左上角的图层控制面板重叠；比例尺紧随其下
   L.control.zoom({ position: 'bottomleft' }).addTo(map)
+  L.control.scale({ position: 'bottomleft', imperial: false }).addTo(map)
   map.setView([30.59, 114.3], 10)
+  map.on('mousemove', onMouseMove)
+  map.on('click', onMapClick)
   setBase(currentBase.value)
   refresh()
 }
@@ -131,6 +134,114 @@ function onResize() {
   if (map) map.invalidateSize()
 }
 
+// ── 显示温度（像元采样） ─────────────────────────────────────────
+const tempMode = ref(false)   // 是否激活"显示温度"（激活后锁定地图交互）
+const tempLocked = ref(false) // 是否锁定当前像素（点击一次锁定，再点一次解锁）
+const cursorPos = ref(null)   // 鼠标当前所在位置 {lat, lon}
+const tempValues = ref({})    // layer_id -> 温度(K) 或 null（仅显示已勾选图层）
+const lockInfo = ref(null)    // 锁定时固定的 {lat, lon, values}
+let _lastQuery = 0
+
+const lstLayers = computed(() => layers.value.filter((l) => l.available && l.is_lst))
+const checkedLstLayers = computed(() => lstLayers.value.filter((l) => l.visible))
+
+// 锁定时显示锁定的坐标与温度；解锁后跟随光标
+const showCoord = computed(() => lockInfo.value || cursorPos.value)
+const showValues = computed(() => (lockInfo.value ? lockInfo.value.values : tempValues.value) || {})
+
+// 经纬度文本：东经/西经/北纬/南纬用 E/W/N/S 字母表示，如 "114.97639° E  30.42174° N"
+const coordText = computed(() => {
+  const c = showCoord.value
+  if (!c) return ''
+  const lonDir = c.lon >= 0 ? 'E' : 'W'
+  const latDir = c.lat >= 0 ? 'N' : 'S'
+  return `${Math.abs(c.lon).toFixed(5)}° ${lonDir}  ${Math.abs(c.lat).toFixed(5)}° ${latDir}`
+})
+
+function lockMapInteractions() {
+  if (!map) return
+  map.dragging.disable()
+  map.touchZoom.disable()
+  map.doubleClickZoom.disable()
+  map.scrollWheelZoom.disable()
+  map.boxZoom.disable()
+  map.keyboard.disable()
+  if (mapEl.value) mapEl.value.style.cursor = 'crosshair'
+}
+
+function unlockMapInteractions() {
+  if (!map) return
+  map.dragging.enable()
+  map.touchZoom.enable()
+  map.doubleClickZoom.enable()
+  map.scrollWheelZoom.enable()
+  map.boxZoom.enable()
+  map.keyboard.enable()
+  if (mapEl.value) mapEl.value.style.cursor = ''
+}
+
+function toggleTempMode() {
+  tempMode.value = !tempMode.value
+  if (!tempMode.value) {
+    tempLocked.value = false
+    lockInfo.value = null
+    cursorPos.value = null
+    tempValues.value = {}
+    unlockMapInteractions()
+  } else {
+    lockMapInteractions()
+  }
+}
+
+async function queryTemps(lat, lon) {
+  const ids = checkedLstLayers.value.map((l) => l.id)
+  if (!ids.length) {
+    tempValues.value = {}
+    return
+  }
+  try {
+    const r = await api.post(
+      `/api/lst-values?conv=${encodeURIComponent(conv.value || '')}`,
+      { lat, lon, layers: ids },
+    )
+    tempValues.value = r.values || {}
+  } catch (_) {
+    // 查询失败：保留旧值，避免移动时温度闪烁
+  }
+}
+
+function onMouseMove(e) {
+  if (!tempMode.value || !e.latlng) return
+  // 锁定期间也记录光标最新位置（解锁后若光标在别的像素就显示那个像素），只是不刷新温度
+  cursorPos.value = { lat: e.latlng.lat, lon: e.latlng.lng }
+  if (tempLocked.value) return
+  const now = Date.now()
+  if (now - _lastQuery < 60) return // 60ms 节流，避免移动时高频请求
+  _lastQuery = now
+  queryTemps(cursorPos.value.lat, cursorPos.value.lon)
+}
+
+async function onMapClick(e) {
+  if (!tempMode.value || !e.latlng) return
+  if (tempLocked.value) {
+    // 再点一次：解锁。解锁后立即按当前光标位置刷新坐标与温度
+    tempLocked.value = false
+    lockInfo.value = null
+    if (cursorPos.value) await queryTemps(cursorPos.value.lat, cursorPos.value.lon)
+    return
+  }
+  // 第一次点击：锁定当前像素的坐标与温度
+  cursorPos.value = { lat: e.latlng.lat, lon: e.latlng.lng }
+  await queryTemps(cursorPos.value.lat, cursorPos.value.lon)
+  tempLocked.value = true
+  lockInfo.value = { lat: cursorPos.value.lat, lon: cursorPos.value.lon, values: { ...tempValues.value } }
+}
+
+function fmtTemp(v) {
+  if (v === undefined || v === null) return '–' // 无数据用短横线（比长横线细短）
+  return `${Number(v).toFixed(2)} K`
+}
+
 onMounted(() => {
   initMap()
   window.addEventListener('resize', onResize)
@@ -138,7 +249,13 @@ onMounted(() => {
 
 onBeforeUnmount(() => {
   window.removeEventListener('resize', onResize)
-  if (map) { map.remove(); map = null }
+  if (map) {
+    map.off('mousemove', onMouseMove)
+    map.off('click', onMapClick)
+    unlockMapInteractions()
+    map.remove()
+    map = null
+  }
 })
 
 watch(conv, async () => {
@@ -152,6 +269,16 @@ watch(conv, async () => {
 watch(projectDir, async () => {
   if (map) { map.invalidateSize(); refresh() }
 })
+
+// 图层勾选/透明度变化时刷新温度采样（勾选新图层 → 立即补查该点温度）
+watch(
+  () => layers.value.map((l) => `${l.id}:${l.visible}`).join(','),
+  async () => {
+    if (tempMode.value && !tempLocked.value && cursorPos.value) {
+      await queryTemps(cursorPos.value.lat, cursorPos.value.lon)
+    }
+  },
+)
 
 const hasAny = computed(() => layers.value.some((l) => l.available))
 const groups = computed(() => {
@@ -194,7 +321,19 @@ const groups = computed(() => {
       </div>
 
       <div v-if="panelOpen && hasAny" class="layer-panel">
-        <div class="layer-panel__title">图层控制</div>
+        <div class="layer-panel__title">
+          <span>图层控制</span>
+          <button
+            v-if="lstLayers.length"
+            class="temp-btn"
+            :class="{ 'temp-btn--active': tempMode }"
+            :title="tempMode ? '关闭温度显示，恢复地图操作' : '显示鼠标所在像元在各 LST 图层上的温度'"
+            @click="toggleTempMode"
+          >
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/><circle cx="12" cy="10" r="3"/></svg>
+            {{ tempMode ? '关闭温度' : '显示温度' }}
+          </button>
+        </div>
         <div v-for="(items, gname) in groups" :key="gname" class="layer-group">
           <div class="layer-group__name">{{ gname }}</div>
           <div v-for="l in items" :key="l.id" class="layer-row">
@@ -217,6 +356,21 @@ const groups = computed(() => {
             <span class="layer-row__pct">{{ Math.round(l.opacity * 100) }}%</span>
           </div>
         </div>
+      </div>
+
+      <div v-if="tempMode" class="temp-panel">
+        <div class="temp-panel__head">
+          <span class="temp-panel__ttl">像元温度</span>
+          <span v-if="tempLocked" class="temp-panel__lock">已锁定</span>
+        </div>
+        <div v-if="showCoord" class="temp-panel__coord">{{ coordText }}</div>
+        <div v-if="checkedLstLayers.length" class="temp-panel__rows">
+          <div v-for="l in checkedLstLayers" :key="l.id" class="temp-panel__row">
+            <span class="temp-panel__name" :title="l.label">{{ l.label }}</span>
+            <span class="temp-panel__val">{{ fmtTemp(showValues[l.id]) }}</span>
+          </div>
+        </div>
+        <div v-else class="temp-panel__hint">请勾选至少一个LST图层</div>
       </div>
     </div>
   </div>
@@ -241,11 +395,19 @@ const groups = computed(() => {
 .map-hint__sub { font-size: 12px; }
 
 .layer-panel {
-  position: absolute; left: 10px; top: 10px; width: 360px; max-height: calc(100% - 20px);
+  position: absolute; left: 10px; top: 10px; width: 400px; max-height: calc(100% - 20px);
   background: rgba(255, 255, 255, 0.97); border: 1px solid var(--border); border-radius: 10px;
   box-shadow: var(--shadow); padding: 10px; overflow-y: auto; z-index: 500;
 }
-.layer-panel__title { font-size: 12px; font-weight: 600; color: var(--text); margin-bottom: 8px; }
+.layer-panel__title { font-size: 12px; font-weight: 600; color: var(--text); margin-bottom: 8px; display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.temp-btn {
+  display: inline-flex; align-items: center; gap: 4px; margin-left: auto; flex-shrink: 0;
+  border: 1px solid var(--border); background: var(--bg); color: var(--text-secondary);
+  font-size: 11px; padding: 3px 8px; border-radius: 6px; cursor: pointer; white-space: nowrap;
+  transition: all 0.15s;
+}
+.temp-btn:hover { border-color: var(--primary); color: var(--primary); }
+.temp-btn--active { background: var(--primary); border-color: var(--primary); color: #fff; }
 .layer-group { margin-bottom: 10px; }
 .layer-group:last-child { margin-bottom: 0; }
 .layer-group__name {
@@ -263,4 +425,23 @@ const groups = computed(() => {
 .layer-row__label:hover { white-space: normal; word-break: break-all; }
 .layer-row__opacity { flex: 0 0 56px; height: 14px; accent-color: var(--primary); }
 .layer-row__pct { font-size: 11px; color: var(--text-muted); width: 30px; text-align: right; flex-shrink: 0; }
+
+/* 显示温度小面板（右下角，避开左上角图层面板与底部 attribution，防止重叠） */
+.temp-panel {
+  position: absolute; right: 10px; bottom: 36px; min-width: 240px; max-width: 320px;
+  background: rgba(255, 255, 255, 0.97); border: 1px solid var(--border); border-radius: 10px;
+  box-shadow: var(--shadow); padding: 10px 12px; z-index: 600; font-size: 12px;
+}
+.temp-panel__head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 6px; }
+.temp-panel__ttl { font-weight: 600; color: var(--text); }
+.temp-panel__lock {
+  font-size: 11px; color: #fff; background: var(--primary); border-radius: 4px;
+  padding: 1px 6px; font-weight: 500;
+}
+.temp-panel__coord { color: var(--text-secondary); margin-bottom: 6px; font-variant-numeric: tabular-nums; }
+.temp-panel__rows { display: flex; flex-direction: column; gap: 3px; max-height: 200px; overflow-y: auto; }
+.temp-panel__row { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.temp-panel__name { flex: 1; min-width: 0; color: var(--text-secondary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.temp-panel__val { width: 64px; text-align: center; font-weight: 600; color: var(--text); font-variant-numeric: tabular-nums; flex-shrink: 0; }
+.temp-panel__hint { color: var(--warning, #b58900); }
 </style>

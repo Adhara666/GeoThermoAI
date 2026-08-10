@@ -51,7 +51,7 @@ SKILL_CASES = {
         {"train_metrics": {"train": {"R2": 0.90}},
          "test_metrics": {"R2": 0.87, "RMSE": 1.23, "MB": 0.12},
          "model_path": "/app/x/results/train/rf_ttri_model.pkl"},
-        ("模型训练完成", "测试集决定系数 0.87", "均方根误差 1.23 开尔文"),
+        ("模型训练完成", "测试集决定系数 0.87", "均方根误差 1.23 K"),
     ),
     "tcr_compute": (
         "TCR计算完成（block_constant）: mean=0.0210K, std=0.4500K, 有效格=373,240, "
@@ -73,7 +73,7 @@ SKILL_CASES = {
         "匹配格数=373,240（不代表能量/辐射守恒，不是独立10m精度）",
         {"closure_metrics": {"closure": {"n_matched_cells": 373240,
                                          "metrics": {"MB_K": 0.05, "MAE_K": 0.40}}}},
-        ("闭合校核完成", "0.05 开尔文", "373,240"),
+        ("闭合校核完成", "0.05 K", "373,240"),
     ),
     "ai_assistant": (
         "AI助手 (diagnose) 完成",
@@ -84,7 +84,9 @@ SKILL_CASES = {
 
 # 红线检查用的模式
 _ASCII_SKILL_NAMES = tuple(SKILL_CASES)
-_PATH_SEP_RE = re.compile(r"[/\\]")
+# 路径判定复用生产 sanitize 的 _PATH_RE：合法的"8/9"（Landsat 8/9）、"row/col"等
+# 表达不算路径（slash 前是字母/数字时不判为路径），真正的路径（/app/...、D:\...）才命中
+_PATH_SEP_RE = presentation._PATH_RE
 _VARNAME_RE = re.compile(r"\b[A-Za-z][A-Za-z0-9]*_[A-Za-z0-9_]+\b")
 
 
@@ -169,7 +171,7 @@ def test_other_bubbles():
     _assert(presentation.study_area_loaded("九江镇.geojson").strip()
             == "已载入研究区：九江镇", "研究区名去掉扩展名")
     _assert("共 7 步" in cases["方案就绪"], "方案就绪给出步骤数")
-    _assert("陆地卫星 4 景" in cases["无配对"] and "哨兵二号 6 景" in cases["无配对"],
+    _assert("Landsat 8/9 4 景" in cases["无配对"] and "Sentinel-2 6 景" in cases["无配对"],
             "无配对说清搜到了什么")
     _assert("覆盖不足被淘汰 2 组" in cases["无配对"], "无配对说清淘汰原因")
     _assert("已暂停" in cases["等待用户"], "暂停用中文状态词")
@@ -200,7 +202,7 @@ def test_sanitize():
     cleaned_keep = presentation.sanitize(keep)
     _assert("row/col" in cleaned_keep,
             f"「row/col」不被当成路径吃掉（实际：{cleaned_keep}）")
-    for text in ("MB/MAE 均为 0.00 开尔文", "训练/验证/测试 划分完成", "云量 30%"):
+    for text in ("MB/MAE 均为 0.00 K", "训练/验证/测试 划分完成", "云量 30%"):
         _assert(presentation.sanitize(text) == text, f"「{text}」原样保留")
     for path in ("/app/data/users/u1/raw/dem.tif", "./output/raw", "D:\\work\\a.tif"):
         _assert("（详见日志）" in presentation.sanitize(f"打开 {path} 失败"),

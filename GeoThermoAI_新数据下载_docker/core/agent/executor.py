@@ -14,6 +14,7 @@
 import glob
 import logging
 import os
+import re
 import time
 from typing import Any, Dict, List, Optional
 
@@ -223,6 +224,12 @@ def build_experiment_record(exp_state: dict, conv_id: str, project_id: str,
         "status": status,
         "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
+    # 影像获取方式：月度合成 / 配对模式（月度模式的伪配对带 composite="monthly"）。
+    # 显式顶层字段，与旧记录（pair.composite）语义一致，查询与展示直接使用。
+    _pair = record["pair"]
+    record["acquisition_mode"] = (
+        "monthly" if str(_pair.get("composite") or "") == "monthly" else "pair"
+    )
     df = exp_state.get("data_features")
     if df:
         record["data_features"] = df
@@ -458,7 +465,14 @@ def execute_plan(agent, plan: dict, on_token=None, on_log=None, pause_callback=N
             # ── 执行 Skill（data_acquisition 特殊处理：搜索→选择→下载）─
             try:
                 def _log(tag, msg):
-                    _emit(f"  [{tag}] {msg}\n", to_log=True)
+                    # 日志行统一格式：`[INFO]`/`[WARN]` 后固定 1 空格；
+                    # 消息若带 2 空格前缀视为子信息，统一保留为 2 空格层级缩进。
+                    # 异常消息里的换行折叠为空格（如 CDSE 504 的整段 HTML），
+                    # 保证每条日志只占一行、不破坏面板排版。
+                    text = re.sub(r"\s*\n\s*", " ", str(msg or "")).strip()
+                    if text.startswith("  "):
+                        text = "  " + text[2:].lstrip()
+                    _emit(f"  [{tag}] {text}\n", to_log=True)
 
                 def _progress(name, pct, msg):
                     _emit(f"  {name} {int(pct*100)}%: {msg}\n", to_log=True)
@@ -466,7 +480,16 @@ def execute_plan(agent, plan: dict, on_token=None, on_log=None, pause_callback=N
                 # data_acquisition: 先搜索返回配对，用户选择后再下载
                 if skill_name == "data_acquisition":
                     exp_state["acq_params"] = step.get("params", {})
-                    if not step.get("params", {}).get("selected_pair"):
+                    if step.get("params", {}).get("selected_pair"):
+                        # 下载模式：selected_pair 已注入（月度伪配对 continue 重入，
+                        # 或配对模式用户选择后的二次调用），直接执行下载。
+                        # 月度模式在 data_acquisition 内部走 _download_monthly 合成分支。
+                        result = skill.execute(
+                            step.get("params", {}),
+                            progress_callback=_progress,
+                            log_callback=_log,
+                        )
+                    else:
                         # 第一次：搜索模式
                         result = skill.execute(
                             step.get("params", {}),
@@ -474,6 +497,27 @@ def execute_plan(agent, plan: dict, on_token=None, on_log=None, pause_callback=N
                             log_callback=_log,
                         )
                         result_data = result.data if isinstance(result.data, dict) else {}
+                        # 月度合成模式：跳过配对选择，用该月全部景直接进入下载（合成）。
+                        # 用一个「代表日（月末日）」伪配对确定产物目录/文件名，与下游同构。
+                        if str(step.get("params", {}).get("composite") or "") == "monthly":
+                            _rep_date = str(step.get("params", {}).get("end_date") or "")[:10]
+                            if _rep_date:
+                                _pseudo = {"landsat_date": _rep_date, "sentinel2_date": _rep_date,
+                                           "composite": "monthly"}
+                                step["params"]["selected_pair"] = _pseudo
+                                exp_state["pair"] = _pseudo
+                                raw_dir, processed_dir, results_dir = pair_dirs(project_dir, _pseudo)
+                                ctx.raw_dir, ctx.processed_dir, ctx.results_dir = (
+                                    raw_dir, processed_dir, results_dir)
+                                SKILL_PATHS = build_skill_paths(
+                                    raw_dir, processed_dir, results_dir,
+                                    dates=pair_dates(_pseudo), project_dir=project_dir)
+                                for _k, _v in SKILL_PATHS.get("data_acquisition", {}).items():
+                                    step["params"][_k] = _v
+                                _emit("  " + presentation.monthly_composite_started(
+                                    result_data.get("landsat_count", 0),
+                                    result_data.get("sentinel_count", 0)))
+                                continue  # 重新执行（下载模式 + composite=monthly）
                         pairs = result_data.get("image_pairs", [])
                         if pairs:
                             # 钩子②：排序与推荐标记（不介入时保持原顺序）

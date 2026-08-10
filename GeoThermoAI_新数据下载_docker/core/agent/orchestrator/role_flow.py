@@ -120,6 +120,12 @@ def run_with_roles(agent, user_input: str, on_token=None, on_log=None,
                 session.update(pending_question=message)
             return message
 
+    # 月度合成模式选择（升级点：时间范围为整月时，无论「完全执行」还是「由我批准」，
+    # 都必须用弹窗询问用户是「配对模式」还是「月度合成模式」）
+    _pause_flag = ask_acquisition_mode_if_month(plan, pause_callback, run_state, _emit)
+    if _pause_flag:
+        return "\n".join(stream_acc) + f"\n{_pause_flag}"
+
     return solve_with_replan(agent, 
         plan, planner=planner, ctx=ctx, run_state=run_state, session=session,
         emit=_emit, mode=mode, cfg=cfg,
@@ -129,6 +135,48 @@ def run_with_roles(agent, user_input: str, on_token=None, on_log=None,
         study_areas_dir=study_areas_dir, conv_id=conv_id, project_id=project_id,
         memory_manager=memory_manager, on_thinking=on_thinking,
     )
+
+
+def ask_acquisition_mode_if_month(plan: dict, pause_callback, run_state, emit) -> str:
+    """时间范围为整月时，弹窗询问「配对模式 / 月度合成模式」。
+
+    无论执行模式（完全执行 / 由我批准）都会触发；用户选择写入 plan 的
+    data_acquisition 步骤 params.composite（'monthly' / 'pair'，执行引擎与
+    下载模块的约定值，与前端选项值 monthly_mode/pair_mode 区分开）。
+    返回非空表示流程应暂停（PAUSE_MARKER）；返回空字符串表示继续执行。
+    时间范围不是整月（或未提供）时不弹窗。
+    """
+    _tr = plan.get("time_range") or {}
+    _start, _end = str(_tr.get("start") or ""), str(_tr.get("end") or "")
+    _is_month = bool(_start[:7]) and _start[:7] == _end[:7]
+    if not (_is_month and pause_callback):
+        return ""
+    _month_label = f"{_start[:4]} 年 {int(_start[5:7])} 月"
+    _mode_payload = approval_proto.build(
+        approval_proto.Node.ACQUISITION_MODE,
+        "选择影像获取方式",
+        f"你的时间范围是{_month_label}（整月），请选择影像获取方式：",
+        [
+            approval_proto.option(approval_proto.Option.PAIR_MODE, "配对模式",
+                                  hint="逐对 Landsat/Sentinel-2 影像处理，保留单日细节"),
+            approval_proto.option(approval_proto.Option.MONTHLY_MODE, "月度合成模式",
+                                  hint="将该月全部符合云量阈值的影像合成为一张月度产品后再处理"),
+        ],
+    )
+    _mode_resp = pause_callback(_mode_payload)
+    if not isinstance(_mode_resp, dict) or _mode_resp.get("paused"):
+        emit(presentation.waiting_for_user())
+        return PAUSE_MARKER
+    _mode_choice = ((_mode_resp.get("data") or {}).get("option_id")
+                    or approval_proto.Option.PAIR_MODE)
+    run_state.record_approval(approval_proto.Node.ACQUISITION_MODE, _mode_choice)
+    # 规范化：前端选项值（monthly_mode/pair_mode）→ 执行引擎/下载模块约定值（monthly/pair）
+    _composite = "monthly" if _mode_choice == approval_proto.Option.MONTHLY_MODE else "pair"
+    for _s in plan.get("steps", []):
+        if _s.get("skill") == "data_acquisition":
+            _s.setdefault("params", {})["composite"] = _composite
+            break
+    return ""
 
 def solve_with_replan(agent, plan: dict, *, planner, ctx, run_state, session, emit,
                       mode: str, cfg: dict, on_token=None, on_log=None,

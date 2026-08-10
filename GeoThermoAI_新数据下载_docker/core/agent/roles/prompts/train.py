@@ -24,7 +24,7 @@ TRAIN_DECISION_PROMPT = """{identity}
 ## 本轮训练结果
 - 训练集决定系数：{train_r2}
 - 测试集决定系数：{test_r2}
-- 均方根误差：{rmse} 开尔文
+- 均方根误差：{rmse} K
 - 特征重要性前五：{top_features}
 
 ## 历史调优轨迹

@@ -382,3 +382,196 @@ def check(text: str, *, bundle: Optional[dict] = None,
                             note="结果解读未通过表述检查，需要重写",
                             violations=violations, rule_hits=rule_hits,
                             data={"expected_grade": expected})
+
+
+# ══════════════════════════════════════════════════════════════════
+# 确定性修复（根治降级）
+#
+# 背景：E-R1 ~ E-R7 是「防 AI 乱说」的关卡，命中即打回重写。但 LLM 对
+# 数字的幻觉（如把 0.73 写成 0.75）与结构偏差（漏掉"产品概况"小节）即使
+# 重写两次也未必改对，导致大量流程降级为模板报告。
+#
+# 因此把 E-R1 / E-R2 / E-R6 / E-R7 四类**可机械修复**的违规改为确定性
+# 修复（数字对齐、禁用词替换、口径句替换、结构补齐），修复后一般直接通过；
+# 重写只兜底"编造了远离真实值的数字"这类无法自动修的情形。
+# ══════════════════════════════════════════════════════════════════
+
+# E-R2 禁用表述的安全替换（保持语句通顺、不引入新错误）。
+# 空字符串表示直接删除该词（能量守恒/辐射守恒只在被否定时合法，
+# 裸出现属于模型乱说，删掉比保留更安全）。
+_DISALLOWED_REPLACEMENTS = {
+    "产品不可用": "产品存在数据空洞",
+    "产品质量差": "产品存在数据空洞",
+    "10m精度": "精度",
+    "10 米精度": "精度",
+    "十米精度": "精度",
+    "独立10m精度": "精度",
+    "独立十米精度": "精度",
+    "完全准确": "总体一致",
+    "零误差": "误差很小",
+    "能量守恒": "",
+    "辐射守恒": "",
+}
+
+# E-R7 缺失小节的兜底句
+_SECTION_FALLBACK = {
+    "产品概况": "以下为本次产品的基本信息与总体情况概述。",
+    "模型精度": "各项精度指标以本次实际结果中的数值为准。",
+    "闭合": "闭合情况见本次实际结果中的闭合校核数值。",
+    "局限": "总体而言，本次产品的关键特征与局限需结合研究区与天气条件理解。",
+}
+
+# E-R1 修复的最大相对偏差：写错但接近真实值才修正，远离真实值的
+# 编造数字（如把样本数编成 12）不做替换，交给重写/降级，避免越修越错。
+_REPAIR_RELATIVE_TOL = 0.1
+
+
+def repair_numbers(text: str, allowed: Dict[str, List[float]]) -> str:
+    """E-R1 兜底：把带指标关键词但数值对不上允许值表的数字改成最近的真实值。
+
+    只修复「偏差 ≤ 10% 相对误差」的近似数字（如 0.75 → 0.73）；
+    偏差过大视为模型编造，不猜（保持原样，由后续重写/降级处理）。
+    """
+    body = text or ""
+    fixes: List[Tuple[int, int, str]] = []
+    for match in _NUMBER_RE.finditer(body):
+        raw = match.group(0)
+        group = _group_for(body, match.start())
+        if group is None:
+            continue
+        value = _parse_number(raw)
+        if value is None:
+            continue
+        candidates = allowed.get(group) or []
+        if not candidates:
+            continue
+        digits = _decimals(raw)
+        if any(abs(value - c) <= 0.5 * (10 ** -digits) + 1e-9 for c in candidates):
+            continue
+        best = min(candidates, key=lambda c: abs(value - c))
+        if best == 0:
+            # 真实值本身是 0（闭合 MB/MAE/RMSE、热约束残差均值常恰为 0.00）时，
+            # 「偏差 ≤ 10%」的判据对 0 无意义。LLM 常把 0.00 幻觉成 0.01~0.05
+            # 这类小数字：偏差不大就修回 0；偏差过大（如 0.5）可能是另一个指标
+            # 的真实值，不猜。这是根治「闭合 0.00 被幻觉成 0.05 后 E-R1 必挂」的修复。
+            if abs(value) <= 0.05:
+                repl = f"{0:.{digits}f}" if digits else "0"
+                fixes.append((match.start(), match.end(), repl))
+            continue
+        if abs(value - best) > _REPAIR_RELATIVE_TOL * abs(best):
+            continue
+        repl = f"{best:.{digits}f}" if digits else f"{int(round(best))}"
+        fixes.append((match.start(), match.end(), repl))
+    for start, end, repl in reversed(fixes):
+        body = body[:start] + repl + body[end:]
+    return body
+
+
+def repair_disallowed(text: str, closure_ok: bool) -> str:
+    """E-R2 兜底：把非否定语境下的禁用表述替换为安全说法。
+
+    与 check_disallowed 的豁免一致：出现在显式否定语境（"不是…"）里的
+    禁用词是允许的口径说明，不做替换。
+    """
+    body = text or ""
+    words = list(DISALLOWED_ALWAYS)
+    if closure_ok:
+        words += list(DISALLOWED_WHEN_CLOSURE_OK)
+    for word in words:
+        if word not in body:
+            continue
+        repl = _DISALLOWED_REPLACEMENTS.get(word)
+        if repl is None:
+            continue
+        pieces: List[str] = []
+        start = 0
+        cursor = 0
+        while True:
+            idx = body.find(word, cursor)
+            if idx < 0:
+                break
+            if _negated_before(body, idx):
+                cursor = idx + len(word)
+                continue
+            pieces.append(body[start:idx] + repl)
+            cursor = idx + len(word)
+            start = cursor
+        if pieces:
+            body = "".join(pieces) + body[start:]
+    return body
+
+
+def repair_closure_wording(text: str) -> str:
+    """E-R6 兜底：把「闭合…精度」的非否定表述替换为「闭合校核结果」。
+
+    只替换命中的子串、保留句子其余内容（真实数字不会因此被丢掉），
+    与被修数字一起构成最终稿。
+    """
+    body = text or ""
+    pattern = re.compile(r"闭合.{0,20}?精度|精度.{0,20}?闭合")
+    parts: List[str] = []
+    cursor = 0
+    for match in pattern.finditer(body):
+        if any(neg in match.group(0) for neg in NEGATION_WORDS):
+            continue
+        parts.append(body[cursor:match.start()])
+        parts.append("闭合校核结果")
+        cursor = match.end()
+    if not parts:
+        return body
+    parts.append(body[cursor:])
+    return "".join(parts)
+
+
+def repair_structure(text: str) -> str:
+    """E-R7 兜底：补缺失小节、补齐句尾标点，避免生成预算耗尽的半截稿。"""
+    body = (text or "").strip()
+    if not body:
+        return body
+    if "产品概况" not in body:
+        body = "产品概况\n\n" + _SECTION_FALLBACK["产品概况"] + "\n\n" + body
+    for section in REQUIRED_SECTIONS:
+        if section == "产品概况" or section in body:
+            continue
+        body = body.rstrip() + "\n\n" + section + "\n\n" + _SECTION_FALLBACK.get(section, "")
+    if not body.endswith(SENTENCE_ENDINGS):
+        body = body.rstrip() + "。"
+    return body
+
+
+def repair_grade(text: str, expected: str) -> str:
+    """E-R5 兜底：把文本里与分档不一致的评级词统一替换为 expected。
+
+    评级词是封闭集合（优秀/良好/合格/偏低），模型写错评级（如把「偏低」写成
+    「合格」）没有机械修复手段就会连续重写失败而降级。这里确定性替换：
+    只要文本里出现非 expected 的评级词就改成 expected；expected 为「未知」
+    （决定系数缺失）时不改动。
+    """
+    if not expected or expected == "未知":
+        return text or ""
+    body = text or ""
+    for word in GRADE_WORDS:
+        if word == expected or word not in body:
+            continue
+        body = body.replace(word, expected)
+    return body
+
+
+def repair_draft(text: str, bundle: Optional[dict] = None) -> str:
+    """确定性修复：数字对齐 → 禁用词替换 → 闭合口径修复 → 结构补齐 → 评级对齐。
+
+    修复后通常直接通过全部规则；仅当仍不过（如编造了远离真实值的数字）
+    才进入重写/降级流程。
+    """
+    if not text:
+        return text
+    bundle = bundle or {}
+    allowed = build_allowed_values(bundle)
+    closure = bundle.get("closure") or {}
+    closure_ok = closure_is_normal(closure.get("metrics"))
+    text = repair_numbers(text, allowed)
+    text = repair_disallowed(text, closure_ok)
+    text = repair_closure_wording(text)
+    text = repair_structure(text)
+    text = repair_grade(text, grade((bundle.get("test_metrics") or {}).get("R2")))
+    return text

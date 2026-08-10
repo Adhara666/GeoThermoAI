@@ -52,7 +52,7 @@ SUGGESTIONS = {
     "D3": ["换一组云量更低的影像组合", "换一个时间段"],
     "D4": ["换一组影像组合", "检查研究区范围是否与影像重叠"],
     "D5": ["换一组影像组合", "调整训练验证测试的划分比例"],
-    "D6": ["换一组影像组合", "检查数字高程数据是否正常"],
+    "D6": ["换一组影像组合", "检查 DEM 数据是否正常"],
     "D7": ["换一组云量更低的影像组合", "换一个时间段"],
 }
 
@@ -149,11 +149,11 @@ def _stem(name: str) -> str:
 
 
 _RASTER_LABELS = {
-    "landsat_lst.tif": "陆地卫星地表温度",
-    "landsat_qa_pixel.tif": "陆地卫星质量标记",
-    "sentinel2_bands.tif": "哨兵二号多光谱",
-    "sentinel2_scl.tif": "哨兵二号场景分类",
-    "dem.tif": "数字高程",
+    "landsat_lst.tif": "Landsat 8/9 地表温度",
+    "landsat_qa_pixel.tif": "Landsat 8/9 质量标记",
+    "sentinel2_bands.tif": "Sentinel-2 多光谱",
+    "sentinel2_scl.tif": "Sentinel-2 场景分类",
+    "dem.tif": "DEM",
 }
 
 

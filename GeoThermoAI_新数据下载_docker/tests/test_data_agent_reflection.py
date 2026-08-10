@@ -96,8 +96,8 @@ def test_d1_rasters():
         return (False, "文件不存在") if path.endswith("dem.tif") else (True, "")
 
     res = _check(raster_probe=missing_dem)
-    _assert(not res.ok and "D1" in res.rule_hits, "数字高程缺失 → D1 不通过")
-    _assert(any("数字高程" in v for v in res.violations), "违规项用中文点名是哪个文件")
+    _assert(not res.ok and "D1" in res.rule_hits, "DEM 缺失 → D1 不通过")
+    _assert(any("DEM" in v for v in res.violations), "违规项用中文点名是哪个文件")
     _assert("换一组影像组合重新下载" in res.suggestions, "给出换配对的建议")
 
     def empty_all(path):

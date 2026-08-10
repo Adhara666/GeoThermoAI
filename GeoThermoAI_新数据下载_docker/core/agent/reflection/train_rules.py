@@ -18,7 +18,8 @@ TUNING_RULES = {
     "R3": "训练 R² − 测试 R² > 0.20 → 判定过拟合，强制干预调优方向："
           "max_depth 下调 10（下限 5），min_samples_leaf 上调至少 2",
     "R4": "参数越界 → 截断到安全区间",
-    "R5": "最近两轮 R² 提升均 < 0.01 → 强制停止（已收敛）",
+    "R5": "最近两轮 R²、MAE、RMSE 的提升均 < 0.01 → 强制停止（已收敛；"
+          "三指标中任何一个提升 ≥ 0.01 都继续调优）",
     "R6": "最近两轮 R² 连续下降 → 强制停止（走势恶化）",
     "R7": "调优轮数达到生效上限 → 强制停止，取均方根误差最低的一轮作为最终结果",
 }
@@ -153,15 +154,47 @@ def _r2(round_data: Dict[str, Any]) -> Optional[float]:
         return None
 
 
+def _metric_values(rounds: List[Dict[str, Any]], key: str) -> Optional[List[float]]:
+    """取最近几轮某指标的数值序列；任一轮缺失该指标返回 None（不判收敛）。"""
+    values = []
+    for r in rounds:
+        try:
+            values.append(float(r.get(key)))
+        except (TypeError, ValueError):
+            return None
+    return values
+
+
 def converged(rounds: List[Dict[str, Any]]) -> bool:
-    """R5：最近两轮 R² 提升均 < 0.01。"""
+    """R5：最近两轮 R²、MAE、RMSE 的提升**都** < 0.01 才算收敛。
+
+    三个指标方向不同：R² 越大越好（提升 = 新 − 旧），MAE/RMSE 越小越好
+    （提升 = 旧 − 新）。三指标中**任何一个**的相邻提升 ≥ 0.01 → 未收敛，
+    继续调优；任一指标缺失 → 保守不判收敛（靠 R7 轮数上限兜底停止）。
+    """
     if len(rounds) < 3:
         return False
-    values = [_r2(r) for r in rounds[-3:]]
-    if any(v is None for v in values):
+    last3 = rounds[-3:]
+    r2 = _metric_values(last3, "test_r2")
+    mae = _metric_values(last3, "mae")
+    rmse = _metric_values(last3, "rmse")
+    if r2 is None or mae is None or rmse is None:
         return False
-    return (values[1] - values[0] < CONVERGE_DELTA
-            and values[2] - values[1] < CONVERGE_DELTA)
+
+    def any_improvement(values: List[float], higher_better: bool) -> bool:
+        for i in range(1, len(values)):
+            delta = values[i] - values[i - 1] if higher_better else values[i - 1] - values[i]
+            if delta >= CONVERGE_DELTA:
+                return True
+        return False
+
+    if any_improvement(r2, higher_better=True):
+        return False
+    if any_improvement(mae, higher_better=False):
+        return False
+    if any_improvement(rmse, higher_better=False):
+        return False
+    return True
 
 
 def deteriorating(rounds: List[Dict[str, Any]]) -> bool:
@@ -260,7 +293,8 @@ def rule_safeguard(llm_decision: Optional[Dict[str, Any]],
     stop_rules: List[str] = []
     if converged(sequence):
         stop_rules.append("R5")
-        notes.append("最近两轮精度提升都很小，判定已收敛，停止调优")
+        notes.append("最近两轮决定系数、平均绝对误差与均方根误差均无明显改善，"
+                     "判定已收敛，停止调优")
     if deteriorating(sequence):
         stop_rules.append("R6")
         notes.append("最近两轮精度连续下降，停止调优")
@@ -324,7 +358,7 @@ def advisory_notes(data_features: Optional[dict],
                   if isinstance(item, dict)}
     ttri = importance.get("TTRI")
     if isinstance(ttri, (int, float)) and ttri < 0.01:
-        notes.append("地形热响应指数贡献极低，需检查数字高程数据是否正常")
+        notes.append("地形热响应指数贡献极低，需检查 DEM 数据是否正常")
 
     indep = (rf.get("independent_prediction") or {}).get("R2")
     test_r2 = (rf.get("test_metrics") or {}).get("R2")

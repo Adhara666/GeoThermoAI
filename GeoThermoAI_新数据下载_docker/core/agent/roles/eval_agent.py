@@ -173,6 +173,10 @@ class EvalAgent(RoleAgent):
         for attempt in range(eval_rules.EVAL_REWRITE_MAX + 1):
             if not draft:
                 break
+            # 根治降级：先做确定性修复（数字对齐/禁用词替换/闭合口径/结构补齐），
+            # 修复后绝大多数稿子直接通过；重写只兜底"编造远离真实值数字"这类
+            # 无法自动修的情形，模板降级成为真正的最后手段。
+            draft = eval_rules.repair_draft(draft, self.bundle)
             reflection = eval_rules.check(draft, bundle=self.bundle,
                                           expected_grade=expected,
                                           require_structure=True)
@@ -262,25 +266,25 @@ class EvalAgent(RoleAgent):
             f"{presentation.fmt_count(size.get('width'))} 列",
             f"- 有效像元占比：{presentation.fmt_percent(stats.get('valid_percent'))}",
             f"- 测试集决定系数：{presentation.fmt_num(test.get('R2'))}",
-            f"- 测试集均方根误差：{presentation.fmt_num(test.get('RMSE'))} 开尔文",
+            f"- 测试集均方根误差：{presentation.fmt_num(test.get('RMSE'))} K",
             f"- 独立预测决定系数：{presentation.fmt_num(indep.get('R2'))}",
-            f"- 独立预测均方根误差：{presentation.fmt_num(indep.get('RMSE_K'))} 开尔文",
+            f"- 独立预测均方根误差：{presentation.fmt_num(indep.get('RMSE_K'))} K",
             f"- 独立预测样本数：{presentation.fmt_count(indep.get('n_samples'))} 个",
-            f"- 闭合平均偏差：{presentation.fmt_num(cm.get('MB_K'))} 开尔文",
-            f"- 闭合平均绝对误差：{presentation.fmt_num(cm.get('MAE_K'))} 开尔文",
-            f"- 闭合均方根误差：{presentation.fmt_num(cm.get('RMSE_K'))} 开尔文",
+            f"- 闭合平均偏差：{presentation.fmt_num(cm.get('MB_K'))} K",
+            f"- 闭合平均绝对误差：{presentation.fmt_num(cm.get('MAE_K'))} K",
+            f"- 闭合均方根误差：{presentation.fmt_num(cm.get('RMSE_K'))} K",
             f"- 闭合匹配格网数：{presentation.fmt_count(closure.get('n_matched_cells'))} 个",
         ]
         if value_range:
             lines.append(
                 f"- 低端温差：{presentation.fmt_num(value_range.get('low_end_difference_K'))}"
-                f" 开尔文；高端温差："
-                f"{presentation.fmt_num(value_range.get('high_end_difference_K'))} 开尔文")
+                f" K；高端温差："
+                f"{presentation.fmt_num(value_range.get('high_end_difference_K'))} K")
         tcr = self.bundle.get("tcr_statistics") or {}
         if tcr:
             lines.append(
-                f"- 热约束残差平均值：{presentation.fmt_num(tcr.get('mean'))} 开尔文；"
-                f"标准差：{presentation.fmt_num(tcr.get('std'))} 开尔文；"
+                f"- 热约束残差平均值：{presentation.fmt_num(tcr.get('mean'))} K；"
+                f"标准差：{presentation.fmt_num(tcr.get('std'))} K；"
                 f"有效格网：{presentation.fmt_count(tcr.get('n_valid_blocks'))} 个")
         top = self._top_features()
         if top:
@@ -418,7 +422,7 @@ class EvalAgent(RoleAgent):
         test = self.bundle.get("test_metrics") or {}
         closure = (self.bundle.get("closure") or {}).get("metrics") or {}
         return (f"测试集决定系数 {presentation.fmt_num(test.get('R2'))}，"
-                f"闭合平均偏差 {presentation.fmt_num(closure.get('MB_K'))} 开尔文。"
+                f"闭合平均偏差 {presentation.fmt_num(closure.get('MB_K'))} K。"
                 f"产品与报告已生成。")
 
     def _top_features(self, limit: int = 3) -> str:

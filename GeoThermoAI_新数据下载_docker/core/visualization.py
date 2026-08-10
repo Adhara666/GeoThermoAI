@@ -73,6 +73,10 @@ class LayerVisualizer:
             "colormap": "RdYlBu_r",
             "opacity": 0.7,
             "visible": True,
+            "temperature": True,  # 地表温度图层（单位 K），供"显示温度"采样
+            # Landsat Collection 2 Level-2 LST：栅格为原始 DN，需换算为 K
+            "scale": 0.00341802,
+            "offset": 149.0,
         },
         {
             "id": "sentinel_rgb",
@@ -102,6 +106,7 @@ class LayerVisualizer:
             "colormap": "RdYlBu_r",
             "opacity": 0.7,
             "visible": True,
+            "temperature": True,
         },
         {
             "id": "lst_10m_filled",
@@ -112,6 +117,7 @@ class LayerVisualizer:
             "colormap": "RdYlBu_r",
             "opacity": 0.7,
             "visible": False,
+            "temperature": True,
         },
     ]
 
@@ -557,11 +563,33 @@ class LayerVisualizer:
             return None
 
     @staticmethod
+    def _is_monthly_composite(file_path: str) -> bool:
+        """文件是否属于月度合成产物：沿目录链向上查找 `.monthly_composite` 标记。
+
+        月度合成在配对目录根（pairs/L{date}_S{date}/）写该标记，raw/processed/results
+        三类子目录下的图层文件向上回溯 3 层都能命中。
+        """
+        d = os.path.dirname(file_path or "")
+        for _ in range(3):
+            if not d:
+                return False
+            if os.path.isfile(os.path.join(d, ".monthly_composite")):
+                return True
+            parent = os.path.dirname(d)
+            if parent == d:
+                return False
+            d = parent
+        return False
+
+    @staticmethod
     def _layer_label_with_date(layer_def: dict, file_path: str) -> str:
         """图层标签附带影像日期（升级点 4：地图界面显示影像日期，DEM 除外）。
 
-        从带日期的文件名（如 landsat_lst_20240701.tif）提取 YYYYMMDD 并
-        格式化为 YYYY-MM-DD 追加到标签后；无日期或 DEM 保持原名。
+        从带日期的文件名（如 landsat_lst_20240701.tif）提取 YYYYMMDD：
+        - 配对模式：格式化为 YYYY-MM-DD 追加到标签后；
+        - 月度合成产物（目录含 .monthly_composite 标记）：显示为 YYYY-M（代表该月），
+          避免月末代表日被误读成"单日影像"；
+        无日期或 DEM 保持原名。
         """
         label = layer_def.get("label", "")
         if layer_def.get("id") == "dem":
@@ -570,6 +598,8 @@ class LayerVisualizer:
         if not m:
             return label
         d = m.group(1)
+        if LayerVisualizer._is_monthly_composite(file_path):
+            return f"{label}（{d[:4]}-{int(d[4:6])}）"
         return f"{label}（{d[:4]}-{d[4:6]}-{d[6:]}）"
 
     @staticmethod
@@ -595,8 +625,67 @@ class LayerVisualizer:
                 "bounds": bounds,
                 "max_native_zoom": max_native_zoom,
                 "path": file_path,
+                "is_lst": bool(layer_def.get("temperature", False)),
             })
         return result
+
+    @staticmethod
+    def sample_lst_value(project_dir: str, layer_id: str,
+                         lat: float, lon: float) -> Optional[float]:
+        """读取指定地表温度图层在 (lat, lon) 处单个像元的温度（单位 K）。
+
+        返回 None 表示：图层不可用、坐标越界或像元为 NoData/非有限值。
+        每次只读 1 个像元（rasterio Window），不加载整幅影像。
+        """
+        if not HAS_RASTERIO or not project_dir or not os.path.isdir(project_dir):
+            return None
+        layer_def = next((d for d in LayerVisualizer.LAYER_DEFS if d["id"] == layer_id), None)
+        if layer_def is None or not layer_def.get("temperature"):
+            return None
+        file_path = LayerVisualizer._resolve_layer_path(project_dir, layer_def)
+        if not os.path.isfile(file_path):
+            return None
+        try:
+            with rasterio.open(file_path) as src:
+                if src.crs and not src.crs.is_geographic:
+                    xs, ys = warp_transform("EPSG:4326", src.crs, [lon], [lat])
+                else:
+                    xs, ys = [lon], [lat]
+                if not xs or not ys:
+                    return None
+                try:
+                    row, col = src.index(float(xs[0]), float(ys[0]))
+                except Exception:
+                    return None  # 坐标落在栅格范围外
+                if row < 0 or col < 0 or row >= src.height or col >= src.width:
+                    return None
+                window = rasterio.windows.Window(col, row, 1, 1)
+                band = layer_def.get("band", 1)
+                raw = src.read(band, window=window)[0, 0]
+                if src.nodata is not None and raw == src.nodata:
+                    return None
+                if not np.isfinite(raw):
+                    return None
+                # 换算为 K：优先用图层定义里显式声明的 scale/offset
+                # （如 Landsat L2 的 DN→K），否则回退栅格自带（多为默认 1/0）
+                scale = float(layer_def.get("scale") or 1.0)
+                offset = float(layer_def.get("offset") or 0.0)
+                if scale == 1.0 and offset == 0.0:
+                    try:
+                        _s = getattr(src, "scales", None)
+                        if isinstance(_s, (tuple, list)) and len(_s) >= band:
+                            scale = float(_s[band - 1])
+                    except Exception:
+                        pass
+                    try:
+                        _o = getattr(src, "offsets", None)
+                        if isinstance(_o, (tuple, list)) and len(_o) >= band:
+                            offset = float(_o[band - 1])
+                    except Exception:
+                        pass
+                return float(raw) * scale + offset
+        except Exception:
+            return None
 
     @staticmethod
     def build_map(project_dir: str) -> str:

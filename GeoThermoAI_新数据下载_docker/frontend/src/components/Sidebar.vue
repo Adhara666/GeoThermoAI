@@ -229,7 +229,7 @@ const hasAny = computed(() => project.tree.length > 0)
 
     <!-- 新建对话弹窗 -->
     <div v-if="showNewConv" class="modal-mask" @click.self="showNewConv = false">
-      <div class="modal-card">
+      <div class="modal-card modal-card--sm">
         <h3>在「{{ convTarget }}」中新建对话</h3>
         <div class="form-group">
           <label>对话名称</label>
@@ -250,7 +250,7 @@ const hasAny = computed(() => project.tree.length > 0)
 
     <!-- 删除项目确认弹窗（页面内弹窗，替代浏览器 confirm） -->
     <div v-if="deleteProjectTarget" class="modal-mask" @click.self="deleteProjectTarget = ''">
-      <div class="modal-card modal-card--sm">
+      <div class="modal-card modal-card--md">
         <h3>删除项目</h3>
         <p class="modal-text">确定删除项目「{{ deleteProjectTarget }}」？将删除其全部对话文件、清除该项目产生的实验记忆与历史经验，并彻底删除该项目的工作区数据文件夹（原始影像与全部处理产物），此操作不可撤销。</p>
         <div class="modal-actions">
@@ -263,7 +263,7 @@ const hasAny = computed(() => project.tree.length > 0)
     <!-- 删除对话确认弹窗（页面内弹窗，替代浏览器 confirm） -->
     <div v-if="deleteConvTarget" class="modal-mask" @click.self="deleteConvTarget = null">
       <div class="modal-card modal-card--sm">
-        <h3>删除对话</h3>
+        <h3>删除对话「{{ deleteConvTarget?.title }}」</h3>
         <p class="modal-text">确定删除对话「{{ deleteConvTarget?.title }}」？将清除所有消息、运行中的进程，以及该对话产生的实验记录。</p>
         <div class="modal-actions">
           <button class="btn btn--danger" @click="confirmDeleteConv">删除</button>

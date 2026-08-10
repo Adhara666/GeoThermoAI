@@ -198,7 +198,7 @@ def test_no_pair_never_hard_runs():
     _assert(hooks.replan_request is not None, "replan 请求被记录，由总调度发起")
     _assert(state.replan_count == 1, "replan 计数 +1")
     joined = "".join(ctx.emitted)
-    _assert("陆地卫星 4 景" in joined and "哨兵二号 6 景" in joined,
+    _assert("Landsat 8/9 4 景" in joined and "Sentinel-2 6 景" in joined,
             "气泡说清搜到了什么，不只说「未找到影像配对」")
     _assert("云量阈值" in joined, "气泡说明当前云量阈值")
 

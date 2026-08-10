@@ -431,15 +431,18 @@ def test_approval_full_workflow():
         agent = GeoThermoAgent(assistant, registry)
         pause = _scripted_pause([
             (Node.PLAN_CONFIRM, Option.START, {}),
+            (Node.ACQUISITION_MODE, Option.PAIR_MODE, {}),
             (Node.TUNING_DECISION, Option.ACCEPT, {}),
             (Node.FINAL_REPORT, Option.DONE, {}),
+            (Node.POSTPROCESS, Option.SKIP_POSTPROCESS, {}),
         ])
         out = env.run(agent, "跑一下九江镇 2025 年 7 月的全流程",
                       exec_mode="approval", pause_callback=pause)
 
         nodes = [p.get("node") for p in pause.seen if isinstance(p, dict) and p.get("node")]
-        _assert(nodes == [Node.PLAN_CONFIRM, Node.TUNING_DECISION, Node.FINAL_REPORT],
-                f"依次弹出方案确认、调优决策、最终报告（实际 {nodes}）")
+        _assert(nodes == [Node.PLAN_CONFIRM, Node.ACQUISITION_MODE,
+                          Node.TUNING_DECISION, Node.FINAL_REPORT, Node.POSTPROCESS],
+                f"依次弹出方案确认、影像获取方式、调优决策、最终报告、结果后处理（实际 {nodes}）")
         pair_payloads = [p for p in pause.seen if p.get("pairs")]
         _assert(len(pair_payloads) == 1, "影像配对选择也停下来问了")
         pairs = pair_payloads[0]["pairs"]
@@ -467,6 +470,7 @@ def test_approval_high_accuracy_still_asks():
         agent = GeoThermoAgent(assistant, registry)
         pause = _scripted_pause([
             (Node.PLAN_CONFIRM, Option.START, {}),
+            (Node.ACQUISITION_MODE, Option.PAIR_MODE, {}),
             (Node.TUNING_DECISION, Option.ACCEPT, {}),
             (Node.FINAL_REPORT, Option.DONE, {}),
         ])
@@ -492,6 +496,7 @@ def test_pipeline_failure_blocks_training():
         agent = GeoThermoAgent(assistant, registry)
         pause = _scripted_pause([
             (Node.PLAN_CONFIRM, Option.START, {}),
+            (Node.ACQUISITION_MODE, Option.PAIR_MODE, {}),
             (Node.DATA_QUALITY, Option.STOP, {}),
         ])
         out = env.run(agent, "跑全流程", exec_mode="approval", pause_callback=pause)
@@ -631,9 +636,11 @@ def test_reselect_pair_skips_replan():
         agent = GeoThermoAgent(assistant, registry)
         pause = _scripted_pause([
             (Node.PLAN_CONFIRM, Option.START, {}),
+            (Node.ACQUISITION_MODE, Option.PAIR_MODE, {}),
             (Node.TUNING_DECISION, Option.RESELECT_PAIR, {}),
             (Node.TUNING_DECISION, Option.ACCEPT, {}),
             (Node.FINAL_REPORT, Option.DONE, {}),
+            (Node.POSTPROCESS, Option.SKIP_POSTPROCESS, {}),
         ])
         out = env.run(agent, "跑一下九江镇 2025 年 7 月的全流程",
                       exec_mode="approval", pause_callback=pause)

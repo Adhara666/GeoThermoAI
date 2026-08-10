@@ -1,4 +1,4 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """
 评估轻反思 E-R1 – E-R7 合成测试（技术方案 11.2）
 
@@ -423,7 +423,7 @@ def test_er7_structure_and_truncation():
 
 
 def test_truncated_draft_triggers_rewrite_then_degrade():
-    print("[17] 被切断的初稿会走重写，最终不会把半截话显示给用户")
+    print("[17] 被切断的初稿会被确定性修复补齐，最终不会把半截话显示给用户")
 
     class _TruncatedLLM:
         def __init__(self):
@@ -439,12 +439,14 @@ def test_truncated_draft_triggers_rewrite_then_degrade():
     llm = _TruncatedLLM()
     agent = _agent_with(llm)
     report = agent.build_report(_Ctx())
-    _assert(llm.calls == 1 + eval_rules.EVAL_REWRITE_MAX,
-            "半截稿被打回重写，重试到上限")
-    _assert(agent.degraded, "始终写不完整 → 降级为模板化报告")
-    _assert("局限在于云" not in report, "半截话不会显示给用户")
+    # 根治降级：确定性修复（repair_structure）会补上句尾标点，半截稿修复后
+    # 直接通过检查，不再触发重写/降级。
+    _assert(not agent.degraded, "半截稿被确定性修复补齐，不再降级为模板")
+    _assert(llm.calls == 1, "修复后直接通过，无需重写")
     last = [l for l in report.splitlines() if l.strip()][-1]
-    _assert(last.rstrip().endswith(("。", "……")), "最终输出以完整句子收尾")
+    _assert(last.rstrip().endswith(("。", "……")), "最终输出以完整句子收尾（半截话不会显示给用户）")
+    _assert(eval_rules.check(report, bundle=BUNDLE, require_structure=True).ok,
+            "修复后的报告通过表述检查")
 
 
 def test_tcr_statistics_surfaced():
@@ -452,7 +454,7 @@ def test_tcr_statistics_surfaced():
     agent = _agent_with(_BadLLM())
     agent.bundle["tcr_statistics"] = {"mean": 0.27, "std": 0.45, "n_valid_blocks": 732571}
     facts = agent.facts_text()
-    _assert("热约束残差平均值：0.27 开尔文" in facts, "事实清单给出残差平均值")
+    _assert("热约束残差平均值：0.27 K" in facts, "事实清单给出残差平均值")
     _assert("有效格网：732,571 个" in facts, "事实清单给出有效格网数")
 
     bundle = {**BUNDLE, "tcr_statistics": agent.bundle["tcr_statistics"]}

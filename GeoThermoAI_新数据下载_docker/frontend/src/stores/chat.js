@@ -9,6 +9,25 @@ const CHAT_MODE_KEY = 'gtai_chat_mode'
 // 避免旧对话的流式回调继续串写全局 store）
 let activeStream = null
 
+// 实时日志双层结构（根治「全流程后页面卡顿」）：
+//   logAll    完整日志（供复制按钮导出，不被渲染）
+//   logLines  渲染窗口，只保留尾部 LOG_VIEW_MAX 行（日志面板 v-for 只渲染这段）
+// 下载阶段日志事件高频（并发分块按 2MB 粒度上报），每行都做响应式替换会占满
+// 主线程 → 页面所有交互（含气泡滚动条）卡死；因此日志批量合并到 120ms 节流窗口
+// 再更新一次 logLines。
+const LOG_ALL_MAX = 20000
+const LOG_VIEW_MAX = 1000
+
+// 按对话暂存日志：切换对话不丢（切回原对话时恢复），LRU 上限 5 个防内存膨胀；
+// 刷新页面后内存清空（实时日志本来就是会话内存态，与后端会话文件无关）
+let _convLogCache = {}
+let _convLogOrder = []
+const LOG_CACHE_MAX = 5
+
+let _logBuf = []
+let _logTimer = null
+let _activeConvId = ''
+
 function loadExecMode() {
   try {
     const v = localStorage.getItem(EXEC_MODE_KEY)
@@ -65,7 +84,8 @@ export const useChatStore = defineStore('chat', {
     execMode: loadExecMode(), // 'approval'（由我批准）| 'auto'（完全执行）
     chatMode: loadChatMode(), // 'work'（完整执行）| 'chat'（只读对话，升级点 17）
     workflowSteps: [], // [{id,label,status}]
-    logLines: [], // 实时过程日志（日志面板）
+    logLines: [], // 实时过程日志（日志面板渲染窗口，尾部 LOG_VIEW_MAX 行）
+    logAll: [], // 完整实时日志（供复制导出，不参与渲染）
     modelLabel: '',
   }),
 
@@ -92,13 +112,25 @@ export const useChatStore = defineStore('chat', {
     },
 
     async loadMessages(pid, cid) {
-      // 升级点 6：切换对话/项目时重置上一对话的暂停态、配对卡、审批、日志与进度，
+      // 升级点 6：切换对话/项目时重置上一对话的暂停态、配对卡、审批与进度，
       // 避免上一对话的弹窗/日志串扰当前对话（正在运行的流由 resumeIfStreaming 恢复）
+      // 日志例外：按对话暂存，切回原对话时恢复，不再被清空
+      if (_activeConvId && _activeConvId !== cid) {
+        _convLogCache[_activeConvId] = { all: this.logAll, view: this.logLines }
+        _convLogOrder = _convLogOrder.filter((x) => x !== _activeConvId)
+        _convLogOrder.push(_activeConvId)
+        if (_convLogOrder.length > LOG_CACHE_MAX) {
+          delete _convLogCache[_convLogOrder.shift()]
+        }
+      }
+      _activeConvId = cid
       this.streaming = false
       this.paused = false
       this.pairs = []
       this.approval = null
-      this.logLines = []
+      const saved = _convLogCache[cid]
+      this.logAll = saved ? saved.all : []
+      this.logLines = saved ? saved.view : []
       this.workflowSteps = []
       const data = await api.get(`/api/messages?project=${encodeURIComponent(pid)}&conv=${encodeURIComponent(cid)}`)
       this.messages = normalizeMessages(data.messages || [])
@@ -148,7 +180,12 @@ export const useChatStore = defineStore('chat', {
       this.paused = false
       this.pairs = []
       this.approval = null
-      this.logLines = [] // 新流程开始时清空日志面板
+      // 新流程开始：清空当前对话日志（含缓存），本对话的日志从新流程重新累积
+      this.logAll = []
+      this.logLines = []
+      if (_logTimer) { clearTimeout(_logTimer); _logTimer = null }
+      _logBuf = []
+      if (_activeConvId) delete _convLogCache[_activeConvId]
       try {
         const r = await api.post('/api/chat/start', {
           project: useProjectStore().currentProject,
@@ -211,13 +248,7 @@ export const useChatStore = defineStore('chat', {
         } else if (type === 'workflow') {
           this.workflowSteps = data.steps || []
         } else if (type === 'log') {
-          const text = (data.text || '').replace(/\r?\n$/, '')
-          if (text) {
-            this.logLines.push(text)
-            // 防止日志无限增长拖慢渲染（下载进度按 2MB 粒度上报，大文件可能上千行）
-            if (this.logLines.length > 3000) this.logLines = this.logLines.slice(-3000)
-            this.logLines = [...this.logLines]
-          }
+          this._acceptLog(data.text)
         } else if (type === 'done') {
           const last = this.messages[this.messages.length - 1]
           if (last && data.content) last.content = data.content
@@ -280,13 +311,43 @@ export const useChatStore = defineStore('chat', {
       }
     },
 
+    /** 接收一条实时日志：完整保存到 logAll，渲染窗口 logLines 走 120ms 节流合并。
+     *  高频下载进度上报若逐行触发响应式更新会占满主线程（页面全卡），
+     *  合并成 120ms 一批只重渲染尾部 LOG_VIEW_MAX 行。 */
+    _acceptLog(text) {
+      const line = String(text || '').replace(/\r?\n$/, '')
+      if (!line) return
+      _logBuf.push(line)
+      if (_logTimer) return
+      _logTimer = setTimeout(() => {
+        _logTimer = null
+        if (!_logBuf.length) return
+        const batch = _logBuf
+        _logBuf = []
+        this.logAll = this.logAll.concat(batch)
+        if (this.logAll.length > LOG_ALL_MAX) this.logAll = this.logAll.slice(-LOG_ALL_MAX)
+        this.logLines = this.logAll.slice(-LOG_VIEW_MAX)
+      }, 120)
+    },
+
     clear() {
+      // 关闭并释放当前 SSE 流（删除项目/对话时若仍在运行，避免旧流继续回调串写）
+      if (activeStream) {
+        try { activeStream.close() } catch (_) {}
+        activeStream = null
+      }
+      if (_logTimer) { clearTimeout(_logTimer); _logTimer = null }
+      _logBuf = []
+      if (_activeConvId) delete _convLogCache[_activeConvId]
+      _activeConvId = ''
       this.messages = []
       this.streaming = false
       this.paused = false
       this.pairs = []
       this.approval = null
+      this.logAll = []
       this.logLines = []
+      this.workflowSteps = [] // 复位进度面板为"等待"（删除项目/对话后立即变等待，不再残留旧进度）
     },
   },
 })

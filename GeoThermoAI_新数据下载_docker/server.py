@@ -691,7 +691,8 @@ class AppBackend:
             logging.warning(f"[memory] 删除对话记忆失败: {e}")
         self._hard_delete_conversation(cid, pid, convs)
         remaining = [k for k in convs[pid] if not k.startswith("__")]
-        return {"ok": True, "message": "对话已彻底删除", "remaining": remaining}
+        title = convs[pid][cid].get("title") or cid
+        return {"ok": True, "message": f"对话「{title}」已彻底删除", "remaining": remaining}
 
     def _async_delete_conversation_memory(self, project_id: str, cid: str):
         """后台线程删除对话记忆（不阻塞删除请求返回）"""
@@ -1550,14 +1551,25 @@ class AppBackend:
 
                     def workflow_callback(skill_name, status, idx, total):
                         wp = conv_state["workflow_progress"]
+                        # 用 skill 在标准流程中的全局位置判定前后步骤，不能用 plan 的
+                        # 局部索引：单步执行（如只发"评估一下我的结果和精度"）时
+                        # accuracy_eval 的局部 idx=0，用 idx 会把 data_acquisition
+                        # 错误重写为 pending，覆盖原有的 completed。
+                        if skill_name not in WORKFLOW_STEPS:
+                            return
+                        prev_map = {s["name"]: s["status"] for s in wp.get("steps", [])}
+                        gidx = WORKFLOW_STEPS.index(skill_name)
                         steps = []
                         for si, sn in enumerate(WORKFLOW_STEPS):
                             if sn == skill_name:
                                 steps.append({"name": sn, "status": status})
-                            elif si < idx:
-                                steps.append({"name": sn, "status": "completed"})
+                            elif si < gidx:
+                                # 当前 skill 之前的步骤：保留既有状态；未出现过视为已完成
+                                # （顺序执行语义下，能执行到本步说明前面步骤已跑过）
+                                steps.append({"name": sn, "status": prev_map.get(sn) or "completed"})
                             else:
-                                steps.append({"name": sn, "status": "pending"})
+                                # 之后的步骤：保留既有状态，不被单步执行覆盖成 pending
+                                steps.append({"name": sn, "status": prev_map.get(sn) or "pending"})
                         wp["status"] = "running" if status != "completed" else (
                             "completed" if idx + 1 >= total else "running"
                         )
@@ -2071,6 +2083,28 @@ def layers(conv: str = ""):
     return {"layers": backend.list_layers(conv or None)}
 
 
+@app.post("/api/lst-values")
+def lst_values(payload: dict, conv: str = ""):
+    """批量读取光标所在像元在各地表温度图层上的温度（单位 K）。
+
+    payload: {"lat": float, "lon": float, "layers": [图层 id, ...]}
+    返回 {"values": {layer_id: 温度或 null}}；非 LST 图层 id 会被忽略。
+    """
+    project_dir = backend._get_project_dir(conv or None)
+    if not project_dir or not os.path.isdir(project_dir):
+        return {"values": {}}
+    try:
+        lat = float(payload.get("lat"))
+        lon = float(payload.get("lon"))
+    except (TypeError, ValueError):
+        return {"values": {}}
+    values = {}
+    for lid in (payload.get("layers") or []):
+        value = LayerVisualizer.sample_lst_value(project_dir, str(lid), lat, lon)
+        values[str(lid)] = value
+    return {"values": values}
+
+
 @app.get("/api/layer/{layer_id}/png")
 def layer_png(layer_id: str, conv: str = ""):
     result = backend.render_layer_png(layer_id, conv or None)
@@ -2220,7 +2254,20 @@ def test_gdal():
 
 _DIST = _ROOT / "dist"
 if _DIST.exists():
-    app.mount("/", StaticFiles(directory=str(_DIST), html=True), name="static")
+    # 静态资源一律不缓存（no-cache）：前端每次构建产物 hash 变化，
+    # 但 index.html 不带 hash，浏览器按启发式缓存会一直加载旧页面导致
+    # 部署后看不到更新，必须强制每次重新校验。
+    app.mount(
+        "/", StaticFiles(directory=str(_DIST), html=True), name="static",
+    )
+
+    @app.middleware("http")
+    async def _no_cache_static(request, call_next):
+        response = await call_next(request)
+        if request.url.path in ("/", "/index.html") or request.url.path.startswith("/assets/"):
+            response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+            response.headers["Pragma"] = "no-cache"
+        return response
 
 
 # ── 入口 ───────────────────────────────────────────────────────
