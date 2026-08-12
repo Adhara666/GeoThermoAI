@@ -4,8 +4,6 @@
     - 只负责粗尺度闭合协议（coarse_constraint_closure），使用完整 30m 约束层
       作为参考，评估 10m 最终结果回聚合到 30m 产品格网的算术均值闭合度；
       明确标注不是独立 10m 精度、不代表能量/辐射守恒；
-    - 独立预测协议（independent_prediction）已随 rf_model 阶段一并产出
-      （因为需要模型对象，本 Skill 拿不到 model_path）；
     - 输出 MB/MAE/RMSE 及各完整有效输出范围低/高端的有符号温差，不输出
       阈值判据类字段；
     - Agent 固定注入的 full_30m_csv/meta_30m_json 仍指向 step2 抽样文件，本
@@ -40,9 +38,9 @@ class AccuracyEvalSkill(BaseSkill):
     @property
     def parameters(self) -> List[SkillParameter]:
         return [
-            SkillParameter(name="test_csv", type="file_path", description="测试集CSV路径（本Skill不使用；独立预测评估已随rf_model阶段产出）", required=False),
-            SkillParameter(name="full_30m_csv", type="file_path", description="30m step2抽样CSV路径（仅用于定位同目录下的完整约束层）", required=True),
-            SkillParameter(name="predict_csv", type="file_path", description="10m最终结果CSV路径（含row, col, LST_final列）", required=True),
+            SkillParameter(name="test_csv", type="file_path", description="测试集Parquet路径（本Skill不使用；测试集评估已随rf_model阶段产出）", required=False),
+            SkillParameter(name="full_30m_csv", type="file_path", description="30m step2抽样Parquet路径（仅用于定位同目录下的完整约束层）", required=True),
+            SkillParameter(name="predict_csv", type="file_path", description="10m最终结果Parquet路径（含row, col, LST_final列）", required=True),
             SkillParameter(name="output_dir", type="file_path", description="输出目录路径", required=True),
             SkillParameter(name="meta_30m_json", type="file_path", description="30m step2元数据JSON路径（同上，仅用于定位）", required=True),
             SkillParameter(name="meta_10m_json", type="file_path", description="10m元数据JSON路径（含transform仿射变换参数）", required=True),
@@ -51,8 +49,8 @@ class AccuracyEvalSkill(BaseSkill):
     @property
     def input_schema(self) -> Dict[str, str]:
         return {
-            "full_30m_csv": "30m全量数据CSV路径",
-            "predict_csv": "10m最终结果CSV路径",
+            "full_30m_csv": "30m全量数据Parquet路径",
+            "predict_csv": "10m最终结果Parquet路径",
             "output_dir": "输出目录",
         }
 
@@ -91,7 +89,7 @@ class AccuracyEvalSkill(BaseSkill):
                 return SkillResult(success=False, message=f"重建输入失败: {e}")
 
         processed_dir = os.path.dirname(full_30m_csv)
-        constraint_csv = params.get("constraint_csv") or os.path.join(processed_dir, "30m_constraint_grid.csv")
+        constraint_csv = params.get("constraint_csv") or os.path.join(processed_dir, "30m_constraint_grid.parquet")
         constraint_meta = params.get("constraint_meta") or os.path.join(processed_dir, "30m_constraint_grid_meta.json")
 
         for label, path in [
@@ -140,7 +138,7 @@ class AccuracyEvalSkill(BaseSkill):
                 artifacts={"output_path": result.get("output_path", "")},
                 stats={"closure": closure, "value_range": value_range},
             )
-            # 全流程最后一步完成后，约束层与 TCR 中间 CSV 已无任何消费方，立即清理
+            # 全流程最后一步完成后，约束层与 TCR 中间 Parquet 已无任何消费方，立即清理
             cleanup_stage(project_root, "accuracy_eval")
 
         if progress_callback:

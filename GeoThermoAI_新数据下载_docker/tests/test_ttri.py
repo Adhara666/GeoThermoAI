@@ -38,13 +38,13 @@ def make_df(n, seed):
     return df
 
 
-train_csv = os.path.join(workdir, 'train.csv')
-val_csv = os.path.join(workdir, 'validate.csv')
-test_csv = os.path.join(workdir, 'test.csv')
+train_csv = os.path.join(workdir, 'train.parquet')
+val_csv = os.path.join(workdir, 'validate.parquet')
+test_csv = os.path.join(workdir, 'test.parquet')
 
-make_df(n, 1).to_csv(train_csv, index=False)
-make_df(80, 2).to_csv(val_csv, index=False)
-make_df(80, 3).to_csv(test_csv, index=False)
+make_df(n, 1).to_parquet(train_csv, index=False)
+make_df(80, 2).to_parquet(val_csv, index=False)
+make_df(80, 3).to_parquet(test_csv, index=False)
 
 result = ttri.compute_ttri_for_splits(train_csv, val_csv, test_csv, workdir)
 print('fit coefficients:', result['coefficients'])
@@ -58,24 +58,24 @@ assert os.path.isfile(coef_path)
 print('OK: fit_ttri_train recovers ground-truth coefficients; ttri_coefficients.json written')
 
 # ---- Anti-leakage check: mutate validate/test LST, TTRI should NOT change ----
-df_val_before = pd.read_csv(val_csv)
+df_val_before = pd.read_parquet(val_csv)
 ttri_before = df_val_before['TTRI'].values.copy()
 
-df_val_mutated = pd.read_csv(val_csv)
+df_val_mutated = pd.read_parquet(val_csv)
 df_val_mutated['LST'] = df_val_mutated['LST'] + 999.0  # sabotage the label
-df_val_mutated.to_csv(val_csv, index=False)
+df_val_mutated.to_parquet(val_csv, index=False)
 
 # Re-apply using SAME coefficients (simulating a second run without refit)
 with open(coef_path, encoding='utf-8') as f:
     coef_dict = json.load(f)
 ttri.apply_ttri_column(val_csv, coef_dict)
-df_val_after = pd.read_csv(val_csv)
+df_val_after = pd.read_parquet(val_csv)
 assert np.allclose(df_val_after['TTRI'].values, ttri_before, atol=1e-9), 'TTRI changed after LST label was corrupted -> LEAKAGE BUG'
 print('OK: mutating validate LST does not change its TTRI (no leakage)')
 
 # ---- Confirm train/validate/test coefficients are literally the SAME hash source ----
-df_train = pd.read_csv(train_csv)
-df_test = pd.read_csv(test_csv)
+df_train = pd.read_parquet(train_csv)
+df_test = pd.read_parquet(test_csv)
 # recompute TTRI manually from coefficients and compare
 coef_arr = np.array(coef_dict['coefficients'])
 manual_train_ttri = df_train[['DEM', 'Slope', 'cos(Aspect)']].values @ coef_arr
@@ -84,13 +84,13 @@ manual_test_ttri = df_test[['DEM', 'Slope', 'cos(Aspect)']].values @ coef_arr
 assert np.allclose(manual_test_ttri, df_test['TTRI'].values, atol=1e-6)
 print('OK: train/validate/test TTRI all derive from the identical coefficient set')
 
-# ---- B-04: rank-deficient / ill-conditioned should raise, not silently succeed ----
+# ---- rank-deficient / ill-conditioned should raise, not silently succeed ----
 flat_df = make_df(50, 5)
 flat_df['DEM'] = 100.0  # constant -> collinear-ish with intercept, should be flagged
 flat_df['Slope'] = 0.0
 flat_df['cos(Aspect)'] = 1.0
-flat_csv = os.path.join(workdir, 'flat_train.csv')
-flat_df.to_csv(flat_csv, index=False)
+flat_csv = os.path.join(workdir, 'flat_train.parquet')
+flat_df.to_parquet(flat_csv, index=False)
 try:
     ttri.fit_ttri_train(flat_csv, workdir)
     raise SystemExit('expected ValueError for rank-deficient TTRI fit, but succeeded silently')
@@ -113,8 +113,8 @@ constraint_df = pd.DataFrame({
     'row': rows30, 'col': cols30, 'LST': lst30,
     'DEM': dem30, 'Slope': slope30, 'cos(Aspect)': cosaspect30,
 })
-constraint_csv = os.path.join(workdir, '30m_constraint_grid.csv')
-constraint_df.to_csv(constraint_csv, index=False)
+constraint_csv = os.path.join(workdir, '30m_constraint_grid.parquet')
+constraint_df.to_parquet(constraint_csv, index=False)
 
 # 30m transform: origin (500000, 4000000), 30m pixel, north-up
 coarse_transform = [30.0, 0.0, 500000.0, 0.0, -30.0, 4000000.0]
@@ -141,10 +141,10 @@ predict_df = pd.DataFrame({
     'R': 0.1, 'G': 0.1, 'B': 0.1, 'NIR': 0.2, 'SWIR1': 0.2,
     'NDVI': 0.1, 'NDWI': 0.1, 'NDBI': 0.1,
 })
-predict_csv = os.path.join(workdir, '10m_predict_features.csv')
-predict_df.to_csv(predict_csv, index=False)
+predict_csv = os.path.join(workdir, '10m_predict_features.parquet')
+predict_df.to_parquet(predict_csv, index=False)
 
-ttri_predict_out = os.path.join(workdir, '10m_predict_with_ttri.csv')
+ttri_predict_out = os.path.join(workdir, '10m_predict_with_ttri.parquet')
 res = ttri.compute_ttri_predict(
     constraint_csv, constraint_meta_json, predict_csv, predict_meta_json,
     coef_dict, ttri_predict_out, batch_size=100000,
@@ -152,7 +152,7 @@ res = ttri.compute_ttri_predict(
 print('compute_ttri_predict result:', {k: v for k, v in res.items() if k != 'grid_ratio_diagnostics'})
 assert res['grid_ratio_diagnostics']['fast_path_eligible'] is True, 'exact aligned 3:1 grid should be flagged fast_path_eligible'
 
-out_df = pd.read_csv(ttri_predict_out)
+out_df = pd.read_parquet(ttri_predict_out)
 # analytic expected TTRI at fine pixel (row,col): its center maps to real-world (x,y),
 # then to continuous 30m coords; because DEM is perfectly bilinear (linear in row/col),
 # the interpolated DEM at any fine pixel center should equal the analytic DEM value there.

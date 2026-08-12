@@ -13,7 +13,7 @@ from .rf_model import train_random_forest, predict_test_set
 from .tcr import compute_tcr
 from .lst_final import compute_lst_final
 from .export_geotiff import export_geotiff
-from .evaluation import evaluate_independent_prediction, evaluate_coarse_constraint_closure
+from .evaluation import evaluate_coarse_constraint_closure
 from .pipeline import EasyLSTPipeline
 from .ai_assistant import GeoThermoAI_Assistant
 
@@ -28,7 +28,6 @@ __all__ = [
     "compute_tcr",
     "compute_lst_final",
     "export_geotiff",
-    "evaluate_independent_prediction",
     "evaluate_coarse_constraint_closure",
     "EasyLSTPipeline",
     "GeoThermoAI_Assistant",

@@ -8,11 +8,11 @@
 删除时机与 Agent 7 阶段工作流（core/agent/geo_thermo_agent.py 的 SKILL_PATHS
 注入的 project_dir/{raw,processed,results} 目录约定）一致：
 
-    - data_pipeline 完成后：Aligned_* 对齐栅格（4 个）+ 30m_features_step2.csv
-    - rf_model      完成后：processed/train.csv, validate.csv, test.csv
-    - tcr_compute   完成后：processed/10m_predict_features.csv
-    - lst_export    完成后：results/rf_10m_predict.csv
-    - accuracy_eval 完成后：processed/30m_constraint_grid.csv, results/tcr_result.csv
+    - data_pipeline 完成后：Aligned_* 对齐栅格（4 个）+ 30m_features_step2.parquet
+    - rf_model      完成后：processed/train.parquet, validate.parquet, test.parquet
+    - tcr_compute   完成后：processed/10m_predict_features.parquet
+    - lst_export    完成后：results/rf_10m_predict.parquet
+    - accuracy_eval 完成后：processed/30m_constraint_grid.parquet, results/tcr_result.parquet
 
 删除前提已逐一核对：被删文件在该阶段之后不再被任何下游环节（skill、
 run_manifest 状态查询、精度接口、地图图层）读取；仅做 dirname 定位的
@@ -30,21 +30,22 @@ run_manifest 状态查询、精度接口、地图图层）读取；仅做 dirnam
 
 import os
 
-# 会被清理的中间产物文件名（精确 basename；下载面板/下载接口按同一集合过滤）
+# 会被清理的中间产物文件名（精确 basename；下载面板/下载接口按同一集合过滤；
+# 升级：中间产物表统一 Parquet 后缀）
 INTERMEDIATE_FILENAMES = frozenset({
     "Aligned_S2_30m.tif",
     "Aligned_SCL_30m.tif",
     "Aligned_DEM_30m.tif",
     "Aligned_SCL_to_S2_10m.tif",
-    "30m_features_step2.csv",
-    "30m_constraint_grid.csv",
-    "10m_predict_features.csv",
-    "train.csv",
-    "validate.csv",
-    "test.csv",
-    "tcr_result.csv",
-    "tcr_predict.csv",
-    "rf_10m_predict.csv",
+    "30m_features_step2.parquet",
+    "30m_constraint_grid.parquet",
+    "10m_predict_features.parquet",
+    "train.parquet",
+    "validate.parquet",
+    "test.parquet",
+    "tcr_result.parquet",
+    "tcr_predict.parquet",
+    "rf_10m_predict.parquet",
     "_merged_vrt_temp.tif",
 })
 
@@ -55,23 +56,23 @@ _STAGE_FILES: dict = {
         "Aligned_SCL_30m.tif",
         "Aligned_DEM_30m.tif",
         "Aligned_SCL_to_S2_10m.tif",
-        "30m_features_step2.csv",
+        "30m_features_step2.parquet",
     ],
     "rf_model": [
-        "train.csv",
-        "validate.csv",
-        "test.csv",
+        "train.parquet",
+        "validate.parquet",
+        "test.parquet",
     ],
     "tcr_compute": [
-        "10m_predict_features.csv",
+        "10m_predict_features.parquet",
     ],
     "lst_export": [
-        "rf_10m_predict.csv",
+        "rf_10m_predict.parquet",
     ],
     "accuracy_eval": [
-        "30m_constraint_grid.csv",
-        "tcr_result.csv",
-        "tcr_predict.csv",
+        "30m_constraint_grid.parquet",
+        "tcr_result.parquet",
+        "tcr_predict.parquet",
     ],
 }
 

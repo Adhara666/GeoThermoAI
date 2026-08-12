@@ -1,5 +1,5 @@
 <script setup>
-// Chat / Work 双模式切换（升级点 17）
+// Chat / Work 双模式切换
 // Chat = 只读对话（Agent 不执行工作流、不改文件）；Work = 完整执行
 // 风格与 ExecModeSelect 的"由我批准/完全执行"下拉一致：上拉面板选择
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'

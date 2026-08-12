@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-结构化 plan schema 合成测试（技术方案 11.2）
+结构化 plan schema 合成测试
 
 运行：python tests/test_plan_schema.py
 覆盖：

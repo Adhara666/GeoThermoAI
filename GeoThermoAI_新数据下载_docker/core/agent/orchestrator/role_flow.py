@@ -1,5 +1,5 @@
 """
-角色编排的总调度流程（技术方案 2.1 / 2.4）
+角色编排的总调度流程
 
 `GeoThermoAgent.process_command_with_roles` 的实现落在这里，`GeoThermoAgent` 侧只保留
 薄委托。这样做的原因有两个：
@@ -8,7 +8,7 @@
 2. 「Plan 交规划 Agent、Solve 由总调度按 plan 依次调用执行 Agent」是编排层的职责，
    与 `orchestrator/` 下的执行模式、审批协议、状态机天然同层。
 
-replan 只能由总调度发起、只能由规划 Agent 产出新 plan（技术方案 2.4 规则 1），
+replan 只能由总调度发起、只能由规划 Agent 产出新 plan（规则 1），
 这条规则的落点就是本文件的 `solve_with_replan`。
 """
 
@@ -48,7 +48,8 @@ def run_with_roles(agent, user_input: str, on_token=None, on_log=None,
             if on_log:
                 on_log(text)
             return
-        stream_acc.append(text)
+        # 气泡文案统一数字两侧空格（幂等）
+        stream_acc.append(presentation.normalize_number_spacing(text))
         if on_token:
             on_token("".join(stream_acc))
 
@@ -95,7 +96,10 @@ def run_with_roles(agent, user_input: str, on_token=None, on_log=None,
 
     plan = outcome.plan or {}
     run_state.plan_id = plan.get("plan_id", "")
-    _emit(presentation.study_area_loaded((plan.get("region") or {}).get("name", "")))
+    # 研究区未确定（如单步结果后处理）时不出「已载入研究区：」空行
+    _region_name = (plan.get("region") or {}).get("name", "")
+    if _region_name:
+        _emit(presentation.study_area_loaded(_region_name))
     _emit(presentation.plan_ready(len(plan.get("steps") or [])))
 
     if not project_dir:
@@ -120,9 +124,11 @@ def run_with_roles(agent, user_input: str, on_token=None, on_log=None,
                 session.update(pending_question=message)
             return message
 
-    # 月度合成模式选择（升级点：时间范围为整月时，无论「完全执行」还是「由我批准」，
-    # 都必须用弹窗询问用户是「配对模式」还是「月度合成模式」）
-    _pause_flag = ask_acquisition_mode_if_month(plan, pause_callback, run_state, _emit)
+    # 月度合成模式选择（时间范围为整月时，无论「完全执行」还是「由我批准」，
+    # 都必须用弹窗询问用户是「配对模式」还是「月度合成模式」；
+    # 用户指令里已明确提到「月度合成/配对模式」等说法时跳过弹窗直接进入对应模式）
+    _pause_flag = ask_acquisition_mode_if_month(plan, pause_callback, run_state, _emit,
+                                                user_input=user_input)
     if _pause_flag:
         return "\n".join(stream_acc) + f"\n{_pause_flag}"
 
@@ -137,7 +143,23 @@ def run_with_roles(agent, user_input: str, on_token=None, on_log=None,
     )
 
 
-def ask_acquisition_mode_if_month(plan: dict, pause_callback, run_state, emit) -> str:
+def _detect_acquisition_mode_hint(text: str) -> str:
+    """用户指令里是否已明确指定影像获取方式。
+
+    「月度合成/月合成/按月合成/月度模式/合成模式」→ 'monthly'；
+    「配对模式/影像配对/逐对/按对/配对」→ 'pair'；
+    都没提到 → 返回空串（照旧弹窗询问）。月度词优先于配对词。
+    """
+    text = text or ""
+    if any(w in text for w in ("月度合成", "月合成", "按月合成", "月度模式", "合成模式")):
+        return "monthly"
+    if any(w in text for w in ("配对模式", "影像配对", "逐对", "按对", "配对")):
+        return "pair"
+    return ""
+
+
+def ask_acquisition_mode_if_month(plan: dict, pause_callback, run_state, emit,
+                                  user_input: str = "") -> str:
     """时间范围为整月时，弹窗询问「配对模式 / 月度合成模式」。
 
     无论执行模式（完全执行 / 由我批准）都会触发；用户选择写入 plan 的
@@ -145,7 +167,23 @@ def ask_acquisition_mode_if_month(plan: dict, pause_callback, run_state, emit) -
     下载模块的约定值，与前端选项值 monthly_mode/pair_mode 区分开）。
     返回非空表示流程应暂停（PAUSE_MARKER）；返回空字符串表示继续执行。
     时间范围不是整月（或未提供）时不弹窗。
+
+    用户指令已明确指定获取方式（如「做月度合成」「用配对模式」）时跳过弹窗，
+    直接按指定方式写入 composite（不依赖时间范围是否整月）。
     """
+    # 用户指令直接指定获取方式：跳过弹窗（并记录该「选择」供断点恢复）
+    _mode_hint = _detect_acquisition_mode_hint(user_input)
+    if _mode_hint:
+        run_state.record_approval(
+            approval_proto.Node.ACQUISITION_MODE,
+            (approval_proto.Option.MONTHLY_MODE if _mode_hint == "monthly"
+             else approval_proto.Option.PAIR_MODE))
+        for _s in plan.get("steps", []):
+            if _s.get("skill") == "data_acquisition":
+                _s.setdefault("params", {})["composite"] = _mode_hint
+                break
+        return ""
+
     _tr = plan.get("time_range") or {}
     _start, _end = str(_tr.get("start") or ""), str(_tr.get("end") or "")
     _is_month = bool(_start[:7]) and _start[:7] == _end[:7]
@@ -186,7 +224,7 @@ def solve_with_replan(agent, plan: dict, *, planner, ctx, run_state, session, em
                       on_thinking=None) -> str:
     """Solve 阶段：按 plan 执行；子 Agent 请求 replan 时由本方法（总调度）发起。
 
-    replan 只能由总调度发起、只能由规划 Agent 产出新 plan（技术方案 2.4 规则 1）。
+    replan 只能由总调度发起、只能由规划 Agent 产出新 plan（规则 1）。
     """
     from .role_hooks import RoleHooks
     from ..roles.data_agent import DataAgent
@@ -227,11 +265,10 @@ def solve_with_replan(agent, plan: dict, *, planner, ctx, run_state, session, em
         if request is None or PAUSE_MARKER in output:
             return "\n".join(r for r in results if r)
 
-        # 「重新选择影像组合」是阶段内回退，不是重新规划（技术方案 3.2.1，实现期修订 v1.2）：
+        # 「重新选择影像组合」是阶段内回退，不是重新规划：
         # 不调用规划 Agent、不计入 replan 次数，原样复用当前 plan 重新执行（自然回到
-        # data_acquisition 重新搜索并弹出配对选择）。此前的实现虽然文档写的是「阶段内
-        # 回退」，代码路径却真的会走到下面的 replan()，多一次不必要的 LLM 调用，还有被
-        # 规划 Agent 改写整条计划的风险。
+        # data_acquisition 重新搜索并弹出配对选择），避免多余的 LLM 调用和被规划 Agent
+        # 改写整条计划的风险。
         if (request.get("payload") or {}).get("reselect_pair"):
             emit("好的，回到影像组合选择，重新来一次。\n")
             # 必须清掉上一轮写入 data_acquisition 步骤 params 的 selected_pair，
@@ -375,6 +412,6 @@ def plan_summary(plan: dict) -> str:
     constraints = plan.get("constraints") or {}
     cloud = constraints.get("cloud_threshold")
     cloud_text = f"，云量上限 {cloud}" if cloud is not None else ""
-    # 升级点 27：研究区/时间/云量与步骤数分两行显示，前后两句都不带句号
+    # 研究区/时间/云量与步骤数分两行显示，前后两句都不带句号
     return (f"研究区 {region}，时间 {when}{cloud_text}\n"
             f"共 {len(plan.get('steps') or [])} 步：{stages}")

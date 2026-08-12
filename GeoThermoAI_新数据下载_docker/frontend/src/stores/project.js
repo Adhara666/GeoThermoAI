@@ -49,10 +49,10 @@ export const useProjectStore = defineStore('project', {
       const chat = useChatStore()
       const convs = p?.conversations || []
       if (convs.length) {
-        // 切换项目时自动进入第一个对话，并加载其消息/进度（升级点 13）
+        // 切换项目时自动进入第一个对话，并加载其消息/进度
         await this.selectConv(convs[0].id)
       } else {
-        // 项目没有对话：清空对话区，绝不显示上一个项目的内容（升级点 13）
+        // 项目没有对话：清空对话区，绝不显示上一个项目的内容
         chat.clear()
       }
     },
@@ -62,7 +62,7 @@ export const useProjectStore = defineStore('project', {
       // 刷新项目目录（对话可能带独立 project_dir）
       const p = this.tree.find((t) => t.project === this.currentProject)
       if (p) this.projectDir = p.project_dir || ''
-      // 切换对话时同步加载消息与进度，并恢复仍在运行的流（升级点 13）
+      // 切换对话时同步加载消息与进度，并恢复仍在运行的流
       const chat = useChatStore()
       await chat.loadMessages(this.currentProject, cid)
       await chat.resumeIfStreaming(cid)
@@ -72,7 +72,7 @@ export const useProjectStore = defineStore('project', {
     async createProject(name) {
       const t = useToast()
       if (!name?.trim()) { t.error('请输入项目名称'); return }
-      // 项目目录由后端按用户自动分配（升级规划 3.12），前端不再传路径
+      // 项目目录由后端按用户自动分配，前端不再传路径
       const r = await api.post('/api/projects', { name: name.trim() })
       if (!r.ok) { t.error(r.message); return }
       await this.bootstrap()

@@ -1,22 +1,28 @@
 """
-结果生成与评估 Agent（技术方案第 7 章）
+结果生成与评估 Agent
 
 覆盖 `tcr_compute` + `lst_export` + `accuracy_eval` 三个 Skill，加上**基于记忆先验的
 结果解读**。评估方法完全复用现有实现，本 Agent 不重算任何指标，只读结果。
 
-轻反思是「表述把关」：确定性规则 E-R1 – E-R6 命中即打回重写（最多 2 次），
-两次仍不过则降级为模板化报告，绝不输出未通过检查的文案。
+结果解读采用「系统组装 + LLM 定性短句」：
+- 报告里的数字、评级、闭合口径句全部由系统从真实结果确定性渲染（assemble_report），
+  不经过 LLM 之手，因此不存在「编造数字」「口径混用」的失败路径；
+- LLM 只负责「关键特征与局限」一节 1~3 句定性说明（_qualitative_note），
+  通过三项轻校验（无数字 / 无禁用表述 / 无极值负面判断）；不通过或接口不可用时
+  用固定兜底句替代，**报告永远完整、永不降级**。
 """
 
 import json
 import logging
 import os
+import re
 from typing import Any, Dict, List, Optional
 
 from ..orchestrator import approval as approval_proto
 from ..orchestrator.approval import Node, Option
 from ..orchestrator.exec_mode import is_auto
 from ..orchestrator.hooks import StepDecision
+from .. import presentation
 from ..reflection import eval_rules
 from ..reflection.train_rules import grade
 from .base_role import RoleAgent
@@ -25,36 +31,17 @@ from .prompts import evaluation as eval_prompts
 logger = logging.getLogger(__name__)
 
 
-def _flatten_metrics(source: Optional[dict]) -> Dict[str, Any]:
-    """把 `{"n_samples":…, "metrics": {"R2":…}}` 摊平成一层。
-
-    `core/evaluation.evaluate_independent_prediction` 把 R²/RMSE/MAE/MB 放在
-    `metrics` 子字典里，而 n_samples 在顶层。不摊平的话报告里会出现
-    「样本数有值、决定系数却显示未计算」这种自相矛盾的输出。
-    """
-    data = dict(source or {})
-    nested = data.pop("metrics", None)
-    if isinstance(nested, dict):
-        for key, value in nested.items():
-            data.setdefault(key, value)
-    return data
+# 定性说明未通过轻校验或接口不可用时的固定兜底句：报告永远完整，永不降级
+_FALLBACK_NOTE = "本次产品的关键特征与局限需结合研究区、天气与云掩膜情况理解。"
 
 
-def _cut_at_sentence(text: str, limit: int) -> str:
-    """按句子边界截断，绝不在句子中间断开（气泡不能出现半截话）。"""
-    body = (text or "").strip()
-    if len(body) <= limit:
-        return body
-    head = body[:limit]
-    for sep in ("。", "；", "！", "？"):
-        pos = head.rfind(sep)
-        if pos > 0:
-            return head[:pos + 1]
-    return head.rstrip("，、 ") + "……"
+def _normalize_note(note: str) -> str:
+    """把 LLM 定性短句里的中文度量单位规范为 10m/30m 写法（先替换更长词防重叠）。"""
+    return (note or "").replace("三十米", "30m").replace("十米", "10m").strip()
 
 
 class EvalAgent(RoleAgent):
-    """结果读取 + 解读生成 + 表述把关 + 工作流写回。"""
+    """结果读取 + 系统组装报告 + LLM 定性短句 + 工作流写回。"""
 
     role = "eval"
     role_name = "评估"
@@ -66,9 +53,8 @@ class EvalAgent(RoleAgent):
                          on_thinking=on_thinking)
         self.bundle: Dict[str, Any] = {}
         self.report = ""
-        self.degraded = False
-        self.degrade_reason = ""
-        self.rewrites = 0
+        # 定性说明未通过轻校验或接口不可用时的原因（空串 = 采用了 LLM 原文）
+        self.note_reason = ""
 
     # ── 执行引擎回调 ───────────────────────────────────────────────
 
@@ -94,6 +80,8 @@ class EvalAgent(RoleAgent):
 
         self._collect(ctx, data)
         self.report = self.build_report(ctx)
+        # 结果说明与上一步之间用与步骤间一致的留白隔开
+        ctx.emit(presentation.step_gap())
         ctx.emit(self.report + "\n")
         self._write_workflow(ctx, hooks)
 
@@ -129,10 +117,6 @@ class EvalAgent(RoleAgent):
         self.bundle["params"] = rf.get("params") or {}
 
         results_dir = getattr(ctx, "results_dir", "") or ""
-        indep = rf.get("independent_prediction") or self._read_json(
-            os.path.join(results_dir, "independent_prediction.json"))
-        self.bundle["independent_prediction"] = _flatten_metrics(indep)
-
         closure_full = accuracy_data.get("closure_metrics") or self._read_json(
             os.path.join(results_dir, "coarse_constraint_closure.json"))
         closure_full = closure_full or {}
@@ -141,13 +125,15 @@ class EvalAgent(RoleAgent):
             closure["value_range"] = closure_full["value_range"]
         self.bundle["closure"] = closure
 
-        for source in (self.bundle["test_metrics"], indep or {}):
+        for source in (self.bundle["test_metrics"],):
             if isinstance(source, dict) and source.get("r2_null_reason"):
                 self.bundle["r2_null_reason"] = source["r2_null_reason"]
 
         plan = getattr(ctx, "plan", {}) or {}
         self.bundle["region"] = (plan.get("region") or {}).get("name", "")
         self.bundle["time_range"] = plan.get("time_range") or {}
+        # 实际用到的影像组合（配对模式的卫星与日期；月度合成的代表日+composite=monthly）
+        self.bundle["pair"] = (getattr(ctx, "exp_state", None) or {}).get("pair") or {}
 
     @staticmethod
     def _read_json(path: str) -> Dict[str, Any]:
@@ -161,78 +147,68 @@ class EvalAgent(RoleAgent):
             logger.warning(f"[eval] 结果文件读取失败（按缺失处理）: {e}")
             return {}
 
-    # ── 解读生成 + 表述把关 ────────────────────────────────────────
+    # ── 结果解读：系统组装 + LLM 定性短句 ──────────────────────────
 
     def build_report(self, ctx: Any) -> str:
+        """生成最终结果说明：数字/评级/口径句由系统渲染，LLM 只补定性短句。
+
+        不再有「检查 → 重写 → 降级」循环：报告永远是完整的，
+        定性短句不通过轻校验就用固定兜底句，不会丢任何真实信息。
+        """
         expected = grade((self.bundle.get("test_metrics") or {}).get("R2"))
         knowledge = self._knowledge_block()
         facts = self.facts_text()
 
-        draft = self._generate(knowledge, facts, expected)
-        last_hits: List[str] = []
-        for attempt in range(eval_rules.EVAL_REWRITE_MAX + 1):
-            if not draft:
-                break
-            # 根治降级：先做确定性修复（数字对齐/禁用词替换/闭合口径/结构补齐），
-            # 修复后绝大多数稿子直接通过；重写只兜底"编造远离真实值数字"这类
-            # 无法自动修的情形，模板降级成为真正的最后手段。
-            draft = eval_rules.repair_draft(draft, self.bundle)
-            reflection = eval_rules.check(draft, bundle=self.bundle,
-                                          expected_grade=expected,
-                                          require_structure=True)
-            if reflection.ok:
-                self.rewrites = attempt
-                return draft
-            last_hits = list(reflection.rule_hits)
-            # 详细违规项只进日志面板（气泡红线 4），且可能含被编造的数字，不进报告
-            self.log(f"表述检查未通过（{'/'.join(last_hits)}），第 {attempt + 1} 次重写；"
-                     f"具体：{'；'.join(reflection.violations[:4])}")
-            if attempt >= eval_rules.EVAL_REWRITE_MAX:
-                break
-            draft = self._rewrite(knowledge, facts, draft, reflection.violations, expected)
+        note = self._qualitative_note(knowledge, facts, expected)
+        return self.assemble_report(expected, note)
 
-        self.degraded = True
-        self.degrade_reason = self._degrade_reason(bool(draft), last_hits)
-        self.log(f"降级为模板化报告：{self.degrade_reason}")
-        return self.template_report(expected)
+    def _qualitative_note(self, knowledge: str, facts: str, expected: str) -> str:
+        """让 LLM 生成「关键特征与局限」的 1~3 句定性说明。
 
-    @staticmethod
-    def _degrade_reason(had_draft: bool, rule_hits: List[str]) -> str:
-        """降级原因的一句话说明。
-
-        进报告的内容只放**规则中文短名**：既不引用可能被编造的原文，
-        也避免「E-R2」这类编号里的数字被 E-R1 当成指标数值（气泡红线 1 与 3）。
+        返回空串表示未采用 LLM 原文（接口不可用或未通过轻校验），
+        由 assemble_report 用固定兜底句替代，报告仍然完整。
         """
-        if not had_draft:
-            return "大模型没有返回解读内容（接口不可用或生成预算耗尽）"
-        if rule_hits:
-            labels = "、".join(eval_rules.rule_labels(rule_hits))
-            return f"自动解读连续两次未通过表述检查，未过项为{labels}"
-        return "自动解读未通过表述检查"
-
-    def _generate(self, knowledge: str, facts: str, expected: str) -> str:
-        # 实现期修订 v1.5：关闭思考链（thinking={"type":"disabled"}）。
-        # 结果解读是「单步结构化输出」任务，不需要推理链；思考链的 reasoning_content
-        # 计入 max_tokens，会占满预算导致正文为空而降级。数值准确性由 E-R1~E-R7
-        # 确定性规则兜底，不依赖模型思考。budget 保留 8192 作双保险。
-        text = self.call_text(eval_prompts.report_prompt(knowledge, facts, expected),
-                             "请撰写结果说明。", temperature=0.2, max_tokens=8192,
-                             thinking={"type": "disabled"})
+        # 与规划/调优同因：关闭思考链，防止推理内容占满 max_tokens 截断输出
+        text = self.call_text(eval_prompts.qualitative_prompt(knowledge, facts, expected),
+                              "请撰写关键特征与局限的说明。", temperature=0.2,
+                              max_tokens=1024, thinking={"type": "disabled"})
         from .base_role import is_api_failure
 
-        return "" if is_api_failure(text) else text.strip()
+        if is_api_failure(text):
+            self.note_reason = "大模型接口调用失败"
+            self.log(f"定性说明未生成（{self.note_reason}），使用固定兜底句")
+            return ""
+        text = (text or "").strip()
+        ok, reason = self._qualitative_ok(text)
+        if not ok:
+            self.note_reason = reason
+            self.log(f"定性说明未通过轻校验（{reason}），使用固定兜底句")
+            return ""
+        self.note_reason = ""
+        return text
 
-    def _rewrite(self, knowledge: str, facts: str, draft: str, violations: List[str],
-                 expected: str) -> str:
-        # 与 _generate 同因：关闭思考链，只输出重写正文
-        text = self.call_text(
-            eval_prompts.rewrite_prompt(knowledge, facts, draft,
-                                        "\n".join(f"- {v}" for v in violations), expected),
-            "请按修改要求重写。", temperature=0.1, max_tokens=8192,
-            thinking={"type": "disabled"})
-        from .base_role import is_api_failure
+    def _qualitative_ok(self, text: str) -> tuple:
+        """定性短句的三项轻校验：无数字 / 无禁用表述 / 无极值负面判断。
 
-        return "" if is_api_failure(text) else text.strip()
+        数字一票否决：定性说明本就不该出现任何数值（提示词已要求），
+        出现数字即视为未遵守约定，宁可兜底也不冒险放行。
+        唯一例外是分辨率单位写法 10m/30m（提示词要求用 10m/30m 而非 十米/三十米）：
+        先剥掉 `数字+m` 的单位 token 再查数字，其余数字（指标数值）仍一票否决。
+        """
+        if len(text) < 10:
+            return False, "内容过短"
+        stripped_units = re.sub(r"\d+(?:\.\d+)?m(?![a-zA-Z])", "", text)
+        if re.search(r"\d", stripped_units):
+            return False, "出现了数字（定性说明不得引用数值）"
+        closure = self.bundle.get("closure") or {}
+        closure_ok = eval_rules.closure_is_normal(closure.get("metrics"))
+        if eval_rules.check_disallowed(text, closure_ok):
+            return False, "使用了禁用表述"
+        if eval_rules.check_extreme_negativity(text, closure_ok):
+            return False, "以极值差为依据下了负面结论"
+        if not text.endswith(eval_rules.SENTENCE_ENDINGS):
+            return False, "未以句子收尾符号结束"
+        return True, ""
 
     def _knowledge_block(self) -> str:
         block = self.memory_block("评估 协议 闭合 精度 解读 禁用表述")
@@ -242,14 +218,30 @@ class EvalAgent(RoleAgent):
 
         return eval_knowledge_text()
 
-    # ── 事实清单与模板化报告（降级兜底） ───────────────────────────
+    # ── 事实清单（系统渲染报告的数字来源） ────────────────────────
+
+    def _data_time_line(self) -> str:
+        """数据时间一行：配对模式写实际用到的 Landsat 卫星与日期、Sentinel-2 日期，
+        月度合成模式写月份，都不再写「起止范围」；无配对信息时回退原时间范围。"""
+        from .. import presentation
+
+        pair = self.bundle.get("pair") or {}
+        if str(pair.get("composite") or "") == "monthly":
+            rep = pair.get("landsat_date") or pair.get("sentinel2_date") or ""
+            return f"- 数据时间：{presentation.month_label(rep)}"
+        l_date = pair.get("landsat_date")
+        s_date = pair.get("sentinel2_date")
+        if l_date and s_date:
+            sat = presentation.satellite_label(pair.get("landsat_satellite"))
+            return (f"- 数据时间：{sat} {l_date} 与 Sentinel-2 {s_date}")
+        tr = self.bundle.get("time_range") or {}
+        return (f"- 数据时间：{tr.get('start', '')} 至 {tr.get('end', '')}")
 
     def facts_text(self) -> str:
         """逐项列出真实数值，作为 LLM 的唯一数字来源。"""
         from .. import presentation
 
         test = self.bundle.get("test_metrics") or {}
-        indep = self.bundle.get("independent_prediction") or {}
         closure = self.bundle.get("closure") or {}
         cm = closure.get("metrics") or {}
         stats = self.bundle.get("lst_stats") or {}
@@ -258,18 +250,15 @@ class EvalAgent(RoleAgent):
 
         lines = [
             f"- 研究区：{self.bundle.get('region') or '未记录'}",
-            f"- 时间范围：{(self.bundle.get('time_range') or {}).get('start', '')} 至 "
-            f"{(self.bundle.get('time_range') or {}).get('end', '')}",
-            f"- 产品分辨率：十米",
+            self._data_time_line(),
+            f"- 产品分辨率：10m",
             f"- 有效像元数：{presentation.fmt_count(stats.get('total_valid'))} 个",
             f"- 影像尺寸：{presentation.fmt_count(size.get('height'))} 行 × "
             f"{presentation.fmt_count(size.get('width'))} 列",
             f"- 有效像元占比：{presentation.fmt_percent(stats.get('valid_percent'))}",
             f"- 测试集决定系数：{presentation.fmt_num(test.get('R2'))}",
+            f"- 测试集平均绝对误差：{presentation.fmt_num(test.get('MAE'))} K",
             f"- 测试集均方根误差：{presentation.fmt_num(test.get('RMSE'))} K",
-            f"- 独立预测决定系数：{presentation.fmt_num(indep.get('R2'))}",
-            f"- 独立预测均方根误差：{presentation.fmt_num(indep.get('RMSE_K'))} K",
-            f"- 独立预测样本数：{presentation.fmt_count(indep.get('n_samples'))} 个",
             f"- 闭合平均偏差：{presentation.fmt_num(cm.get('MB_K'))} K",
             f"- 闭合平均绝对误差：{presentation.fmt_num(cm.get('MAE_K'))} K",
             f"- 闭合均方根误差：{presentation.fmt_num(cm.get('RMSE_K'))} K",
@@ -290,55 +279,78 @@ class EvalAgent(RoleAgent):
         if top:
             lines.append(f"- 贡献最大的特征：{top}")
         if self.bundle.get("r2_null_reason"):
-            lines.append(f"- 决定系数无法计算的原因：{self.bundle['r2_null_reason']}")
-        return "\n".join(lines)
+            lines.append(f"- 决定系数无法计算的原因："
+                         f"{self.bundle['r2_null_reason'].rstrip('。')}")
+        return "\n".join(l.rstrip("。") for l in lines)
 
-    def template_report(self, expected_grade: str) -> str:
-        """模板化报告：只填数字，不含任何 LLM 生成的评价性语句（技术方案 7.3）。"""
+    def assemble_report(self, expected_grade: str, note: str) -> str:
+        """确定性组装最终报告：全部数字、评级、闭合口径句由系统给出。
+
+        层级规则（与气泡排版约定一致）：只有「结果说明」是二级标题（前端主色
+        竖线），其下的产品概况/模型精度/闭合情况/关键特征与局限全部用三级标题
+        + 缩进区分层级，不再各自带竖线；数字一律用阿拉伯数字（10m 而非十米）。
+        """
         from .. import presentation
-        from ...memory.knowledge_eval import EVAL_SEED_ITEMS
 
-        closure_note = next((i["content"] for i in EVAL_SEED_ITEMS if i["id"] == "E01"), "")
         test = self.bundle.get("test_metrics") or {}
         lines = [
-            "**结果说明（模板化）**",
+            "## 结果说明",
             "",
-            "产品概况",
+            "### 产品概况",
             self.facts_text(),
             "",
-            "模型精度",
+            "### 模型精度",
             f"- 按分档基准，本次测试集精度评级为{expected_grade}"
-            f"（决定系数 {presentation.fmt_num(test.get('R2'))}）。",
+            f"（决定系数 {presentation.fmt_num(test.get('R2'))}）",
+            "- 可在工作面板中的地图页面查看每个像元的温度情况，并与30m的地表温度对比",
             "",
-            "闭合情况",
-            "- 闭合指标是十米结果回聚合到三十米产品格网的算术均值闭合度，"
-            "不是十米独立精度，也不代表能量或辐射守恒。",
+            "### 闭合情况",
+            "- 闭合指标是10m结果回聚合到30m产品格网的算术均值闭合度，"
+            "不是10m独立精度，也不代表能量或辐射守恒",
             "",
-            "局限性",
-            "- 本段为模板化说明，未包含自动生成的解读文字。",
-            f"- 降级原因：{self.degrade_reason or '未记录'}。详细的未通过项见日志面板。",
-            f"- 口径依据：{_cut_at_sentence(closure_note, 180)}",
+            "### 关键特征与局限",
+            f"- {(_normalize_note(note) or _FALLBACK_NOTE).rstrip('。')}",
         ]
-        return "\n".join(lines)
+        return "\n".join(l.rstrip("。") for l in lines)
 
-    # ── 结果后处理（可选，升级点：10m LST 空洞填补） ─────────────
+    # ── 结果后处理（可选，10m LST 空洞填补） ─────────────
+
+    def _plan_has_gapfill(self, ctx: Any) -> bool:
+        """当前执行计划是否已显式包含结果后处理步骤（lst_gapfill）。
+
+        用户要求「从头执行并包含结果后处理」时，规划 Agent 会在完整流程末尾带上
+        lst_gapfill 步骤——此时评估完成后由执行引擎直接执行该步骤，不再弹询问/提示。
+        """
+        plan = getattr(ctx, "plan", None)
+        if not isinstance(plan, dict):
+            return False
+        return any(str((s or {}).get("skill") or "") == "lst_gapfill"
+                   for s in (plan.get("steps") or []))
 
     def _handle_postprocess(self, ctx: Any, hooks=None) -> StepDecision:
         """全流程结果生成后：询问是否对 10m LST 空洞做填补。
 
         由我批准模式：弹审批卡片让用户选择（执行填洞 / 不需要结束流程）；
         完全执行模式：默认跳过不询问，并在气泡中提示默认不执行、需要时可告知。
+        若执行计划本身已包含 lst_gapfill 步骤，则不重复询问/提示，直接交给执行引擎。
         """
         exec_mode = getattr(hooks, "exec_mode", "") if hooks is not None else ""
 
+        if self._plan_has_gapfill(ctx):
+            return StepDecision.cont()
+
         if is_auto(exec_mode):
-            # 完全执行模式：默认不执行结果后处理，完成后提示用户可随时告知
+            # 完全执行模式：默认不执行结果后处理，完成后提示用户可随时告知。
+            # 用引用块（前端灰字 + 主色竖线）与最终报告同一层级展示，
+            # 前面用与步骤间一致的 step_gap 留白与「关键特征与局限」分隔
+            # （等价「执行方案已确定」与「第 1 步」之间的空行大小）。
             try:
                 ctx.exp_state.setdefault("approval_choices", {})[Node.POSTPROCESS] = Option.SKIP_POSTPROCESS
             except Exception:
                 pass
-            ctx.emit("（本次为完全执行模式，默认不执行结果后处理；"
-                     "如需要无空洞的 10m 地表温度产品，告诉我即可对结果做空洞填补。）\n")
+            ctx.emit(presentation.step_gap())
+            ctx.emit("> 本次为完全执行模式，默认不执行结果后处理；"
+                     "如需要无空洞的 10m 地表温度产品，告诉我即可对结果做空洞填补\n")
             return StepDecision.cont()
 
         summary = self._postprocess_summary()
@@ -368,31 +380,53 @@ class EvalAgent(RoleAgent):
         return (head + "是否对这些空洞做填补，生成无空洞的 10m 地表温度产品？"
                 "（只估计空洞像元，不改变无云区数值）")
 
-    def _run_gapfill(self, ctx: Any) -> StepDecision:
-        """执行 lst_gapfill skill（空洞填补），结果写入气泡与阶段清单。"""
+    def _run_gapfill(self, ctx: Any, params: Optional[dict] = None) -> StepDecision:
+        """执行 lst_gapfill skill（空洞填补），结果写入气泡与阶段清单。
+
+        params 为 None 时按 ctx 的 raw/processed/results 目录拼接标准路径
+        （全流程结束后询问路径）；否则用调用方（执行引擎对 postprocess 计划
+        动态查找）已解析好的输入/输出路径。
+        """
         skill = ctx.registry.get("lst_gapfill")
         if skill is None:
             ctx.emit("结果后处理组件未注册，本次跳过。\n")
             return StepDecision.cont()
-        try:
-            from ..executor import build_skill_paths, pair_dates
+        if params is None:
+            try:
+                from ..executor import build_skill_paths, pair_dates
 
-            dates = pair_dates(ctx.exp_state.get("pair") or {})
-            paths = build_skill_paths(
-                getattr(ctx, "raw_dir", ""), getattr(ctx, "processed_dir", ""),
-                getattr(ctx, "results_dir", ""), dates=dates,
-                project_dir=getattr(ctx, "project_dir", ""),
-            )
-            params = paths.get("lst_gapfill") or {}
-        except Exception as e:
-            ctx.emit(f"结果后处理路径解析失败：{e}\n")
-            return StepDecision.cont()
+                dates = pair_dates(ctx.exp_state.get("pair") or {})
+                paths = build_skill_paths(
+                    getattr(ctx, "raw_dir", ""), getattr(ctx, "processed_dir", ""),
+                    getattr(ctx, "results_dir", ""), dates=dates,
+                    project_dir=getattr(ctx, "project_dir", ""),
+                )
+                params = paths.get("lst_gapfill") or {}
+            except Exception as e:
+                ctx.emit(f"结果后处理路径解析失败：{e}\n")
+                return StepDecision.cont()
+        else:
+            params = dict(params)
+
+        # 只填研究区矢量范围内的空洞：从计划的研究区 GeoJSON 路径注入
+        # （独立请求路径的 _PostCtx 不带 plan，靠上层把 region_geojson 放进 ctx）。
+        # 调用方（executor）已按影像对记录的研究区填好 params["region_geojson"] 时不覆盖。
+        if not params.get("region_geojson"):
+            region_geojson = getattr(ctx, "region_geojson", "") or ""
+            if not region_geojson:
+                plan = getattr(ctx, "plan", None)
+                if isinstance(plan, dict):
+                    region_geojson = str((plan.get("region") or {}).get("study_area_file") or "")
+            if region_geojson:
+                params = dict(params)
+                params["region_geojson"] = region_geojson
 
         ctx.emit("开始结果后处理：填补 10m 地表温度产品中的云像元空洞…\n")
         try:
             result = skill.execute(
                 params,
-                progress_callback=lambda sn, pct, msg: None,
+                # 填洞进度同时进日志面板（保留工作面板进度由阶段清单驱动）
+                progress_callback=lambda sn, pct, msg: self.log(msg),
                 log_callback=lambda lvl, msg: self.log(msg),
             )
         except Exception as e:
@@ -407,11 +441,11 @@ class EvalAgent(RoleAgent):
         if getattr(result, "success", False):
             data = getattr(result, "data", None)
             data = data if isinstance(data, dict) else {}
+            # 气泡只给完成统计（skill 的 message 已含填充像元数/占比/未改无云区），
+            # 产物路径细节走日志面板，不泄漏路径进气泡
             ctx.emit(getattr(result, "message", "结果后处理完成") + "\n")
-            filled_tif = data.get("filled_tif", "")
-            mask_tif = data.get("mask_tif", "")
-            ctx.emit(f"无空洞的 10m 地表温度产品已生成（{filled_tif}）"
-                     f"{f'，空洞掩膜：{mask_tif}' if mask_tif else ''}\n")
+            self.log(f"结果后处理产物：filled_tif={data.get('filled_tif', '')}，"
+                     f"mask_tif={data.get('mask_tif', '')}")
         else:
             ctx.emit(f"结果后处理未完成：{getattr(result, 'message', '未知原因')}\n")
         return StepDecision.cont()
@@ -435,7 +469,7 @@ class EvalAgent(RoleAgent):
         return "、".join(labels.get(i.get("feature"), str(i.get("feature")))
                         for i in items[:limit])
 
-    # ── 工作流写回记忆（技术方案 7.5 / 8.3） ──────────────────────
+    # ── 工作流写回记忆 ──────────────────────
 
     def _write_workflow(self, ctx: Any, hooks=None) -> None:
         from ...memory import workflow_experience
@@ -445,8 +479,9 @@ class EvalAgent(RoleAgent):
         test_r2 = (self.bundle.get("test_metrics") or {}).get("R2")
         failed = ctx.exp_state.get("failed")
         status = "failed" if failed else "success"
-        if not workflow_experience.should_write(status=status,
-                                                eval_passed=not self.degraded,
+        # 报告永远完整（数字/评级/口径由系统渲染，定性短句兜底），
+        # 不存在「解读失败降级」的状态，评估始终视为通过。
+        if not workflow_experience.should_write(status=status, eval_passed=True,
                                                 test_r2=test_r2):
             self.log("未满足工作流写回的三个条件，跳过写入")
             return

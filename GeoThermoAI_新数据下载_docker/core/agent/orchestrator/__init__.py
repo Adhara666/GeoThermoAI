@@ -1,5 +1,5 @@
 """
-总调度编排层（技术方案第 3 章）
+总调度编排层
 
 - exec_mode：执行模式常量与归一化
 - agent_config：`settings.agent` 特性开关与可配置项

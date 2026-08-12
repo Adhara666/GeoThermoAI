@@ -1,5 +1,5 @@
 """
-角色编排的特性开关与可配置项（技术方案第 12 章「特性开关」）
+角色编排的特性开关与可配置项（「特性开关」）
 
 配置位置：`settings.agent`（每用户 `settings.json` 优先，缺失时回落本文件默认值）。
 
@@ -15,20 +15,20 @@ from typing import Any, Dict, Optional
 
 from .exec_mode import DEFAULT_EXEC_MODE, normalize as normalize_exec_mode
 
-# 自动 replan 上限（技术方案 2.4 规则 4）
+# 自动 replan 上限（规则 4）
 REPLAN_MAX = 3
 
 # 审批等待超时（秒）
 APPROVAL_WAIT_TIMEOUT = 1800
 
-# 调优轮数：默认 5，硬上限 8（拍板结论 4）。
+# 调优轮数：默认 5，硬上限 8。
 # 这里是**单一来源**，`reflection/train_rules.py` 的规则 R7 从本文件导入，
 # 保证「配置值 / 默认值 / 硬上限」三者不会在两处漂移。
 MAX_TUNING_ROUNDS = 8
 DEFAULT_TUNING_ROUNDS = 5
 
 AGENT_DEFAULTS: Dict[str, Any] = {
-    # 安全阀：P0–P6 全部阶段测试与回归验收通过，已置为 True（技术方案第 12 章）。
+    # 安全阀：P0–P6 全部阶段测试与回归验收通过，已置为 True。
     # 出现问题时把 config/settings.json 的 agent.roles_enabled 改回 false 即可整体回退到旧路径。
     "roles_enabled": True,
     "replan_max": REPLAN_MAX,

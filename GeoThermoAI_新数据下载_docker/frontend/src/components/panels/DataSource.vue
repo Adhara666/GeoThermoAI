@@ -25,10 +25,10 @@ function testGdal() { runTest('gdal', '/api/test/gdal') }
 // 测试页图标（与工作面板「测试」tab 同一图标）
 const ZAP_ICON = '<polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>'
 
-// 测试结果行解析：按状态符号着色并替换为 SVG 图标（升级点 25）
+// 测试结果行解析：按状态符号着色并替换为 SVG 图标
 const resultLines = computed(() => {
   if (!result.value) return []
-  // 行尾句号不显示（升级点：测试说明行末尾不再加「。」）
+  // 行尾句号不显示（测试说明行末尾不再加「。」）
   const noEndPeriod = (s) => s.replace(/。$/, '')
   return String(result.value)
     .split('\n')

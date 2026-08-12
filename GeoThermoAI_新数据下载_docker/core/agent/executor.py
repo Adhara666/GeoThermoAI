@@ -1,17 +1,16 @@
 """
-执行引擎（技术方案 10.2）
+执行引擎
 
-由 `GeoThermoAgent._execute_plan` 平移而来，`GeoThermoAgent._execute_plan` 保留为
-签名一字不改的薄委托（`tests/test_memory_synthetic.py` 直接调用它，是回归护栏）。
+负责遍历计划中的步骤、获取对应 Skill 并执行、收集结果，并向气泡输出进度。
+`GeoThermoAgent._execute_plan` 保留为签名一字不改的薄委托（`tests/test_memory_synthetic.py`
+直接调用它，是回归护栏）。
 
-平移原则（P0）：`hooks is None` 时执行路径与气泡文案与平移前**完全等价**；
-气泡文案的中文化在 P6 统一进行（届时改为调用 `presentation` 的渲染函数）。
-
-钩子机制（`StepDecision` / `StageHooks`）供角色编排（P1 起）介入
+钩子机制（`StepDecision` / `StageHooks`）供角色编排介入
 「改参数 / 暂停审批 / 重跑本步 / 中止 / 交回 replan」。
 """
 
 import glob
+import json
 import logging
 import os
 import re
@@ -20,6 +19,8 @@ from typing import Any, Dict, List, Optional
 
 from . import presentation
 from .orchestrator.hooks import StageHooks, StepDecision
+from ..memtrim import release_rss_memory
+from ..skills.base_skill import SkillResult
 
 logger = logging.getLogger(__name__)
 
@@ -70,7 +71,7 @@ class ExecContext:
 
 
 def new_exp_state() -> dict:
-    """实验记录累加器（前 8 个键与平移前一致；新增键为空时不进入记录）。"""
+    """实验记录累加器（固定键位；新增键为空时不进入记录）。"""
     return {
         "acq_params": None,       # data_acquisition 步骤参数（region/日期）
         "pair": None,             # 用户选中的影像配对
@@ -80,7 +81,7 @@ def new_exp_state() -> dict:
         "step_success": {},       # skill_name -> bool
         "failed": None,           # (skill_name, message) 首个失败步骤
         "paused": False,          # 是否因等待用户输入而暂停
-        # ── 角色编排新增（技术方案 8.3 工作流经验的数据来源）──
+        # ── 角色编排新增（工作流经验的数据来源）──
         "pair_candidates": [],    # 候选配对及其得分
         "pair_selected_by": "",   # user / auto
         "tuning_trace": [],       # 调优轨迹
@@ -96,7 +97,7 @@ def build_skill_paths(raw_dir: str, processed_dir: str, results_dir: str,
     """各 Skill 的输入/输出路径硬编码映射。
 
     dates 携带当前配对的影像日期（YYYYMMDD），用于生成带日期的文件名
-    （升级点 4：本地 LST/Sentinel-2 文件名必须带日期；DEM 不带日期）。
+    （本地 LST/Sentinel-2 文件名必须带日期；DEM 不带日期）。
     project_dir 注入给 data_acquisition，供「已下载配对去重 / 重复影像复制 / DEM 复用」使用。
     """
     ldate = str((dates or {}).get("landsat") or "").strip()
@@ -112,10 +113,10 @@ def build_skill_paths(raw_dir: str, processed_dir: str, results_dir: str,
     qa_file = _landsat("landsat_qa_pixel")
     s2_file = _sentinel("sentinel2_bands")
     scl_file = _sentinel("sentinel2_scl")
-    tcr_csv = f"tcr_result_{sdate}.csv" if sdate else "tcr_result.csv"
+    tcr_csv = f"tcr_result_{sdate}.parquet" if sdate else "tcr_result.parquet"
     lst_tif = f"rf_10m_lst_final_{sdate}.tif" if sdate else "rf_10m_lst_final.tif"
-    lst_csv = f"rf_10m_predict_{sdate}.csv" if sdate else "rf_10m_predict.csv"
-    # 结果后处理（升级点：空洞填补）产物：命名与原始产品区分，
+    lst_csv = f"rf_10m_predict_{sdate}.parquet" if sdate else "rf_10m_predict.parquet"
+    # 结果后处理（空洞填补）产物：命名与原始产品区分，
     # 前缀 _filled 保证与 lst_export 的 glob（rf_10m_lst_final_[0-9]*）互不串扰
     filled_tif = f"rf_10m_lst_final_filled_{sdate}.tif" if sdate else "rf_10m_lst_final_filled.tif"
     filled_mask = f"rf_10m_lst_final_filled_{sdate}_cloud_mask.tif" if sdate else "rf_10m_lst_final_filled_cloud_mask.tif"
@@ -135,24 +136,24 @@ def build_skill_paths(raw_dir: str, processed_dir: str, results_dir: str,
         },
         "ttri_compute": {
             "output_dir": processed_dir,
-            "data_30m_csv": processed_dir + "/30m_features_step2.csv",
-            "predict_10m_csv": processed_dir + "/10m_predict_features.csv",
-            "train_csv": processed_dir + "/train.csv",
-            "val_csv": processed_dir + "/validate.csv",
-            "test_csv": processed_dir + "/test.csv",
+            "data_30m_csv": processed_dir + "/30m_features_step2.parquet",
+            "predict_10m_csv": processed_dir + "/10m_predict_features.parquet",
+            "train_csv": processed_dir + "/train.parquet",
+            "val_csv": processed_dir + "/validate.parquet",
+            "test_csv": processed_dir + "/test.parquet",
         },
         "rf_model": {
             "output_dir": results_dir,
-            "train_csv": processed_dir + "/train.csv",
-            "val_csv": processed_dir + "/validate.csv",
-            "test_csv": processed_dir + "/test.csv",
+            "train_csv": processed_dir + "/train.parquet",
+            "val_csv": processed_dir + "/validate.parquet",
+            "test_csv": processed_dir + "/test.parquet",
         },
         "tcr_compute": {
             "output_dir": results_dir,
             "output_path": results_dir + "/" + tcr_csv,
-            "data_30m_csv": processed_dir + "/30m_features_step2.csv",
+            "data_30m_csv": processed_dir + "/30m_features_step2.parquet",
             "meta_30m_json": processed_dir + "/30m_features_step2_meta.json",
-            "predict_10m_csv": processed_dir + "/10m_predict_features.csv",
+            "predict_10m_csv": processed_dir + "/10m_predict_features.parquet",
             "meta_10m_json": processed_dir + "/10m_predict_features_meta.json",
             "model_path": None,  # 动态查找
         },
@@ -165,8 +166,8 @@ def build_skill_paths(raw_dir: str, processed_dir: str, results_dir: str,
         },
         "accuracy_eval": {
             "output_dir": results_dir,
-            "test_csv": processed_dir + "/test.csv",
-            "full_30m_csv": processed_dir + "/30m_features_step2.csv",
+            "test_csv": processed_dir + "/test.parquet",
+            "full_30m_csv": processed_dir + "/30m_features_step2.parquet",
             "predict_csv": results_dir + "/" + tcr_csv,
             "meta_30m_json": processed_dir + "/30m_features_step2_meta.json",
             "meta_10m_json": processed_dir + "/10m_predict_features_meta.json",
@@ -181,7 +182,7 @@ def build_skill_paths(raw_dir: str, processed_dir: str, results_dir: str,
 
 
 def pair_dirs(project_dir: str, selected_pair: Optional[dict]) -> tuple:
-    """按当前选中的影像对计算独立目录（升级点 2：每对影像及其后续文件目录独立）。
+    """按当前选中的影像对计算独立目录（每对影像及其后续文件目录独立）。
 
     目录布局：{project_dir}/pairs/L{landsat_date}_S{sentinel2_date}/{raw,processed,results}
     未选择配对（搜索阶段）时回退项目级 {project_dir}/{raw,processed,results}。
@@ -208,7 +209,7 @@ def pair_dates(selected_pair: Optional[dict]) -> dict:
 def build_experiment_record(exp_state: dict, conv_id: str, project_id: str,
                             status: str, failure_stage: str = "",
                             failure_message: str = "") -> dict:
-    """把累加器组装为结构化实验记录（与平移前一致；新增字段仅在非空时写入）。"""
+    """把累加器组装为结构化实验记录（新增字段仅在非空时写入）。"""
     acq = exp_state.get("acq_params") or {}
     region = acq.get("region", "")
     if isinstance(region, str) and region.lower().endswith(".geojson"):
@@ -244,7 +245,6 @@ def build_experiment_record(exp_state: dict, conv_id: str, project_id: str,
         record["params"] = rf.get("params", {})
         record["metrics"] = metrics
         record["feature_importance"] = rf.get("feature_importance", [])
-        record["independent_prediction"] = rf.get("independent_prediction", {})
         record["train_time_seconds"] = rf.get("train_time_seconds", 0)
     acc = exp_state.get("acc_data") or {}
     acc_full = acc.get("closure_metrics") or {}
@@ -271,7 +271,7 @@ def execute_plan(agent, plan: dict, on_token=None, on_log=None, pause_callback=N
                  exec_mode: str = "", run_state=None) -> str:
     """遍历计划中的步骤，获取对应 Skill，执行并收集结果。
 
-    特殊处理（与平移前一致）：
+    特殊处理：
     - data_acquisition 走「搜索 → 让用户选配对 → 注入 selected_pair → 下载」
     - data_pipeline 完成后收集数据特征
     - 按 project_dir 强制注入各 Skill 的输入输出路径
@@ -315,7 +315,8 @@ def execute_plan(agent, plan: dict, on_token=None, on_log=None, pause_callback=N
             if on_log:
                 on_log(text)
             return
-        _emit_accumulator.append(text)
+        # 气泡文案统一数字两侧空格（如「第1轮」→「第 1 轮」），幂等
+        _emit_accumulator.append(presentation.normalize_number_spacing(text))
         full_text = "".join(_emit_accumulator)
         if on_token:
             on_token(full_text)
@@ -336,7 +337,7 @@ def execute_plan(agent, plan: dict, on_token=None, on_log=None, pause_callback=N
         skill = agent.registry.get(skill_name)
         ctx.step_index = i
 
-        # ── 每对影像独立目录（升级点 2）：按当前已选配对动态解析路径 ──
+        # ── 每对影像独立目录：按当前已选配对动态解析路径 ──
         # 搜索阶段无配对时用项目级目录；用户选择配对后（params.selected_pair 已注入）
         # 自动切换为该配对的独立目录，同一计划内的所有后续步骤随之生效。
         _sel_pair = None
@@ -396,6 +397,26 @@ def execute_plan(agent, plan: dict, on_token=None, on_log=None, pause_callback=N
                     params["output_mask"] = os.path.join(
                         _dir, _base.replace("_final_", "_final_filled_")
                         .replace(".tif", "_cloud_mask.tif")).replace("\\", "/")
+                    # 只填研究区矢量范围内的空洞：优先复用该影像对生成时记录的研究区
+                    #（region_study_area.json，保证与产品同一区域），再回退项目根记录，
+                    # 最后回退计划里的研究区
+                    _rg = ""
+                    for _cand in (os.path.join(os.path.dirname(_dir),
+                                               "region_study_area.json"),
+                                  os.path.join(project_dir, "region_study_area.json")):
+                        try:
+                            with open(_cand, encoding="utf-8") as _f:
+                                _rg = str(json.load(_f).get("study_area_file") or "")
+                            if _rg and os.path.isfile(_rg):
+                                break
+                            _rg = ""
+                        except Exception:
+                            _rg = ""
+                            continue
+                    if not _rg and isinstance(plan.get("region"), dict):
+                        _rg = str(plan["region"].get("study_area_file") or "")
+                    if _rg and os.path.isfile(_rg):
+                        params["region_geojson"] = _rg
                 else:
                     # 项目里确实还没有 10m LST 结果：保留原参数，让 skill 报"缺少输入"
                     _emit(f"  未找到已有的 10m 地表温度产品（{skill_name} 需要先导出 LST）\n")
@@ -414,8 +435,29 @@ def execute_plan(agent, plan: dict, on_token=None, on_log=None, pause_callback=N
             _region_file = ""
             if isinstance(plan.get("region"), dict):
                 _region_file = str(plan["region"].get("study_area_file") or "")
+            if not (_region_file and os.path.isfile(_region_file)):
+                _region_file = agent._find_study_area_file(
+                    study_areas_dir,
+                    preferred_name=str((plan.get("region") or {}).get("name") or "")) or ""
             if _region_file and not step.get("params", {}).get("study_area_geojson"):
                 step.setdefault("params", {})["study_area_geojson"] = _region_file
+            # 记录本影像对实际使用的研究区文件（region_study_area.json）：
+            # 后续「单步结果后处理（空洞填补）」必须复用同一研究区，否则按「最新上传」
+            # 取研究区会把别的区域多边形（如鄂州）套到本产品（如武汉）上，导致填洞
+            # 只在错误区域内进行、真实像元全部被置 NoData。单步结果后处理本身不写。
+            try:
+                if str(plan.get("intent") or "") != "postprocess":
+                    _pair_root = os.path.dirname(results_dir) if results_dir else project_dir
+                    if _pair_root:
+                        os.makedirs(_pair_root, exist_ok=True)
+                        with open(os.path.join(_pair_root, "region_study_area.json"),
+                                  "w", encoding="utf-8") as _f:
+                            json.dump({
+                                "study_area_file": _region_file,
+                                "name": str((plan.get("region") or {}).get("name") or ""),
+                            }, _f, ensure_ascii=False)
+            except Exception:
+                pass
 
         if not skill:
             results.append(f"未找到技能: {skill_name}")
@@ -426,7 +468,7 @@ def execute_plan(agent, plan: dict, on_token=None, on_log=None, pause_callback=N
         # 强制 data_acquisition 的 region 使用已上传研究区文件（执行期兜底：
         # 即使 _normalize_plan_paths 的替换未生效，也保证 region 是 GeoJSON 绝对路径，
         # 屏蔽 LLM 生成的纯城市名/bbox 导致的解析崩溃）。
-        # plan 带 region.study_area_file 时以它为准（技术方案 10.1）。
+        # plan 带 region.study_area_file 时以它为准。
         if skill_name == "data_acquisition":
             _planned = ""
             if isinstance(plan.get("region"), dict):
@@ -435,6 +477,9 @@ def execute_plan(agent, plan: dict, on_token=None, on_log=None, pause_callback=N
             if _sa:
                 step.setdefault("params", {})["region"] = _sa
 
+        # 步骤之间用留白（不画分割线）：分割线只用于区分**步骤内部**的内容块
+        # （如调优各轮之间），步骤之间用比段落略大的垂直留白隔开
+        _emit(presentation.step_gap())
         _emit(presentation.step_header(i + 1, total, skill_name))
         # 更新工作流进度（running）
         if workflow_callback:
@@ -462,6 +507,10 @@ def execute_plan(agent, plan: dict, on_token=None, on_log=None, pause_callback=N
 
         attempt = 0
         while True:
+            # 上一步/上一轮释放但被 glibc malloc 保留的空闲堆先归还 OS：
+            # 大研究区长流程（预处理 → TTRI → RF 调优 → TCR）若不清，RSS 会
+            # 停在峰值附近，在 WSL2 配额（20GB）下触发 OOM 杀进程（exit 137）。
+            release_rss_memory()
             # ── 执行 Skill（data_acquisition 特殊处理：搜索→选择→下载）─
             try:
                 def _log(tag, msg):
@@ -497,6 +546,14 @@ def execute_plan(agent, plan: dict, on_token=None, on_log=None, pause_callback=N
                             log_callback=_log,
                         )
                         result_data = result.data if isinstance(result.data, dict) else {}
+                        # 复用第一次搜索的目录结果：下载模式（月度 continue 重入、
+                        # 配对选择后的二次调用）直接消费，避免下载前重复 STAC 查询
+                        _cached_search = {
+                            "landsat": result_data.get("landsat_items", []),
+                            "sentinel": result_data.get("sentinel2_items", []),
+                        }
+                        if _cached_search["landsat"] or _cached_search["sentinel"]:
+                            step["params"]["cached_search"] = _cached_search
                         # 月度合成模式：跳过配对选择，用该月全部景直接进入下载（合成）。
                         # 用一个「代表日（月末日）」伪配对确定产物目录/文件名，与下游同构。
                         if str(step.get("params", {}).get("composite") or "") == "monthly":
@@ -516,7 +573,9 @@ def execute_plan(agent, plan: dict, on_token=None, on_log=None, pause_callback=N
                                     step["params"][_k] = _v
                                 _emit("  " + presentation.monthly_composite_started(
                                     result_data.get("landsat_count", 0),
-                                    result_data.get("sentinel_count", 0)))
+                                    result_data.get("sentinel_count", 0),
+                                    month=presentation.month_label(
+                                        step.get("params", {}).get("end_date"))))
                                 continue  # 重新执行（下载模式 + composite=monthly）
                         pairs = result_data.get("image_pairs", [])
                         if pairs:
@@ -546,7 +605,7 @@ def execute_plan(agent, plan: dict, on_token=None, on_log=None, pause_callback=N
                                 selected = pairs[0]
                                 exp_state["pair_selected_by"] = "auto"
                                 _emit("  " + presentation.pair_auto_selected(1))
-                            # 注入选择，重新执行下载（升级点 2：切换为该配对的独立目录）
+                            # 注入选择，重新执行下载（切换为该配对的独立目录）
                             step["params"]["selected_pair"] = selected
                             exp_state["pair"] = selected
                             raw_dir, processed_dir, results_dir = pair_dirs(project_dir, selected)
@@ -604,6 +663,16 @@ def execute_plan(agent, plan: dict, on_token=None, on_log=None, pause_callback=N
                             _record_step(skill_name, False, "未找到影像配对")
                             _finalize_experiment("failed", skill_name, "未找到影像配对")
                             return "\n".join(results)
+                elif skill_name == "lst_gapfill" and hooks is not None \
+                        and getattr(hooks, "eval_agent", None) is not None:
+                    # 结果后处理：执行交给结果 Agent（EvalAgent）——气泡的开始/完成提示、
+                    # 填洞进度日志与研究区矢量范围限定都由它负责；输入/输出路径由
+                    # 上方的动态查找分支解析进 step.params。
+                    hooks.eval_agent._run_gapfill(ctx, params=step.get("params", {}))
+                    _gf_ok = bool((ctx.exp_state.get("step_success") or {})
+                                  .get("lst_gapfill"))
+                    result = SkillResult(
+                        _gf_ok, "结果后处理完成" if _gf_ok else "结果后处理未完成")
                 else:
                     # 普通执行或其他 Skill
                     result = skill.execute(
@@ -613,7 +682,19 @@ def execute_plan(agent, plan: dict, on_token=None, on_log=None, pause_callback=N
                     )
 
                 results.append(f"{skill_name}: {result.message}")
-                _emit("  " + presentation.summarize(skill_name, result) + "\n")
+                # 摘要用项目符号与步骤标题/说明形成列表结构。
+                # 调优轮（rf_model 非首轮）与结果后处理（lst_gapfill）不再重复输出
+                # 摘要：分别由训练 Agent / 结果 Agent 输出进度与完成提示。
+                # 步骤之间不再输出分割线（改用 step_gap 留白，见步骤头部），
+                # 分割线只用于调优各轮之间（见下方 RETRY 分支）。
+                if skill_name == "rf_model" and hooks is not None \
+                        and exp_state.get("rf_data") is not None:
+                    pass
+                elif skill_name == "lst_gapfill" and hooks is not None:
+                    pass
+                else:
+                    _emit("  - " + presentation.summarize(
+                        skill_name, result, pair=exp_state.get("pair")) + "\n")
                 # 更新工作流进度（completed）
                 if workflow_callback:
                     workflow_callback(skill_name, "completed", i, total)
@@ -660,7 +741,10 @@ def execute_plan(agent, plan: dict, on_token=None, on_log=None, pause_callback=N
                     if decision.new_params:
                         step["params"] = {**step.get("params", {}), **decision.new_params}
                     if decision.reason:
-                        _emit(f"  {decision.reason}\n")
+                        # 与训练 Agent 的调优公告/规则说明同一层级：项目符号对齐
+                        # 「- 模型训练（第N轮）完成：…」；轮间分割线由训练 Agent
+                        # 在每轮「开始调优训练」公告前输出（见 train_agent._emit_block）
+                        _emit("  - " + decision.reason + "\n")
                     ctx.retry_count = attempt
                     continue
 
@@ -681,7 +765,7 @@ def execute_plan(agent, plan: dict, on_token=None, on_log=None, pause_callback=N
 
         i += 1
 
-    # ── 收尾：判定整体状态并写入实验记录（聚合判定，见 Schema 第三节）──
+    # ── 收尾：判定整体状态并写入实验记录（聚合判定）──
     if exp_state["paused"]:
         _finalize_experiment("paused")
     else:

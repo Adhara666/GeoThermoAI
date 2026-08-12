@@ -81,9 +81,12 @@ export const api = {
   setCurrentStudyArea: (name) => req('POST', '/api/study-area/current', { name }),
   deleteStudyArea: (name) => req('DELETE', `/api/study-area?name=${encodeURIComponent(name)}`),
 
-  /** 建立 SSE 连接；onEvent(type, data)；返回 { close }（升级点 5/6：切换对话时主动关闭旧连接） */
+  /** 建立 SSE 连接；onEvent(type, data)；返回 { close }（切换对话时主动关闭旧连接） */
   stream(convId, onEvent, onError) {
-    const es = new EventSource(`/api/chat/stream?conv=${encodeURIComponent(convId)}&token=${encodeURIComponent(getToken())}`)
+    // 用户本地时区偏移（小时）：服务器日志时间戳按该偏移换算，
+    // 与部署环境（mac/Windows Docker、云端网页）无关，永远等于用户电脑时间
+    const tz = -new Date().getTimezoneOffset() / 60
+    const es = new EventSource(`/api/chat/stream?conv=${encodeURIComponent(convId)}&token=${encodeURIComponent(getToken())}&tz=${encodeURIComponent(tz)}`)
     es.onmessage = (e) => { try { onEvent('message', JSON.parse(e.data)) } catch (_) {} }
     ;['token', 'thinking', 'append', 'pause', 'workflow', 'log', 'done', 'error'].forEach((t) => {
       es.addEventListener(t, (e) => {

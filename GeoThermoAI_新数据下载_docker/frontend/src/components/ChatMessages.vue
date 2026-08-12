@@ -15,7 +15,7 @@ watch(
   { deep: true },
 )
 
-// 思考过程默认折叠（升级点 19）：无论思考中还是思考结束，都不自动展开，
+// 思考过程默认折叠：无论思考中还是思考结束，都不自动展开，
 // 用户点击 summary 才展开查看内容
 function thinkingOpen() {
   return false
@@ -42,12 +42,12 @@ function pairText(p) {
     <div v-else class="chat-scroll">
       <div v-for="(m, i) in chat.messages" :key="i" class="msg" :class="m.role === 'user' ? 'msg--user' : 'msg--ai'">
         <div class="msg__bubble">
-          <!-- 思考过程折叠块（升级点 15）：独立于正文，样式明显区分 -->
+          <!-- 思考过程折叠块：独立于正文，样式明显区分 -->
           <details v-if="m.thinking" class="thinking-box" :open="thinkingOpen()">
             <summary>
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9.5 2A2.5 2.5 0 0 1 12 4.5v15a2.5 2.5 0 0 1-4.96.44 2.5 2.5 0 0 1-2.96-3.08 3 3 0 0 1-.34-5.58 2.5 2.5 0 0 1 1.32-4.24 2.5 2.5 0 0 1 1.98-3A2.5 2.5 0 0 1 9.5 2Z"/><path d="M14.5 2A2.5 2.5 0 0 0 12 4.5v15a2.5 2.5 0 0 0 4.96.44 2.5 2.5 0 0 0 2.96-3.08 3 3 0 0 0 .34-5.58 2.5 2.5 0 0 0-1.32-4.24 2.5 2.5 0 0 0-1.98-3A2.5 2.5 0 0 0 14.5 2Z"/></svg>
               <span>思考过程</span>
-              <!-- 升级点 16：思考用时，格式 (用时XX秒) -->
+              <!-- 思考用时，格式 (用时XX秒) -->
               <span v-if="m.thinking_seconds" class="thinking-box__seconds">(用时{{ m.thinking_seconds }}秒)</span>
               <span v-if="chat.streaming && i === chat.messages.length - 1" class="thinking-box__live">思考中…</span>
             </summary>
@@ -68,7 +68,7 @@ function pairText(p) {
 }
 @keyframes blink { 50% { opacity: 0; } }
 
-/* ── 思考过程折叠块（升级点 15）──────────────────────────────
+/* ── 思考过程折叠块──────────────────────────────
    浅灰底、深灰字，与正文白色气泡区分但风格协调；
    思考未完成时自动展开，思考结束折叠后再输出正文 */
 .thinking-box {

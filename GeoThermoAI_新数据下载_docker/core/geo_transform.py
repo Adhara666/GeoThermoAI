@@ -1,5 +1,5 @@
 """
-GDAL/OSR 坐标变换共享工具（A-01）
+GDAL/OSR 坐标变换共享工具
 
 问题背景：GDAL 3 对 EPSG:4326 默认使用权威（纬度,经度）轴序，而代码历史上一直按
 传统 GIS（经度,纬度）顺序传参，导致武汉经度 114.3 被当成纬度，产生
@@ -57,7 +57,7 @@ def transform_point_traditional(lon: float, lat: float, src_epsg: int = 4326, ds
                                  dst_srs=None) -> Tuple[float, float]:
     """按传统 GIS 轴序（lon, lat）转换单点坐标，转换后校验为有限值。
 
-    供 server.py 的最小自检使用（对应 A-01 的 /api/test/gdal 数值校验）。
+    供 server.py 的最小自检使用（/api/test/gdal 数值校验）。
     """
     from osgeo import osr
 

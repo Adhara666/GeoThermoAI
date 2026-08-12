@@ -5,15 +5,16 @@
     - train_random_forest: 训练RF模型并评估
     - predict_test_set:    使用训练好的模型对测试集推理
 
-B-02 修复（用户确认第12条）：
+修复：
     - 参数合并改为"先拷贝默认值，再用白名单校验过的用户参数覆盖"，不再是
       "只要前端传入非空 params 就整体不与默认值合并"，避免 random_state/
       max_features 静默丢失、悄悄回退到 scikit-learn 自身默认值；
     - 不再无条件 n_jobs=-1：按容器 CPU 配额（cgroup v1/v2，兼容宿主机）解析
       实际可用核数并写入生效参数；
-    - 评估指标新增 MB（平均偏差），供 A-07 的 independent_prediction 使用。
+    - 评估指标含 MB（平均偏差），供测试集评估使用。
 """
 
+import gc
 import json
 import os
 import re
@@ -26,6 +27,8 @@ import numpy as np
 import pandas as pd
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+
+from .table_io import read_table
 
 # ── 默认特征列和目标列 ────────────────────────────────────────────────
 FEATURE_COLS = ["R", "G", "B", "NIR", "SWIR1", "NDVI", "NDWI", "NDBI", "TTRI"]
@@ -43,7 +46,7 @@ DEFAULT_RF_PARAMS = {
     "verbose": 0,
 }
 
-# 用户可覆盖的参数白名单（B-02：明确包含 random_state/max_features，
+# 用户可覆盖的参数白名单（明确包含 random_state/max_features，
 # 此前逐阶段包装的白名单只收五个字段、不收 random_state，是丢参数的根因之一）
 RF_PARAM_WHITELIST = {
     "n_estimators", "max_depth", "min_samples_split",
@@ -52,7 +55,7 @@ RF_PARAM_WHITELIST = {
 
 
 def detect_cpu_quota() -> int:
-    """检测容器实际可用 CPU 配额（B-02：不再无条件 n_jobs=-1）。
+    """检测容器实际可用 CPU 配额（不再无条件 n_jobs=-1）。
 
     优先级：cgroup v2 cpu.max → cgroup v1 cpu.cfs_quota_us/cpu.cfs_period_us
     → os.sched_getaffinity（尊重 taskset/affinity）→ os.cpu_count()。
@@ -104,7 +107,7 @@ def resolve_n_jobs(requested: Optional[int]) -> int:
 
 
 def merge_rf_params(user_params: Optional[Dict]) -> Dict:
-    """先拷贝 DEFAULT_RF_PARAMS，再用白名单校验过的用户参数覆盖（B-02）。
+    """先拷贝 DEFAULT_RF_PARAMS，再用白名单校验过的用户参数覆盖。
 
     无论用户传入多少字段，random_state/max_features 等未被用户覆盖的参数都保留
     默认值，不会退回 scikit-learn 自身默认（max_features=1.0, random_state=None）。
@@ -132,8 +135,8 @@ def _compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict:
     """计算R²、RMSE、MAE、MB指标。
 
     MB（平均偏差，Mean Bias）= mean(y_pred - y_true)；正值表示预测整体偏暖，
-    供 A-07 的 independent_prediction 协议使用（此前 rf_model 只算 R2/RMSE/MAE，
-    缺 MB 需要另一模块重复计算/混用 TCR 闭合口径）。
+    供测试集评估使用（此前 rf_model 只算 R2/RMSE/MAE，缺 MB 需要另一模块
+    重复计算/混用 TCR 闭合口径）。
     """
     return {
         "R2": round(float(r2_score(y_true, y_pred)), 6),
@@ -180,8 +183,8 @@ def train_random_forest(
         5. 保存模型为.pkl和指标为.json
 
     Args:
-        train_csv:         训练集CSV路径（需包含TTRI列）
-        val_csv:           验证集CSV路径（需包含TTRI列）
+        train_csv:         训练集Parquet路径（需包含TTRI列）
+        val_csv:           验证集Parquet路径（需包含TTRI列）
         output_dir:        输出目录
         params:            随机森林超参数字典（为None则使用默认值；非空时按
                            白名单与默认值合并，不再整体替换默认值）
@@ -204,8 +207,8 @@ def train_random_forest(
     os.makedirs(output_dir, exist_ok=True)
 
     # ── 1. 加载数据 ───────────────────────────────────────────────────
-    df_train = pd.read_csv(train_csv)
-    df_val = pd.read_csv(val_csv)
+    df_train = read_table(train_csv)
+    df_val = read_table(val_csv)
 
     for name, df in [("训练集", df_train), ("验证集", df_val)]:
         _validate_columns(df, FEATURE_COLS + [TARGET_COL], name)
@@ -273,7 +276,7 @@ def train_random_forest(
         )
 
     # ── 4. 保存模型和指标 ─────────────────────────────────────────────
-    # 自动编号（文件名仍固定写死这一命名模式；C-03 的"最新文件不可靠"问题
+    # 自动编号（文件名仍固定写死这一命名模式；"最新文件不可靠"问题
     # 通过 run_manifest.json 精确记录本轮 model_path/metrics_path 解决，
     # 不改变这里的命名策略本身）
     existing = [
@@ -285,7 +288,13 @@ def train_random_forest(
     model_path = os.path.join(output_dir, f"rf_ttri_model_run{run_id:03d}.pkl")
     metrics_path = os.path.join(output_dir, f"rf_ttri_metrics_run{run_id:03d}.json")
 
-    joblib.dump(model, model_path)
+    # 释放训练期大数组（X_train/y_train/X_val/y_val/DataFrame），
+    # 避免 joblib.dump 时"完整模型 + 训练数据"同时驻留内存推高峰值。
+    del X_train, y_train, X_val, y_val, df_train, df_val
+    gc.collect()
+    # zlib 压缩落盘：4GB 级 pkl 可压至约 1/3 体积（zlib 为 stdlib 自带，
+    # 不引入 lz4/zstd 等第三方压缩依赖）；joblib.load 透明解压，下游无需改动。
+    joblib.dump(model, model_path, compress=3)
 
     output = {
         "model": "RandomForest",
@@ -339,10 +348,10 @@ def predict_test_set(
     progress_callback=None,
 ) -> Dict:
     """
-    使用训练好的随机森林模型对测试集进行推理和精度评估（独立预测协议的数据来源，见 A-07）。
+    使用训练好的随机森林模型对测试集进行推理和精度评估（独立预测协议的数据来源）。
 
     Args:
-        test_csv:          测试集CSV路径（需包含TTRI列）
+        test_csv:          测试集Parquet路径（需包含TTRI列）
         model_path:        训练好的模型.pkl文件路径
         output_dir:        输出目录
         progress_callback: 进度回调 callback(step_name, percent, message)
@@ -370,7 +379,7 @@ def predict_test_set(
         )
 
     # ── 2. 加载测试集 ─────────────────────────────────────────────────
-    df_test = pd.read_csv(test_csv)
+    df_test = read_table(test_csv)
     _validate_columns(df_test, feature_cols + [TARGET_COL], "测试集")
 
     X_test = df_test[feature_cols].values
@@ -398,7 +407,7 @@ def predict_test_set(
     run_id = match.group(1) if match else "001"
     output_path = os.path.join(output_dir, f"rf_ttri_predict_run{run_id}.json")
 
-    # 空间范围（供 A-07 的 independent_prediction 报告"样本数和空间范围"）
+    # 空间范围（供测试集评估报告"样本数和空间范围"）
     spatial_extent = None
     if "row" in df_test.columns and "col" in df_test.columns:
         spatial_extent = {

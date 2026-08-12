@@ -18,7 +18,7 @@ from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
-# BGE 官方检索惯例：查询文本加前缀，效果更稳定（见升级方案第五节）
+# BGE 官方检索惯例：查询文本加前缀，效果更稳定
 BGE_QUERY_PREFIX = "为这个句子生成表示以用于检索相关文章："
 
 # 默认 bge ONNX 模型目录（Dockerfile 构建期预下载；可用 BGE_MODEL_DIR 覆盖）
@@ -205,7 +205,7 @@ class RAGStore:
 
     def save_workflow(self, project_id: str, text: str,
                       metadata: Optional[Dict[str, Any]] = None) -> None:
-        """写入一条可复用工作流段落（technical 方案 8.3），metadata 带 kind="workflow"。"""
+        """写入一条可复用工作流段落，metadata 带 kind="workflow"。"""
         if not text:
             return
         meta = _clean_metadata({"kind": "workflow", **(metadata or {})})
@@ -218,7 +218,7 @@ class RAGStore:
                 logger.warning(f"[memory] ChromaDB 写入工作流段落失败: {e}")
 
     def save_knowledge(self, items: List[Dict[str, Any]]) -> None:
-        """按 id 增量播种领域知识（技术方案 8.4a）。
+        """按 id 增量播种领域知识。
 
         改造前的判据是「collection 非空就整体跳过」，导致新增条目（如 E 系列）
         在老用户环境永远灌不进去。改为逐条按 id 比对：已有的不动（避免重复写入与
@@ -258,7 +258,7 @@ class RAGStore:
 
     def _query_collection(self, col, query: str, n: int,
                           where: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
-        """向量检索，可选 metadata 过滤（技术方案 8.4b）。
+        """向量检索，可选 metadata 过滤。
 
         `where` 语法在不同 ChromaDB 版本上有差异，过滤查询异常时自动退回无过滤查询
         （与现有「检索失败返回空列表」的容错风格一致，但不因过滤语法把结果清空）。

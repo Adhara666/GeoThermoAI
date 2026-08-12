@@ -10,7 +10,7 @@ export const useSettingsStore = defineStore('settings', {
 
   getters: {
     displayName: (s) => s.settings?.display_name || s.settings?.model_id || '',
-    // 凭据不回传明文：以 has_api_key 判断是否已配置（见升级规划 3.12.1）
+    // 凭据不回传明文：以 has_api_key 判断是否已配置
     configured: (s) => !!(s.settings && (s.settings.has_api_key || s.settings.base_url)),
   },
 

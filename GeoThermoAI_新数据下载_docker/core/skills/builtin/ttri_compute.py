@@ -40,31 +40,31 @@ class TTRIComputeSkill(BaseSkill):
     @property
     def parameters(self) -> List[SkillParameter]:
         return [
-            SkillParameter(name="train_csv", type="file_path", description="训练集CSV路径（需包含DEM, Slope, cos(Aspect), LST列）", required=True),
-            SkillParameter(name="val_csv", type="file_path", description="验证集CSV路径", required=True),
-            SkillParameter(name="test_csv", type="file_path", description="测试集CSV路径", required=True),
+            SkillParameter(name="train_csv", type="file_path", description="训练集Parquet路径（需包含DEM, Slope, cos(Aspect), LST列）", required=True),
+            SkillParameter(name="val_csv", type="file_path", description="验证集Parquet路径", required=True),
+            SkillParameter(name="test_csv", type="file_path", description="测试集Parquet路径", required=True),
             SkillParameter(name="output_dir", type="file_path", description="输出目录路径（预处理阶段的processed目录）", required=True),
-            SkillParameter(name="constraint_csv", type="file_path", description="完整30m约束层CSV路径，默认 output_dir/30m_constraint_grid.csv", required=False),
-            SkillParameter(name="predict_10m_csv", type="file_path", description="10m预测特征CSV路径，默认 output_dir/10m_predict_features.csv", required=False),
+            SkillParameter(name="constraint_csv", type="file_path", description="完整30m约束层Parquet路径，默认 output_dir/30m_constraint_grid.parquet", required=False),
+            SkillParameter(name="predict_10m_csv", type="file_path", description="10m预测特征Parquet路径，默认 output_dir/10m_predict_features.parquet", required=False),
             SkillParameter(name="batch_size", type="number", description="批处理大小（10m预测数据插值时使用），默认 500000", required=False, default=500000),
         ]
 
     @property
     def input_schema(self) -> Dict[str, str]:
         return {
-            "train_csv": "训练集CSV路径",
-            "val_csv": "验证集CSV路径",
-            "test_csv": "测试集CSV路径",
+            "train_csv": "训练集Parquet路径",
+            "val_csv": "验证集Parquet路径",
+            "test_csv": "测试集Parquet路径",
             "output_dir": "输出目录",
         }
 
     @property
     def output_schema(self) -> Dict[str, str]:
         return {
-            "train_with_ttri": "训练集含TTRI的CSV路径",
-            "val_with_ttri": "验证集含TTRI的CSV路径",
-            "test_with_ttri": "测试集含TTRI的CSV路径",
-            "predict_with_ttri": "10m预测数据含TTRI的CSV路径",
+            "train_with_ttri": "训练集含TTRI的Parquet路径",
+            "val_with_ttri": "验证集含TTRI的Parquet路径",
+            "test_with_ttri": "测试集含TTRI的Parquet路径",
+            "predict_with_ttri": "10m预测数据含TTRI的Parquet路径",
             "coefficients_path": "固定 ttri_coefficients.json 路径",
         }
 
@@ -97,9 +97,9 @@ class TTRIComputeSkill(BaseSkill):
                 return SkillResult(success=False, message=f"重建输入失败: {e}")
 
         # 固定命名推导（Agent 不会显式注入，见模块顶部说明）
-        constraint_csv = params.get("constraint_csv") or os.path.join(output_dir, "30m_constraint_grid.csv")
+        constraint_csv = params.get("constraint_csv") or os.path.join(output_dir, "30m_constraint_grid.parquet")
         constraint_meta = params.get("constraint_meta") or os.path.join(output_dir, "30m_constraint_grid_meta.json")
-        predict_10m_csv = params.get("predict_10m_csv") or os.path.join(output_dir, "10m_predict_features.csv")
+        predict_10m_csv = params.get("predict_10m_csv") or os.path.join(output_dir, "10m_predict_features.parquet")
         predict_10m_meta = params.get("predict_10m_meta") or os.path.join(output_dir, "10m_predict_features_meta.json")
 
         for label, path in [

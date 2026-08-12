@@ -124,6 +124,7 @@ def gapfill_lst(
     output_tif: str,
     output_mask_tif: str = "",
     max_level: int = _MAX_LEVEL,
+    region_geojson: str = "",
     progress_callback=None,
 ) -> Dict:
     """对带空洞的 10m LST GeoTIFF 做空间填洞。
@@ -133,6 +134,9 @@ def gapfill_lst(
         output_tif:     填洞后输出 GeoTIFF（保留地理参考，全像元有值）
         output_mask_tif:空洞掩膜 GeoTIFF（uint8：1=估计像元，0=原始有效）；可留空不写
         max_level:      金字塔最大下采样层数
+        region_geojson: 研究区 GeoJSON 路径（可选）。给定时只对**研究区矢量范围内**
+                        的空洞做填补，矢量范围外的像元保持 NoData 不变（避免把
+                        bbox 外沿/区外区域也填成估计值）；不给定时回退整幅 bbox 网格。
         progress_callback: 进度回调 (percent 0~1, message)
 
     Returns:
@@ -152,11 +156,28 @@ def gapfill_lst(
     _progress(0.0, "读取原始 LST 影像")
     arr, profile = _load_band(input_tif)
     height, width = arr.shape
-    total = int(height * width)
-    valid = int(np.isfinite(arr).sum())
-    filled = total - valid
-    # 占比口径统一：优先用研究区多边形内像元数（写入 tif 的 REGION_PIXELS 元数据，
-    # 由 export_geotiff 写入）；缺失时回退 bbox 全网格
+
+    # 研究区掩膜（可选）：只填研究区矢量范围内的空洞；区外保持 NoData
+    region_mask = None
+    outside = None
+    if region_geojson:
+        try:
+            from .geo_mask import rasterize_region
+
+            region_mask = rasterize_region(region_geojson, input_tif)
+        except Exception:
+            region_mask = None
+        if region_mask is not None and int(region_mask.sum()) > 0:
+            outside = ~region_mask
+            work = np.where(region_mask, arr, np.nan).astype(np.float32)
+            _progress(0.02, "已按研究区矢量范围限定填洞区域")
+        else:
+            region_mask = None
+            work = arr
+    else:
+        work = arr
+
+    # 研究区口径：优先读 tif 的 REGION_PIXELS 元数据；缺失时用掩膜像元数兜底
     region_pixels = 0
     try:
         with rasterio.open(input_tif) as _src:
@@ -164,14 +185,23 @@ def gapfill_lst(
         region_pixels = int(_tag) if _tag else 0
     except Exception:
         region_pixels = 0
+    if region_mask is not None and region_pixels <= 0:
+        region_pixels = int(region_mask.sum())
+
+    total = int(height * width)
+    valid = int(np.isfinite(work).sum())
+    if region_mask is not None:
+        filled = int((~np.isfinite(work) & region_mask).sum())
+    else:
+        filled = total - valid
     denom = region_pixels if region_pixels > 0 else total
     filled_ratio = filled / denom if denom else 0.0
-    before = _stats(arr)
+    before = _stats(work)
 
     # 全图无洞：原样输出（拷贝）
     if filled == 0:
         os.makedirs(os.path.dirname(output_tif) or ".", exist_ok=True)
-        _write_tif(arr, output_tif, profile)
+        _write_tif(work, output_tif, profile)
         if output_mask_tif:
             _write_tif(np.zeros((height, width), dtype=np.uint8), output_mask_tif,
                        _mask_profile(profile, height, width))
@@ -179,7 +209,7 @@ def gapfill_lst(
         return {
             "total_pixels": total, "valid_pixels": valid, "filled_pixels": 0,
             "filled_ratio": 0.0, "region_pixels": region_pixels,
-            "before": before, "after": _stats(arr),
+            "before": before, "after": _stats(work),
             "max_level": 0, "used_pyramid": False,
             "output_tif": output_tif, "output_mask_tif": output_mask_tif,
         }
@@ -189,13 +219,13 @@ def gapfill_lst(
     used_pyramid = True
     if filled_ratio < _SMALL_HOLE_RATIO:
         _progress(0.5, "空洞占比小，直接 IDW 填充")
-        filled_arr = _idw_fill(arr)
+        filled_arr = _idw_fill(work)
         used_pyramid = False
         effective_level = 0
     else:
         # 逐级下采样，直到空洞占比 < 2% 或达到最大层数
-        levels = [arr]
-        masks = [~np.isfinite(arr)]
+        levels = [work]
+        masks = [~np.isfinite(work)]
         level = 0
         while level < max_level:
             nxt = _downsample_mean(levels[-1])
@@ -239,8 +269,15 @@ def gapfill_lst(
         fill_value = float(np.nanmean(filled_arr)) if np.isfinite(filled_arr).any() else 0.0
         filled_arr[leftover] = fill_value
 
+    # 研究区矢量范围外的像元一律恢复 NoData（不产出区外估计值）
+    if outside is not None:
+        filled_arr = np.where(outside, np.nan, filled_arr)
+
     after = _stats(filled_arr)
-    mask = (np.isfinite(arr) ^ True).astype(np.uint8)
+    if region_mask is not None:
+        mask = ((~np.isfinite(work)) & region_mask).astype(np.uint8)
+    else:
+        mask = (~np.isfinite(work)).astype(np.uint8)
 
     _progress(0.9, "写入填洞结果与空洞掩膜")
     os.makedirs(os.path.dirname(output_tif) or ".", exist_ok=True)
@@ -262,7 +299,7 @@ def gapfill_lst(
 def _mask_profile(profile: dict, height: int, width: int) -> dict:
     """空洞掩膜 tif 的 profile（uint8，单波段）。"""
     p = dict(profile)
-    p.update(dtype="uint8", count=1, nodata=None, compress="lzw",
+    p.update(dtype="uint8", count=1, nodata=None, compress="deflate", predictor=2,
              tiled=True, blockxsize=256, blockysize=256,
              height=int(height), width=int(width))
     return p
@@ -277,7 +314,8 @@ def _write_tif(arr: np.ndarray, path: str, profile: dict, nodata: float = np.nan
 
     dtype = str(arr.dtype)
     p = dict(profile)
-    p.update(dtype=dtype, count=1, compress="lzw", tiled=True,
+    p.update(dtype=dtype, count=1, compress="deflate",
+             predictor=(3 if dtype.startswith("float") else 2), tiled=True,
              blockxsize=256, blockysize=256,
              height=int(arr.shape[0]), width=int(arr.shape[1]))
     if dtype.startswith("float"):

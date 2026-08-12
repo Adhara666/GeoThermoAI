@@ -1,13 +1,13 @@
 """
-GeoTIFF导出模块（B-07 / 用户确认第13条重写）
+GeoTIFF导出模块（重写）
 
-严格按 CSV 的 row,col 写入栅格，不再依赖 CSV 文件偏移/行序推导像元位置。
-旧实现虽然要求 CSV 含 row,col 列，但实际用 ``idx = csv_offset + i; row = idx // width``
+严格按 Parquet 的 row,col 写入栅格，不再依赖表格文件偏移/行序推导像元位置。
+旧实现虽然要求表含 row,col 列，但实际用 ``idx = csv_offset + i; row = idx // width``
 按连续文件偏移重新计算行列，只在"全网格、严格行优先、未被重排"这一隐含前提下
 碰巧正确；一旦只写有效行、并发合并、排序或断点续跑，栅格会静默错位（已用乱序
 2x2 CSV 复现）。
 
-本实现改为：读取 CSV 的 row/col 列直接定位到二维数组对应位置；越界或重复
+本实现改为：读取表格的 row/col 列直接定位到二维数组对应位置；越界或重复
 (row,col) 立即结构化失败，不静默覆盖或忽略。统计信息使用在线（Welford）算法
 增量计算，不再对整幅数组做布尔索引复制。
 """
@@ -22,6 +22,7 @@ import pandas as pd
 import rasterio
 
 from .atomic_io import write_verified
+from .table_io import iter_chunks
 
 
 class _OnlineStats:
@@ -70,10 +71,10 @@ def export_geotiff(
     progress_callback=None,
 ) -> Dict:
     """
-    将CSV中的 LST_final 列严格按 row,col 写入带地理参考的GeoTIFF影像。
+    将Parquet中的 LST_final 列严格按 row,col 写入带地理参考的GeoTIFF影像。
 
     Args:
-        lst_final_csv:   包含 LST_final、row、col 列的CSV路径
+        lst_final_csv:   包含 LST_final、row、col 列的Parquet路径
         meta_10m_json:   10m数据元信息JSON路径（含height, width, transform, crs）
         output_path:     输出GeoTIFF路径（固定名，通过 .partial + 原子替换写入）
         value_column:    写入的数值列名，默认 LST_final
@@ -87,7 +88,7 @@ def export_geotiff(
             - file_size_mb: 文件大小(MB)
 
     Raises:
-        ValueError: CSV 中出现 row/col 越界或重复索引（结构化失败，不静默覆盖/忽略）
+        ValueError: 表中出现 row/col 越界或重复索引（结构化失败，不静默覆盖/忽略）
     """
     if progress_callback:
         progress_callback("export_geotiff", 0, "开始加载元数据...")
@@ -113,28 +114,28 @@ def export_geotiff(
     seen = np.zeros((height, width), dtype=bool)
 
     if progress_callback:
-        progress_callback("export_geotiff", 0.15, "开始按 row,col 读取CSV并填充栅格...")
+        progress_callback("export_geotiff", 0.15, "开始按 row,col 读取Parquet并填充栅格...")
 
-    # ── 3. 分批读取CSV，严格按 row,col 定位写入 ─────────────────────────
+    # ── 3. 分批读取Parquet，严格按 row,col 定位写入 ──────────────────────
     chunk_size = 1_000_000
     total_rows = 0
     filled_rows = 0
     stats = _OnlineStats()
 
-    for i, chunk in enumerate(pd.read_csv(lst_final_csv, chunksize=chunk_size, usecols=["row", "col", value_column])):
+    for i, chunk in enumerate(iter_chunks(lst_final_csv, columns=["row", "col", value_column], batch_size=chunk_size)):
         n = len(chunk)
 
         # 空值必须先于 int64 转换检出：NaN 转 int64 会变成 INT64_MIN
         # (-9223372036854775808)，之后只能报「越界」，读者无法看出真实原因是
-        # 「row/col 是空的」——这通常意味着上游中间 CSV 写入不完整或被截断。
+        # 「row/col 是空的」——这通常意味着上游中间表写入不完整或被截断。
         null_index = chunk["row"].isna() | chunk["col"].isna()
         if null_index.any():
             n_null = int(null_index.sum())
             first_bad = int(null_index.values.argmax()) + i * chunk_size
             raise ValueError(
-                f"GeoTIFF 导出失败：CSV 第 {i} 个批次中有 {n_null} 行的 row 或 col 是空值"
+                f"GeoTIFF 导出失败：第 {i} 个批次中有 {n_null} 行的 row 或 col 是空值"
                 f"（首个出现在第 {first_bad:,} 行附近）。行列号本应是完整的整数，"
-                f"出现空值通常说明上游中间 CSV 写入不完整（磁盘空间不足或写入被中断），"
+                f"出现空值通常说明上游中间表写入不完整（磁盘空间不足或写入被中断），"
                 f"而不是模型或算法问题；拒绝导出以避免静默错位"
             )
 
@@ -147,7 +148,7 @@ def export_geotiff(
             n_bad = int(out_of_bounds.sum())
             examples = list(zip(rows[out_of_bounds][:5].tolist(), cols[out_of_bounds][:5].tolist()))
             raise ValueError(
-                f"GeoTIFF 导出失败：CSV 第 {i} 个批次中有 {n_bad} 行 row/col 越界 "
+                f"GeoTIFF 导出失败：第 {i} 个批次中有 {n_bad} 行 row/col 越界 "
                 f"(height={height}, width={width})，例如 {examples}；拒绝导出以避免静默错位"
             )
 
@@ -156,7 +157,7 @@ def export_geotiff(
             n_dup = int(dup_mask.sum())
             examples = list(zip(rows[dup_mask][:5].tolist(), cols[dup_mask][:5].tolist()))
             raise ValueError(
-                f"GeoTIFF 导出失败：CSV 第 {i} 个批次中有 {n_dup} 行 row/col 与此前已写入的像元重复，"
+                f"GeoTIFF 导出失败：第 {i} 个批次中有 {n_dup} 行 row/col 与此前已写入的像元重复，"
                 f"例如 {examples}；每个像元最多允许出现一次，拒绝导出以避免静默覆盖"
             )
         seen[rows, cols] = True
@@ -195,7 +196,7 @@ def export_geotiff(
             f"统计: min={_min:.4f}, max={_max:.4f}, mean={_mean:.4f}, valid={valid_percent:.1f}%",
         )
 
-    # ── 5. 写入GeoTIFF（.partial + 校验 + 原子替换，A-02/A-08）───────────
+    # ── 5. 写入GeoTIFF（.partial + 校验 + 原子替换）───────────
     if progress_callback:
         progress_callback("export_geotiff", 0.7, "写入GeoTIFF文件...")
 
@@ -204,7 +205,7 @@ def export_geotiff(
             tmp_path, "w", driver="GTiff",
             height=height, width=width, count=1,
             dtype=rasterio.float32, crs=crs, transform=transform,
-            compress="lzw", tiled=True, blockxsize=256, blockysize=256,
+            compress="deflate", predictor=3, tiled=True, blockxsize=256, blockysize=256,
             nodata=np.nan,
         ) as dst:
             dst.write(arr, 1)

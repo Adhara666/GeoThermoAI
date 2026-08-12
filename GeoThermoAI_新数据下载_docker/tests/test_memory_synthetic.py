@@ -45,8 +45,6 @@ SUCCESS_RECORD = {
         {"feature": "DEM", "importance": 0.23},
         {"feature": "NIR", "importance": 0.10},
     ],
-    "independent_prediction": {"n_samples": 388869, "R2": 0.82,
-                               "RMSE_K": 1.41, "MAE_K": 1.05, "MB_K": 0.08},
     "closure": {"n_matched_cells": 373240,
                 "metrics": {"MB_K": 0.05, "MAE_K": 0.40, "RMSE_K": 0.50, "R2": 0.995},
                 "value_range": {"low_end_difference_K": -0.45, "high_end_difference_K": -0.58}},

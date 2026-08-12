@@ -1,5 +1,5 @@
 """
-规划角色提示词（技术方案 4.3 / 4.6 / 附录 A）
+规划角色提示词
 
 四段结构（缺一不可）：你是谁 / 你只负责什么 / 你禁止做什么 / 你的输出格式。
 """
@@ -32,6 +32,13 @@ PLANNER_INTENT_PROMPT = """{identity}
 - 用户只是确认某个地名、问「你认识 X 吗」→ qa，不要当成任务
 - 用户明确说想要产品/结果/数据但没给全信息 → 仍然是 task，把缺失项写进 missing
 - **model 未指定时绝不反问、绝不写进 missing**：模型默认使用随机森林（rf）；只有用户明确要求具体模型（如 XGBoost）时才抽取 model 槽位
+- **已有结果时优先判 postprocess**：「当前对话已有的产物」非空（已有 10m 地表温度结果）且用户说「无空洞/填洞/空洞填补/结果后处理/对已有结果做XX」→ postprocess；不要因为用户没提新研究区/新时间就问东问西
+- **结果后处理的两种情况必须分清**：
+  - 用户**基于已有结果**（如「根据我现有的结果/对当前已有产品/对现有结果/继续生成无空洞」）要求无空洞、填洞、空洞填补 → **postprocess**：不重新下载数据、不训练模型，只对已有 10m 产品做空洞填补
+  - 用户要求**从头/重新跑一次完整流程**（如「对 XX 地区做全流程处理」「重新跑一遍」），并**顺带要求结果后处理**（如「包括无空洞结果」「加上空洞填补」）→ **task**：按完整流程规划，并在流程末尾包含 lst_gapfill 步骤
+
+## 当前对话已有的产物（判断「结果后处理」的关键依据，不要忽略）
+{existing_products}
 
 ## 槽位
 - region_name：用户说的研究区名称（地名），没提就填 null
@@ -79,6 +86,9 @@ PLANNER_PLAN_PROMPT = """{identity}
 2. params 里只放 region、start_date、end_date 三个业务参数；**禁止输出任何文件路径参数**，系统会自动注入
 3. reason 用一句中文概括，不超过 30 字
 4. 若检索到同区域的可复用成功流程，把它的参数写进 constraints，并在 goal 里说明参考了历史流程
+5. **用户明确要求包含结果后处理（无空洞/填洞/空洞填补）时**，在 accuracy_eval 之后追加一个步骤：
+   {{"skill": "lst_gapfill", "params": {{}}, "reason": "对结果做空洞填补生成无空洞产品"}}
+   用户没提结果后处理时**不要**加这个步骤
 
 ## 输出格式（严格遵守，只输出这个 JSON 对象）
 {{"goal": "一句话说明本次要产出什么",
@@ -110,11 +120,38 @@ action 只能取 proceed / ask / chat_only。
 """
 
 
-def intent_prompt(session_context: str, study_areas: str) -> str:
+def intent_prompt(session_context: str, study_areas: str,
+                  existing_products: str = "") -> str:
     return PLANNER_INTENT_PROMPT.format(
         identity=PLANNER_IDENTITY,
         session_context=session_context or "（本对话尚无已确认信息）",
         study_areas=study_areas or "（用户还没有上传任何研究区文件）",
+        existing_products=existing_products or "（本对话暂无已生成的 10m 地表温度结果）",
+    )
+
+
+CONFIRM_POSTPROCESS_PROMPT = """你是 GeoThermoAI 的意图确认器，只做一件事：判断用户最新这条消息是「对已有结果做后处理」还是「重新跑完整流程」。
+
+## 当前对话已有的 10m 地表温度结果
+{existing_products}
+
+## 用户最新消息
+{user_input}
+
+## 判断规则
+- postprocess：用户在对**已有结果**说话（无空洞/填洞/空洞填补/结果后处理/补洞/去空洞等），不需要重新下载数据或训练模型
+- task：用户要**重新/从头**跑完整流程（提到了新研究区、新时间范围、重新生成产品等明确的新任务信号）
+- 拿不准时选 postprocess（系统更倾向对已有结果做后处理，代价更低）
+
+## 输出格式（只输出这个 JSON 对象）
+{{"intent": "postprocess 或 task", "confidence": 0.9, "reason": "一句话说明判定依据"}}
+"""
+
+
+def confirm_postprocess_prompt(user_input: str, existing_products: str) -> str:
+    return CONFIRM_POSTPROCESS_PROMPT.format(
+        user_input=user_input or "",
+        existing_products=existing_products or "（暂无已生成的 10m 地表温度结果）",
     )
 
 

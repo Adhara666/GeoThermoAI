@@ -1,9 +1,9 @@
 """
-反思结果数据类（技术方案 2.5）
+反思结果数据类
 
 各角色的反思统一返回 `ReflectionResult`；确定性规则的结论**永远覆盖** LLM 结论，
 `rule_hits` 记录命中的规则编号（如 `P2` / `D3` / `R3` / `E-R4`），供气泡与报告标注
-「[规则] R3」以便追溯（技术方案 13.2）。
+「[规则] R3」以便追溯。
 """
 
 from dataclasses import dataclass, field

@@ -1,10 +1,10 @@
 """
 角色编排钩子（把三个执行 Agent 接到执行引擎的扩展点上）
 
-技术方案 2.2 的「Solve」侧实现：执行引擎在每个钩子点回调这里，本类再委托给
+「Solve」侧实现：执行引擎在每个钩子点回调这里，本类再委托给
 数据 / 训练 / 评估 Agent，并按执行模式决定「继续 / 暂停审批 / 重跑本步 / 中止 / 交回 replan」。
 
-replan 只能由总调度发起（技术方案 2.4 规则 1）：本类只把 `replan_request` 记下来，
+replan 只能由总调度发起（规则 1）：本类只把 `replan_request` 记下来，
 由 `GeoThermoAgent.process_command_with_roles` 决定是否真的交给规划 Agent。
 """
 
@@ -82,7 +82,7 @@ class RoleHooks(StageHooks):
     def rank_pairs(self, pairs: List[dict], ctx: Any) -> Optional[List[dict]]:
         if self.data_agent is None:
             return None
-        # 升级点 1/12：读取本项目历史已尝试过的影像对，供排序排除
+        # 读取本项目历史已尝试过的影像对，供排序排除
         used: set = set()
         try:
             mm = getattr(ctx, "memory_manager", None)
@@ -113,12 +113,12 @@ class RoleHooks(StageHooks):
         return chosen
 
     def _all_pairs_tried(self) -> bool:
-        """当前候选是否全部已尝试过（升级点 12：此时不再提示换影像对）。"""
+        """当前候选是否全部已尝试过（此时不再提示换影像对）。"""
         ranked = self.ranked_pairs or []
         return bool(ranked) and all(bool(p.get("tried")) for p in ranked)
 
     def on_no_pair(self, detail: dict, ctx: Any) -> Optional[StepDecision]:
-        """搜不到合格配对：两种模式都不许硬跑（技术方案 5.2）。"""
+        """搜不到合格配对：两种模式都不许硬跑。"""
         summary = (self.data_agent.no_pair_summary(detail) if self.data_agent
                    else presentation.no_pair_reason(detail).strip())
         ctx.emit(summary + "\n")
@@ -165,7 +165,7 @@ class RoleHooks(StageHooks):
     # ── 数据阶段的失败与反思 ───────────────────────────────────────
 
     def _data_step_failed(self, skill_name: str, result: Any, ctx: Any) -> StepDecision:
-        """数据阶段任一步失败 → 禁止往下跑（修复 1.5(4)）。
+        """数据阶段任一步失败 → 禁止往下跑。
 
         结果摘要由执行引擎在调用本钩子前输出，这里不重复打印。
         """
@@ -189,7 +189,9 @@ class RoleHooks(StageHooks):
             meta_probe=self.data_probes.get("meta_probe"),
         )
         if reflection.ok:
-            ctx.emit("数据检查通过，进入模型训练\n")
+            # 分割线 + 项目符号：与上一条「- 地形热响应指数计算完成：…」摘要对齐
+            ctx.emit(presentation.step_divider())
+            ctx.emit("  - 数据检查通过，进入模型训练\n")
             return StepDecision.cont()
 
         summary = self._reflection_summary(reflection)
@@ -210,7 +212,7 @@ class RoleHooks(StageHooks):
         if reflection.suggestions:
             lines.append("建议：" + "；".join(reflection.suggestions[:3]))
         if reflection.rule_hits:
-            # 升级点 10：不向前端展示「[规则] D7 判定不合格」类字眼，
+            # 不向前端展示「[规则] D7 判定不合格」类字眼，
             # 用自然语言说明判定结论即可（规则编号仅供日志追溯）
             lines.append("已按数据质量检查判定本批数据不合格，请选择下一步")
         return "\n".join(lines)
@@ -232,7 +234,7 @@ class RoleHooks(StageHooks):
     def _approval_branch(self, node: str, summary: str, ctx: Any) -> StepDecision:
         builder = (approval_proto.build_no_pair if node == Node.NO_PAIR
                    else approval_proto.build_data_quality)
-        # 升级点 12：全部影像对都已尝试过时，不再提供"重新选择影像组合"选项
+        # 全部影像对都已尝试过时，不再提供"重新选择影像组合"选项
         payload = builder(summary, exclude_reselect=self._all_pairs_tried())
         choice = self._ask(payload)
         if choice is None:
@@ -251,7 +253,7 @@ class RoleHooks(StageHooks):
                                      message="已按你的要求停下，随时可以重新下达指令。")
 
         if option_id == Option.ACCEPT:
-            # v1.2 新增：用户明确要求忽略检查未通过的提示，直接放行进入下一步
+            # 用户明确要求忽略检查未通过的提示，直接放行进入下一步
             message = "好的，已按你的确认继续执行后续步骤。"
             ctx.emit(message + "\n")
             return StepDecision.cont()

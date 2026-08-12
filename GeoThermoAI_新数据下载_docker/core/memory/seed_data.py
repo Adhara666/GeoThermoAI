@@ -8,7 +8,7 @@ ChromaDB `global_knowledge` Collection（幂等：count>0 跳过）。
 
 from .knowledge_eval import EVAL_SEED_ITEMS
 
-SEED_SCHEMA_VERSION = 2   # v2：各条目补 domain 标量字段 + 合并 E 系列评估先验知识
+SEED_SCHEMA_VERSION = 3   # v3：新增 K33 结果后处理「研究区矢量范围限定」知识
 
 SEED_ITEMS = [
     {
@@ -37,7 +37,7 @@ SEED_ITEMS = [
         "topic": "TCR 机制",
         "tags": ["tcr", "残差", "热约束"],
         "domain": "theory",
-        "content": "TCR（热约束残差）修正跨尺度系统性偏差，以完整30m约束层（30m_constraint_grid.csv，真实30m像元而非稀疏锚点）为参考，细→粗/粗→细映射统一使用 core.grid_mapping 仿射逆变换。核心公式：TCR_30m = LST_true_30m − mean(LST_pred_in_30m_cell)；LST_final_10m = LST_pred_10m + TCR。默认 block_constant 模式：每个30m格内所有有效10m像元加同一残差常数，精确满足「30m产品格网算术均值闭合」，边界可能呈块状；可选 smooth_recentered 模式（实验性）：先对TCR场双线性插值生成连续残差场，再按同一父格重中心化，格内均值闭合同样精确，但不承诺全局连续（30m栅格边缘半个像元内退化为整格常数）。TCR 只谈算术均值闭合，不宣称辐射或能量守恒。",
+        "content": "TCR（热约束残差）修正跨尺度系统性偏差，以完整30m约束层（30m_constraint_grid.parquet，真实30m像元而非稀疏锚点）为参考，细→粗/粗→细映射统一使用 core.grid_mapping 仿射逆变换。核心公式：TCR_30m = LST_true_30m − mean(LST_pred_in_30m_cell)；LST_final_10m = LST_pred_10m + TCR。默认 block_constant 模式：每个30m格内所有有效10m像元加同一残差常数，精确满足「30m产品格网算术均值闭合」，边界可能呈块状；可选 smooth_recentered 模式（实验性）：先对TCR场双线性插值生成连续残差场，再按同一父格重中心化，格内均值闭合同样精确，但不承诺全局连续（30m栅格边缘半个像元内退化为整格常数）。TCR 只谈算术均值闭合，不宣称辐射或能量守恒。",
     },
     {
         "id": "K03",
@@ -144,14 +144,21 @@ SEED_ITEMS = [
         "domain": "theory",
         "content": "10m 地表温度产品在预处理阶段按联合掩膜（Landsat QA 无云 + Sentinel-2 SCL 类别 4/5/6 + 热红外有效值）剔除了云/云影等像元，因此最终导出的 rf_10m_lst_final_{date}.tif 在云区存在 nodata 空洞。结果后处理（可选）对这些空洞做空间重建（gap filling），只估计空洞像元、绝不改变无云区数值，且填洞值不参与 TCR 与闭合精度评价。算法：空洞占比 <2% 时直接在原始分辨率做 IDW（k 近邻反距离加权，距离幂次默认 2）一次填完；否则用多尺度金字塔——逐级 2× 平均聚合下采样直到空洞占比 <2%（最粗层代表大尺度温度趋势），最粗层对残余小洞做 IDW 填充，再逐层双线性上采样回填（有效像元写真值、空洞像元继承上层趋势值），避免成片云洞中心被拉平成洞口邻域均值。输出两个 GeoTIFF：填洞后的完整产品（rf_10m_lst_final_filled_{date}.tif）与空洞掩膜（rf_10m_lst_final_filled_{date}_cloud_mask.tif，1=估计像元、0=原始有效），供下游区分真实观测与重建值。卫星在云下看不见地表，任何填洞都是估计而非观测。",
     },
+    {
+        "id": "K33",
+        "topic": "结果后处理（空洞填补）的研究区矢量范围限定",
+        "tags": ["结果后处理", "空洞填补", "研究区", "矢量范围", "NoData", "掩膜", "gap filling"],
+        "domain": "theory",
+        "content": "10m LST 空洞填补只作用于**研究区矢量范围内**：从执行计划（plan.region.study_area_file）或用户研究区目录取研究区 GeoJSON，用 gdal.RasterizeLayer 栅格化到 LST 产品网格，得到「像元中心是否落在研究区内」的布尔掩膜；掩膜外的像元在填洞前一律视为无效（不参与 IDW 近邻与金字塔下采样），填洞完成后恢复为 NoData——绝不产出研究区 bbox 范围内、矢量区外的估计值。统计口径同步按研究区：填洞占比分母优先用产品元数据 REGION_PIXELS（研究区内像元数），缺失时用掩膜像元数兜底；空洞掩膜 GeoTIFF（1=估计像元）也只标记研究区内被估计的像元。区外与区内的分界线以研究区矢量边界为准，不以 bbox 外接矩形为准。",
+    },
 ]
 
 
-# ── 合并 E 系列评估先验知识（技术方案 7.2）─────────────────────────
+# ── 合并 E 系列评估先验知识 ─────────────────────────
 # 分文件维护、单一列表导出：播种与检索都只认 SEED_ITEMS，避免两处清单漂移。
 SEED_ITEMS = SEED_ITEMS + EVAL_SEED_ITEMS
 
-# 各条目的 domain 取值（ChromaDB metadata 标量过滤键，见技术方案 8.4c）
+# 各条目的 domain 取值（ChromaDB metadata 标量过滤键）
 DOMAINS = ("data", "model", "eval", "theory")
 
 

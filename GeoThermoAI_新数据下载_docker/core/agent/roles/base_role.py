@@ -1,5 +1,5 @@
 """
-角色 Agent 基类（技术方案 2.5 / 附录 A）
+角色 Agent 基类
 
 四个角色共用一个 LLM 客户端（`GeoThermoAI_Assistant`），不引入任何多智能体框架。
 本基类只负责三件事：
@@ -7,7 +7,7 @@
 2. JSON 三级解析兜底（与现有 `_parse_plan` 同一套策略，此处是单一来源）；
 3. 按角色定制的记忆注入（`enrich_for_role`，不可用时退回 `enrich_prompt`）。
 
-角色提示词必须包含四段（附录 A 检查清单）：你是谁 / 只负责什么 / 禁止做什么 / 输出格式。
+角色提示词必须包含四段（提示词检查清单）：你是谁 / 只负责什么 / 禁止做什么 / 输出格式。
 """
 
 import json
@@ -23,7 +23,7 @@ REQUIRED_PROMPT_SECTIONS = ("你是", "你只负责", "你禁止", "输出")
 
 def _strip_trailing_commas(snippet: str) -> str:
     """去掉对象/数组收尾前多余的逗号（`{"a": 1,}` → `{"a": 1}`），
-    应对模型输出的「近似 JSON」常见笔误（实现期修订 v1.2）。"""
+    应对模型输出的「近似 JSON」常见笔误。"""
     return re.sub(r",(\s*[}\]])", r"\1", snippet)
 
 
@@ -81,8 +81,7 @@ def extract_json(response: str) -> Optional[dict]:
     首尾大括号截取；每一级都追加一次「去尾随逗号」重试）。
 
     这是全项目 JSON 解析的单一来源；`GeoThermoAgent._parse_plan` 也委托到这里。
-    实现期修订 v1.2：原三级兜底只覆盖模型输出「干净」JSON 的理想情况，对「推理前言里
-    夹带花括号」「尾随逗号」两类常见的不严格 JSON 输出没有兜底，新增两级应对。
+    兜底链覆盖两类常见的不严格输出：「推理前言里夹带花括号」与「尾随逗号」。
     """
     text = (response or "").strip()
     if not text:
@@ -130,7 +129,7 @@ class RoleAgent:
         self.memory = memory_manager
         self.project_id = project_id
         self._on_log = on_log
-        # 思考过程累积缓冲（升级点 15/16）：规划/反思等同步 LLM 调用的
+        # 思考过程累积缓冲：规划/反思等同步 LLM 调用的
         # reasoning_content 也会累积透传，让气泡思考块实时展示"在想什么"
         self._on_thinking = on_thinking
         self._thinking_acc = ""
@@ -145,7 +144,7 @@ class RoleAgent:
             except Exception:
                 pass
 
-    # ── 思考过程透传（升级点 15）───────────────────────────────────
+    # ── 思考过程透传───────────────────────────────────
 
     def _push_thinking(self, text: str) -> None:
         """累积一次 LLM 调用的思考内容并透传（覆盖式回调，保持最新全量）。"""
@@ -199,13 +198,18 @@ class RoleAgent:
     def call_json(self, system_prompt: str, user_content: str,
                   temperature: float = 0.0, max_tokens: int = 1200,
                   history: Optional[List[dict]] = None,
-                  retry_once: bool = True) -> Optional[dict]:
+                  retry_once: bool = True,
+                  thinking: Optional[dict] = None) -> Optional[dict]:
         """调用 LLM 并解析为 JSON 对象；解析失败时用更严格的提示重试一次。
 
         返回 None 表示「LLM 不可用或输出无法解析」，由调用方走确定性兜底。
+        `thinking` 透传给底层 API：对「单步结构化输出」的 JSON 调用建议传
+        thinking={"type": "disabled"}，否则 DeepSeek 等模型的推理内容计入
+        max_tokens，可能把 JSON 截断。
         """
         response = self.call_text(system_prompt, user_content, temperature=temperature,
-                                  max_tokens=max_tokens, history=history)
+                                  max_tokens=max_tokens, history=history,
+                                  thinking=thinking)
         if is_api_failure(response):
             self.log(f"LLM 不可用：{response[:120]}")
             return None
@@ -217,7 +221,8 @@ class RoleAgent:
 
         strict = system_prompt + "\n\n## 强制要求\n只输出一个 JSON 对象，不要任何解释文字、标题或代码块标记。"
         response = self.call_text(strict, user_content, temperature=0.0,
-                                  max_tokens=max_tokens, history=history)
+                                  max_tokens=max_tokens, history=history,
+                                  thinking=thinking)
         if is_api_failure(response):
             return None
         parsed = extract_json(response)

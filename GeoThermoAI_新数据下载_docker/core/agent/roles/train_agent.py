@@ -1,15 +1,18 @@
 """
-训练与调优 Agent（技术方案第 6 章）· 主反思
+训练与调优 Agent· 主反思
 
 只做**阶段内优化**：改超参再训一轮属于本 Agent 内部循环，不发起 replan。
 唯一上报总调度请求 replan 的情况：用户在审批节点明确选择「换时间或地区」。
 
-两个工程问题的解决（技术方案 6.4）：
+两个工程问题的解决：
 - 问题 A：调优期给 `rf_model` 传 `defer_cleanup=True`，避免每轮重建 train/validate/test；
   接受最终结果后再显式清理一次。
 - 问题 B：每轮输出到 `results/tuning/round_{i}/`，选定最佳轮后把产物**复制**到规范位置
-  `results/`（保留调优轨迹供审计），并确保复制后的模型是 `results/train/` 下最新的，
-  这样下游 `tcr_compute` / `accuracy_eval` 的现有推断逻辑无需改动。
+  `results/`（模型 pkl 只保留最佳轮这一份，供下游 `tcr_compute` / `accuracy_eval` 使用），
+  并确保复制后的模型是 `results/train/` 下最新的，这样下游的现有推断逻辑无需改动。
+- 磁盘瘦身：调优收尾时删除非最佳轮的 round 目录、删除最佳轮在 tuning 里的 pkl 副本，
+  只保留规范位置 `results/train/` 的模型；**每一次调优的指标与参数轨迹仍照常写入
+  `tuning_trace` 实验记录与记忆**，不因删除大体积 pkl 而丢失。
 """
 
 import glob
@@ -24,6 +27,7 @@ from ..orchestrator import approval as approval_proto
 from ..orchestrator.approval import Node, Option
 from ..orchestrator.exec_mode import is_auto
 from ..orchestrator.hooks import StepDecision
+from .. import presentation
 from ..reflection import train_rules
 from ..reflection.train_rules import Decision
 from .base_role import RoleAgent
@@ -51,6 +55,10 @@ class TrainAgent(RoleAgent):
         self.decided_no_tuning = False
         self.manual_params: Dict[str, Any] = {}
         self.finalized = False
+        # AI 连续调优轮数：只统计**连续由 AI/规则主导**的调优轮（round>=1，
+        # 初始训练轮不计入）；用户手动调参的轮次不占用额度，且会把连续计数重置为 0
+        self.ai_rounds = 0
+        self._round_kind = "ai"  # 本轮训练方式（ai / manual），供 on_trained 更新计数
 
     # ── 执行前：分轮目录 + 延迟清理 ─────────────────────────────────
 
@@ -70,7 +78,12 @@ class TrainAgent(RoleAgent):
         index = len(self.rounds)
         record = self._round_record(index, data, ctx)
         self.rounds.append(record)
-        self._emit_round_summary(ctx, record)
+        # AI 连续调优轮数：只有调优轮（round>=1）计入；手动调参轮重置连续计数。
+        # 首轮完成的精度由执行引擎的摘要行报告（「模型训练（第一轮）完成：…」），
+        # 调优轮进度由本 Agent 的「开始调优训练（第N轮）」与「调优结束」报告，
+        # 不再重复输出「第 N 轮训练完成」行（见气泡排版需求）。
+        if index > 0:
+            self.ai_rounds = 0 if self._round_kind == "manual" else self.ai_rounds + 1
 
         exec_mode = getattr(hooks, "exec_mode", "")
         run_state = getattr(hooks, "run_state", None)
@@ -98,7 +111,7 @@ class TrainAgent(RoleAgent):
             summary=self._decision_summary(record),
             fields=self._manual_fields(),
             max_rounds=self.max_rounds,
-            exclude_reselect=all_tried,  # 升级点 12：全部已尝试时不再提示换对
+            exclude_reselect=all_tried,  # 全部已尝试时不再提示换对
         )
         choice = self._ask(hooks, payload)
         if choice is None:
@@ -109,14 +122,18 @@ class TrainAgent(RoleAgent):
 
         if option_id == Option.AI_TUNE:
             self.tuning_started = True
+            self._round_kind = "ai"
             return None
         if option_id == Option.MANUAL_TUNE:
             self.tuning_started = True
+            self._round_kind = "manual"
             self.manual_params = dict(choice.get("values") or {})
             params, _ = train_rules.clamp_params(self.manual_params)
-            ctx.emit("已按你设置的参数再训练一轮\n")
+            self._emit_block(ctx, "已按你设置的参数再训练一轮")
+            # reason 置空：执行引擎 RETRY 分支会重复输出「按你设置的参数重新训练」，
+            # 与上面的确认句语义重复，这里不再让执行引擎补一行
             return StepDecision.retry(self._retry_params(ctx, params),
-                                     reason="按你设置的参数重新训练")
+                                     reason="")
         if option_id == Option.ACCEPT:
             self.decided_no_tuning = True
             self._finalize(ctx, record)
@@ -133,6 +150,13 @@ class TrainAgent(RoleAgent):
 
     # ── 七规则调优循环 ─────────────────────────────────────────────
 
+    @staticmethod
+    def _emit_block(ctx: Any, text: str) -> None:
+        """调优阶段新块：前画分割线 + 项目符号，与「- 模型训练（第N轮）完成：…」
+        摘要对齐（步骤内部的分隔线只用于区分调优各轮之间的内容块）。"""
+        ctx.emit(presentation.step_divider())
+        ctx.emit("  - " + text + "\n")
+
     def _tuning_step(self, ctx: Any, record: dict, exec_mode: str, run_state,
                      hooks) -> StepDecision:
         if self.decided_no_tuning:
@@ -143,21 +167,35 @@ class TrainAgent(RoleAgent):
             "rounds": self.rounds[:-1],
             "current": record,
             "max_rounds": self.max_rounds,
+            "ai_rounds": self.ai_rounds,  # 连续 AI 调优轮数（手动轮不占额度、会重置）
         })
         if final["note"]:
-            # 升级点 10：不向前端展示「[规则] R7 …」类字眼，直接用自然语言说明调优结论
-            ctx.emit(final["note"] + "\n")
+            # 不向前端展示「[规则] R7 …」类字眼，直接用自然语言说明调优结论；
+            # 项目符号与「模型训练（第N轮）完成：…」摘要对齐；收敛/上限/停止类
+            # 结论（action 非 ADJUST）是独立内容块，前面补分割线与上一轮内容分隔。
+            if final["action"] != Decision.ADJUST:
+                self._emit_block(ctx, final["note"])
+            else:
+                ctx.emit("  - " + final["note"] + "\n")
         record["decision"] = final["action"]
         record["rule_hits"] = final["rule_hits"]
 
         # 由我批准模式：每一轮**调优**都报告并询问（无论精度好坏）。
         # 首次训练（round 0）由 tuning_decision 节点负责，不重复弹 tuning_round。
         if not is_auto(exec_mode) and self.tuning_started and record["round"] > 0:
+            # AI 连续调优已达上限（或规则不再建议继续）时视为最后一轮：
+            # 弹窗不再推荐「继续下一轮」，但仍允许用户手动设置参数继续
             is_last = (final["action"] != Decision.ADJUST
-                       or len(self.rounds) >= self.max_rounds)
+                       or self.ai_rounds >= self.max_rounds)
+            # 总训练次数（初始 1 + 调优 N）达到 6 轮后，弹窗提示继续调优收益可能不显著
+            _note = ""
+            if len(self.rounds) >= 6:
+                _note = "当前训练轮数已达6轮（调优轮数已达5轮），继续调优的收益可能不显著。\n"
             payload = approval_proto.build_tuning_round(
-                summary=self._round_summary_text(record, final),
-                is_last_round=is_last)
+                summary=_note + self._round_summary_text(record, final),
+                is_last_round=is_last,
+                fields=self._manual_fields(),
+            )
             choice = self._ask(hooks, payload)
             if choice is None:
                 return StepDecision.pause(payload, reason="等待用户选择本轮调优结果")
@@ -166,9 +204,18 @@ class TrainAgent(RoleAgent):
             if option_id in (Option.ACCEPT, Option.STOP_TUNING):
                 self._finalize(ctx, self._best())
                 return StepDecision.cont()
+            if option_id == Option.MANUAL_TUNE:
+                # 用户手动设置参数再训一轮：不占 AI 额度，AI 连续计数在下一轮重置。
+                # reason 置空：执行引擎 RETRY 分支会重复输出原因，见 _first_decision 注释
+                self._round_kind = "manual"
+                self.manual_params = dict(choice.get("values") or {})
+                params, _ = train_rules.clamp_params(self.manual_params)
+                self._emit_block(ctx, "已按你设置的参数再训练一轮")
+                return StepDecision.retry(self._retry_params(ctx, params),
+                                         reason="")
             if train_rules.hard_stopped(final["rule_hits"]):
                 # 用户要继续，但命中了硬停止规则（R2/R5/R6/R7）→ 规则优先
-                ctx.emit("按硬性规则已不宜继续调优，取误差最小的一轮作为最终结果\n")
+                self._emit_block(ctx, "按硬性规则已不宜继续调优，取误差最小的一轮作为最终结果")
                 self._finalize(ctx, self._best())
                 return StepDecision.cont()
             if final["action"] != Decision.ADJUST:
@@ -182,7 +229,11 @@ class TrainAgent(RoleAgent):
                 run_state.next_tuning_round()
             next_index = len(self.rounds)
             params = self._retry_params(ctx, final["new_params"], round_index=next_index)
-            ctx.emit(f"开始第 {next_index + 1} 轮调优训练\n")
+            self._round_kind = "ai"
+            # 项目符号与模型训练摘要对齐；总轮数含初始训练轮，调优序号只数调优轮
+            # （初始轮不算）；前面的分割线把本轮调优公告与上一轮内容隔开
+            self._emit_block(ctx,
+                f"开始调优训练（总第{next_index + 1}轮，调优第{next_index}轮）")
             return StepDecision.retry(params, reason=final.get("reason", ""))
 
         self._finalize(ctx, self._best())
@@ -200,19 +251,39 @@ class TrainAgent(RoleAgent):
 
         ctx.exp_state["tuning_trace"] = [
             {"round": r["round"], "test_r2": r.get("test_r2"),
-             "rmse": r.get("rmse"), "mae": r.get("mae")}
+             "rmse": r.get("rmse"), "mae": r.get("mae"),
+             "params": dict(r.get("params") or {})}
             for r in self.rounds
         ]
         ctx.exp_state["final_params"] = dict(best.get("params") or {})
         ctx.exp_state["rf_data"] = dict(best.get("raw") or {})
 
         promoted = self._promote_round(ctx, best)
-        rounds_text = f"共 {len(self.rounds)} 轮" if len(self.rounds) > 1 else "未调优"
+        # 磁盘瘦身：调优轨迹（指标/参数）已写入 tuning_trace，磁盘上只保留最佳轮模型
+        self._prune_tuning_artifacts(ctx, best)
         from .. import presentation
 
-        ctx.emit(f"调优结束（{rounds_text}），采用第 {best['round'] + 1} 轮的结果："
-                 f"测试集决定系数 {presentation.fmt_num(best.get('test_r2'))}，"
-                 f"均方根误差 {presentation.fmt_num(best.get('rmse'))} K\n")
+        # 两套轮数口径都写清，避免把「累计训练轮数」误读成调优轮数：
+        # - 累计训练轮数 = 初始 1 轮 + 调优轮数（含手动轮），如「共 2 轮」其实是初始 1 + 调优 1
+        # - 调优轮数不含初始训练轮；「采用调优第 X 轮（总第 Y 轮）」与
+        #   「开始调优训练（总第 N 轮，调优第 M 轮）」的表述风格一致
+        total = len(self.rounds)
+        tuning_n = max(total - 1, 0)
+        if total <= 1:
+            self._emit_block(ctx,
+                f"调优结束（未调优），采用初始训练（总第 1 轮）的结果："
+                f"测试集决定系数 {presentation.fmt_num(best.get('test_r2'))}，"
+                f"均方根误差 {presentation.fmt_num(best.get('rmse'))} K")
+        else:
+            if best["round"] == 0:
+                adopted = "采用初始训练（总第 1 轮）的结果"
+            else:
+                adopted = (f"采用调优第 {best['round']} 轮"
+                           f"（总第 {best['round'] + 1} 轮）的结果")
+            self._emit_block(ctx,
+                f"调优结束（调优 {tuning_n} 轮，累计训练 {total} 轮），{adopted}："
+                f"测试集决定系数 {presentation.fmt_num(best.get('test_r2'))}，"
+                f"均方根误差 {presentation.fmt_num(best.get('rmse'))} K")
         if not promoted:
             self.log("最佳轮产物复制未完成，下游将使用最近一次训练的模型")
 
@@ -264,6 +335,48 @@ class TrainAgent(RoleAgent):
         except Exception as e:
             logger.warning(f"[train] 收尾清理失败（已忽略）: {e}")
 
+    def _prune_tuning_artifacts(self, ctx: Any, best: dict) -> None:
+        """调优轨迹瘦身：磁盘上只保留最佳轮模型（规范位置 results/train/）。
+
+        最佳轮的模型已由 `_promote_round` 复制到 `results/train/`，tuning 里的 pkl 副本
+        冗余可删；非最佳轮的 round 目录整个删除（其唯一大体积文件就是模型 pkl）。
+        每一轮调优的指标与参数已写入 `tuning_trace`（实验记录/记忆），删除文件不影响记忆。
+        任何失败只告警，绝不影响主流程。
+        """
+        results_dir = getattr(ctx, "results_dir", "") or ""
+        if not results_dir:
+            return
+        tuning_root = f"{results_dir}/tuning"
+        if not os.path.isdir(tuning_root):
+            return
+        try:
+            best_round = int(best.get("round", -1))
+        except (TypeError, ValueError):
+            best_round = -1
+        try:
+            for name in sorted(os.listdir(tuning_root)):
+                if not name.startswith("round_"):
+                    continue
+                try:
+                    r_index = int(name.split("_", 1)[1])
+                except (IndexError, ValueError):
+                    continue
+                round_dir = os.path.join(tuning_root, name)
+                if r_index == best_round:
+                    # 最佳轮：保留目录（含每轮轻量 json 轨迹），只删大体积 pkl 副本
+                    for root, _dirs, files in os.walk(round_dir):
+                        for fn in files:
+                            if fn.lower().endswith(".pkl"):
+                                try:
+                                    os.remove(os.path.join(root, fn))
+                                except OSError:
+                                    pass
+                else:
+                    # 非最佳轮：整个轮次目录删除（其唯一大体积文件就是模型 pkl）
+                    shutil.rmtree(round_dir, ignore_errors=True)
+        except OSError as e:
+            logger.warning(f"[train] 调优轨迹瘦身失败（已忽略）: {e}")
+
     # ── 内部工具 ──────────────────────────────────────────────────
 
     @staticmethod
@@ -301,13 +414,6 @@ class TrainAgent(RoleAgent):
 
     def _best(self) -> Optional[dict]:
         return train_rules.best_round(self.rounds)
-
-    def _emit_round_summary(self, ctx: Any, record: dict) -> None:
-        from .. import presentation
-
-        ctx.emit(f"第 {record['round'] + 1} 轮训练完成：测试集决定系数 "
-                 f"{presentation.fmt_num(record.get('test_r2'))}，均方根误差 "
-                 f"{presentation.fmt_num(record.get('rmse'))} K\n")
 
     def _decision_summary(self, record: dict) -> str:
         from .. import presentation
@@ -410,8 +516,13 @@ class TrainAgent(RoleAgent):
                 memory_block=self.memory_block("调参 指标 解读"),
                 advisories="\n".join(f"- {n}" for n in advisories),
             ),
-            # 实现期修订 v1.2：retry_once=False 只有一次机会，预算给足避免被截断
-            "请给出本轮的调优决策。", temperature=0.1, max_tokens=1024, retry_once=False,
+            # retry_once=True：第一次解析失败时 call_json 会用更严格的提示重试一次；
+            # 若只给一次机会，LLM 偶发输出非 JSON 文本会直接失败，兜底成 ACCEPT
+            # 导致调优提前结束。max_tokens 提到 2048 防截断。
+            # 调优决策是单步结构化输出，关闭思考链（DeepSeek 等模型默认开思考，
+            # reasoning_content 计入 max_tokens 会把 JSON 截断）；数值依据已在提示词里给出。
+            "请给出本轮的调优决策。", temperature=0.1, max_tokens=2048, retry_once=True,
+            thinking={"type": "disabled"},
         )
         if not isinstance(parsed, dict):
             return None

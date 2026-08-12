@@ -115,7 +115,7 @@ class GeoThermoAI_Assistant:
         """流式向AI提问，每次收到 token 回调 on_token(累计内容)
 
         on_thinking（可选）：模型输出思考过程（如 DeepSeek 的 reasoning_content）
-        时，以累计思考内容回调，供前端以可折叠形式展示（升级点 15）。
+        时，以累计思考内容回调，供前端以可折叠形式展示。
         """
         if not self.api_key and not self.api_base_url:
             error = "未检测到LLM模型配置，请先在设置中配置 API 密钥或自定义请求地址。"
@@ -148,7 +148,7 @@ class GeoThermoAI_Assistant:
 
     def _call_api(self, messages: List[Dict], **overrides) -> str:
         """调用大模型API，overrides 可覆盖 max_tokens/temperature 等参数。
-        支持 on_thinking 回调（透传非流式响应中的 reasoning_content，升级点 15）。"""
+        支持 on_thinking 回调（透传非流式响应中的 reasoning_content）。"""
         if self.api_format == 'anthropic':
             return self._call_anthropic_api(messages)
         else:
@@ -159,7 +159,7 @@ class GeoThermoAI_Assistant:
 
         on_thinking（可选）：非流式响应（如规划 Agent 出 plan 前的 LLM 调用）
         携带 reasoning_content 时回调，让规划/反思等同步阶段的思考也能实时展示
-        （升级点 15）。
+        。
         """
         on_thinking = overrides.get("on_thinking")
         if self.api_base_url:
@@ -205,7 +205,7 @@ class GeoThermoAI_Assistant:
         """流式调用 OpenAI 兼容格式 API，每次收到 token 回调 on_token(累计内容)
 
         on_thinking：模型输出 reasoning_content（DeepSeek 等思考模型）时，
-        以累计思考内容回调（升级点 15：前端可折叠展示思考过程）。
+        以累计思考内容回调（前端可折叠展示思考过程）。
         """
         if self.api_base_url:
             api_url = f"{self.api_base_url}/chat/completions"

@@ -1,15 +1,16 @@
 """
-规划 Agent（技术方案第 4 章）
+规划 Agent
 
 职责：判定意图 → 多轮补全槽位 → 反问 → 出结构化 plan → 轻反思。
 边界：不执行任何 Skill，信息不全禁止放行。
 
-拍板结论 2：**每条消息都过一次意图分类**，关键词表只作为 LLM 不可用时的兜底。
+：**每条消息都过一次意图分类**，关键词表只作为 LLM 不可用时的兜底。
 """
 
 import datetime
 import json
 import pathlib
+import re
 from typing import Any, Dict, List, Optional
 
 from .. import plan_schema
@@ -28,11 +29,39 @@ _FALLBACK_TASK_KEYWORDS = ("处理", "训练", "下载", "执行", "运行", "�
 _FULL_WORKFLOW_KEYWORDS = ("全流程", "一键", "跑完全流程", "执行全流程")
 
 # 结果后处理关键词（无空洞/填洞等：只对已有结果做后处理，不重跑生产流程）
-_POSTPROCESS_KEYWORDS = ("无空洞", "填洞", "空洞填补", "结果后处理", "去除空洞", "去掉空洞")
+_POSTPROCESS_KEYWORDS = ("无空洞", "空洞填补", "填补空洞", "空洞填充",
+                         "填洞", "补洞", "去空洞", "结果后处理", "gapfill", "gap fill")
+
+# 明确要求跑完整流程的说法（沿用 geo_thermo_agent 的安全网判据）
+_FULLWORKFLOW_MARKERS = ("全流程", "一键", "跑完全流程", "执行全流程", "跑全流程", "做全流程")
+
+
+def _is_postprocess_request(text: str) -> bool:
+    """是否**单独提出**的结果后处理请求（与 geo_thermo_agent 入口拦截同语义）。
+
+    LLM 意图分类偶发把「继续帮我生成无空洞的结果」误判为 task 而反问时间范围，
+    这里用关键词预判在规划阶段就修正（疑问句/全流程/顺带提到均不命中）。
+    """
+    text = (text or "").strip()
+    if not text:
+        return False
+    if text.endswith("？") or text.endswith("?") or text.endswith("吗") \
+            or "为什么" in text or "原因" in text or "什么是" in text or "是什么" in text:
+        return False
+    if any(m in text for m in _FULLWORKFLOW_MARKERS):
+        return False
+    if "包括" in text and any(kw in text for kw in _POSTPROCESS_KEYWORDS):
+        return False
+    if any(kw in text for kw in _POSTPROCESS_KEYWORDS):
+        return True
+    if "空洞" in text and any(w in text for w in ("填补", "填充", "处理",
+                                                   "去掉", "去除", "补上", "生成")):
+        return True
+    return False
 
 
 class PlannerContext:
-    """规划 Agent 的输入上下文（技术方案 4.2，必须全给）。"""
+    """规划 Agent 的输入上下文（必须全给）。"""
 
     def __init__(self, *, user_input: str, prior_messages: Optional[List[dict]] = None,
                  session_state: Optional[dict] = None, study_areas: Optional[List[str]] = None,
@@ -96,15 +125,15 @@ class PlannerAgent(RoleAgent):
     def classify_intent(self, ctx: PlannerContext) -> Dict[str, Any]:
         """低成本意图分类（temperature=0）。
 
-        LLM 不可用时退回关键词兜底（拍板结论 2 的降级路径）。
+        LLM 不可用时退回关键词兜底。
 
-        实现期修订 v1.2：`max_tokens` 从 600 提到 2048——带隐藏推理链的模型（如
-        DeepSeek-V4-Flash）思考过程也计入输出预算，600 太小会把 JSON 答案截断，
-        逼得每次都退回关键词兜底，参考旧路径 `max_tokens=4096` 的经验值放宽。
+        `max_tokens` 提到 2048：带隐藏推理链的模型（如 DeepSeek-V4-Flash）思考过程
+        也计入输出预算，太小会把 JSON 答案截断而退回关键词兜底。
         """
         prompt = planner_prompts.intent_prompt(
             session_context=self._session_context_text(ctx),
             study_areas="、".join(ctx.study_areas) or "",
+            existing_products=self._existing_products_text(ctx),
         )
         parsed = self.call_json(prompt, ctx.user_input, temperature=0.0, max_tokens=2048,
                                history=self._recent_history(ctx))
@@ -114,6 +143,16 @@ class PlannerAgent(RoleAgent):
         intent = str(parsed.get("intent") or "").strip()
         if intent not in plan_schema.INTENTS:
             intent = self._keyword_fallback(ctx)["intent"]
+        # 关键词预判（软性）→ 二次判定：用户单独提出「无空洞/填洞/结果后处理」而 LLM
+        # 判成其他时，追加一次低成本判定让 LLM 拍板——是对已有结果的后处理还是新任务。
+        # 规则不再一刀切强制：LLM 二次判定明确判新任务且高置信才尊重，否则按 postprocess。
+        if intent != "postprocess" and _is_postprocess_request(ctx.user_input):
+            if self._confirm_postprocess(ctx):
+                self.log(f"意图修正：LLM 判定 {intent}，二次判定为 postprocess，已改判")
+                intent = "postprocess"
+                parsed["question"] = ""
+            else:
+                self.log(f"意图修正：LLM 判定 {intent}，二次判定确认新任务，维持原判定")
         raw_slots = parsed.get("slots") if isinstance(parsed.get("slots"), dict) else {}
         return {
             "intent": intent,
@@ -230,7 +269,7 @@ class PlannerAgent(RoleAgent):
 
     def resolve_region(self, ctx: PlannerContext,
                        merged: Dict[str, Any]) -> Dict[str, Any]:
-        """把地名解析成研究区文件绝对路径（技术方案 4.4 硬规则）。
+        """把地名解析成研究区文件绝对路径（硬规则）。
 
         返回 `{"name", "study_area_file", "question"}`；question 非空表示需要反问。
         """
@@ -290,7 +329,7 @@ class PlannerAgent(RoleAgent):
                     memory_block=self.memory_block(ctx.user_input),
                 ),
                 self._plan_request_text(ctx, region, time_value),
-                # 实现期修订 v1.2：与 4096 的旧路径经验值对齐，避免 7 步计划被截断
+                # 与全流程路径经验值对齐，避免 7 步计划被截断
                 temperature=0.1, max_tokens=4096,
             )
 
@@ -313,11 +352,30 @@ class PlannerAgent(RoleAgent):
 
         region/time_range 留空（不需要新输入）；lst_gapfill 的输入路径由执行引擎
         从项目结果目录自动定位（executor 对 lst_gapfill 做动态查找）。
+        研究区 GeoJSON 优先读影像对目录里记录的生成时研究区（region_study_area.json），
+        回退到当前研究区目录最新上传文件——填洞只作用于研究区矢量范围内
+        （区外保持 NoData，见结果后处理需求），且必须与产品同一区域。
         """
+        record = self._latest_pair_region_record(ctx)
+        _sa = []
+        _name = ""
+        if record.get("study_area_file") and \
+                pathlib.Path(str(record["study_area_file"])).is_file():
+            _sa = [pathlib.Path(str(record["study_area_file"]))]
+            _name = str(record.get("name") or "") or _sa[0].stem
+        else:
+            _sa = ctx.study_area_paths()
+            if _sa:
+                _n = pathlib.Path(str(_sa[0])).name
+                for _ext in (".geojson", ".json", ".shp", ".kml", ".gpkg"):
+                    if _n.lower().endswith(_ext):
+                        _n = _n[: -len(_ext)]
+                        break
+                _name = _n
         return plan_schema.parse({
             "intent": intent,
-            "goal": "对已有十米地表温度产品做空洞填补，生成无空洞产品",
-            "region": {"name": "", "study_area_file": ""},
+            "goal": "对已有10m地表温度产品做空洞填补，生成无空洞产品",
+            "region": {"name": _name, "study_area_file": str(_sa[0]) if _sa else ""},
             "time_range": {"start": "", "end": ""},
             "constraints": self._constraints(ctx, {}),
             "steps": [{"skill": "lst_gapfill", "params": {},
@@ -325,11 +383,36 @@ class PlannerAgent(RoleAgent):
             "memory_refs": [],
         }, registry=self.registry)
 
+    def _latest_pair_region_record(self, ctx: PlannerContext) -> Dict[str, str]:
+        """影像对目录里 mtime 最新的 region_study_area.json（生成产品时记录的研究区）。
+
+        保证「单步结果后处理」复用生成产品时的同一研究区，而不是最新上传的文件
+        （否则可能把别的区域多边形套到本产品上，导致填洞区域错误）。
+        找不到/解析失败返回空 dict。
+        """
+        base = pathlib.Path(ctx.project_dir) if ctx.project_dir else None
+        if base is None or not base.is_dir():
+            return {}
+        try:
+            cands = sorted(base.glob("pairs/*/region_study_area.json"),
+                           key=lambda p: p.stat().st_mtime, reverse=True)
+        except OSError:
+            return {}
+        if not cands:
+            return {}
+        try:
+            with open(cands[0], encoding="utf-8") as f:
+                data = json.load(f)
+            return {"study_area_file": str(data.get("study_area_file") or ""),
+                    "name": str(data.get("name") or "")}
+        except Exception:
+            return {}
+
     def _plan_request_text(self, ctx: PlannerContext, region: Dict[str, str],
                            time_value: List[str]) -> str:
         return (f"请为「{region.get('name', '')}」在 "
                 f"{slot_utils.describe_range(time_value[0], time_value[1])} 的"
-                f"十米地表温度产品生成完整执行计划。用户原话：{ctx.user_input}")
+                f"10m地表温度产品生成完整执行计划。用户原话：{ctx.user_input}")
 
     def _builtin_steps(self, region: Dict[str, str], time_value: List[str]) -> List[dict]:
         """内置全流程步骤（LLM 不可用或输出不合法时的兜底）。"""
@@ -359,7 +442,7 @@ class PlannerAgent(RoleAgent):
         when = slot_utils.describe_range(time_value[0] if time_value else "",
                                         time_value[1] if len(time_value) > 1 else "")
         product = (merged.get("product") or {}).get("value", "lst_10m")
-        label = "十米地表温度产品" if product == "lst_10m" else product
+        label = "10m地表温度产品" if product == "lst_10m" else product
         return f"生成{region_name or '所选研究区'} {when} 的{label}"
 
     # ── 第四步：轻反思（规则在后，永远覆盖 LLM） ──────────────────
@@ -409,7 +492,7 @@ class PlannerAgent(RoleAgent):
                 step_names="、".join(plan_schema.skill_names(plan)),
                 missing="、".join(classified.get("missing") or []),
             ),
-            # 实现期修订 v1.2：retry_once=False 只有一次机会，预算给足避免被截断
+            # retry_once=False 只有一次机会，预算给足避免被截断
             "请开始复查。", temperature=0.0, max_tokens=1024, retry_once=False,
         )
         if parsed is None:
@@ -478,7 +561,7 @@ class PlannerAgent(RoleAgent):
 
         time_slot = merged.get("time_range") or {}
         if not slot_utils.is_executable(str(time_slot.get("precision") or "")):
-            # 反问时间前补一段简短思考说明（升级点 15/16）：意图分类若走
+            # 反问时间前补一段简短思考说明：意图分类若走
             # 关键词兜底没有 LLM 思考，这里也让反问消息有思考块与用时可展示
             if not self._thinking_acc:
                 region_name = str(region.get("name") or "") or "该研究区"
@@ -505,7 +588,7 @@ class PlannerAgent(RoleAgent):
                               note=reflection.note, reflection=reflection)
 
     def replan(self, ctx: PlannerContext, adjusted_plan: Dict[str, Any]) -> PlannerOutcome:
-        """带原因重新出 plan（技术方案 2.4 规则 5：必须体现针对性调整）。
+        """带原因重新出 plan（规则 5：必须体现针对性调整）。
 
         入参 `adjusted_plan` 已由总调度按子 Agent 建议做过确定性调整
         （放宽云量 / 扩大时间窗 / 换数据源），本方法据此重建步骤参数并跑一次反思。
@@ -537,7 +620,7 @@ class PlannerAgent(RoleAgent):
 
     @staticmethod
     def _ask_time(time_slot: Dict[str, Any], region: Optional[Dict[str, Any]] = None) -> str:
-        """反问时间范围（实现期修订 v1.2：年份先做合理性校验，不合理时不能原样复述）。
+        """反问时间范围（年份先做合理性校验，不合理时不能原样复述）。
 
         例如用户说「125年」，不能直接问「125 年范围比较大，请确认具体月份」——
         那是在不加甄别地复述一个明显异常的输入，得先指出年份本身有问题。
@@ -574,6 +657,57 @@ class PlannerAgent(RoleAgent):
         if ctx.replan_reason:
             parts.append(f"- 这是一次重新规划，原因：{ctx.replan_reason}")
         return "\n".join(parts)
+
+    def _existing_products_text(self, ctx: PlannerContext) -> str:
+        """当前对话工作区里已有的 10m LST 结果（排除 _filled 填洞产物）。
+
+        意图分类的关键信息：LLM 看到「已有结果」，才能把「继续生成无空洞的结果」
+        判为 postprocess 而不是全流程 task（后者会导致反问时间范围）。返回空串时
+        调用方按「暂无结果」兜底。目录：{project_dir}/pairs/L*_S*/results/。
+        """
+        base = pathlib.Path(ctx.project_dir) if ctx.project_dir else None
+        if base is None or not base.is_dir():
+            return ""
+        try:
+            files = sorted(base.glob("pairs/*/results/rf_10m_lst_final_*.tif"),
+                           key=lambda p: p.stat().st_mtime, reverse=True)
+        except OSError:
+            return ""
+        files = [p for p in files if "_filled" not in p.name and "_cloud_mask" not in p.name]
+        if not files:
+            return ""
+        lines = []
+        for p in files[:5]:
+            m = re.search(r"_final_(\d{8})\.tif$", p.name)
+            date = m.group(1) if m else p.stem
+            lines.append(f"- 影像日期 {date}：{p}")
+        return "\n".join(lines)
+
+    def _confirm_postprocess(self, ctx: PlannerContext) -> bool:
+        """二次判定：LLM 拍板「这条消息是对已有结果的后处理，还是重新跑完整流程」。
+
+        返回 True=按 postprocess 处理（对已有结果填洞），False=尊重 LLM 原判定（新任务）。
+        主路径仍是 LLM 决策：只有 LLM 二次判定明确判「新任务」且高置信（≥0.8）才尊重；
+        判 postprocess / 拿不准 / LLM 不可用（解析失败）都按关键词命中兜底为 postprocess。
+        """
+        prompt = planner_prompts.confirm_postprocess_prompt(
+            user_input=ctx.user_input,
+            existing_products=self._existing_products_text(ctx),
+        )
+        parsed = self.call_json(prompt, ctx.user_input, temperature=0.0, max_tokens=512,
+                                thinking={"type": "disabled"})
+        if parsed is None:
+            self.log("二次判定 LLM 不可用，按关键词命中视为 postprocess")
+            return True
+        intent = str(parsed.get("intent") or "").strip()
+        confidence = _as_float(parsed.get("confidence"), 0.0)
+        self.log(f"二次判定：LLM 认为 intent={intent}（置信度 {confidence}）")
+        if intent == "postprocess":
+            return True
+        if intent in ("task", "new_task"):
+            # 明确判新任务且高置信才尊重 LLM；否则按关键词兜底 postprocess
+            return confidence < 0.8
+        return True
 
     @staticmethod
     def _recent_history(ctx: PlannerContext, limit: int = 8) -> List[dict]:

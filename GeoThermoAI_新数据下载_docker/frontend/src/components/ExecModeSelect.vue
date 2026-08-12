@@ -1,5 +1,5 @@
 <script setup>
-// 执行模式上拉框（技术方案 9.1）：位于发送键左边，向上弹出选项面板。
+// 执行模式上拉框：位于发送键左边，向上弹出选项面板。
 // 选择结果写入 chat store 的 execMode 并持久化到 localStorage，每次发送随请求带上。
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useChatStore } from '../stores/chat'

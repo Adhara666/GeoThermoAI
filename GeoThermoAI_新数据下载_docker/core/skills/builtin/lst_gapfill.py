@@ -7,7 +7,7 @@
     - 不改变任何无云像元的数值；
     - 填洞值只是空间估计，不参与 TCR / 闭合精度评价；
     - 同时输出空洞掩膜 GeoTIFF（1=估计像元，0=原始有效），供下游区分真实观测与重建值；
-    - 输出带日期文件名（升级点 4）：rf_10m_lst_final_filled_{date}.tif / _cloud_mask.tif。
+    - 输出带日期文件名：rf_10m_lst_final_filled_{date}.tif / _cloud_mask.tif。
 """
 
 import os
@@ -39,6 +39,7 @@ class LSTGapFillSkill(BaseSkill):
             SkillParameter(name="output_dir", type="file_path", description="输出目录路径", required=True),
             SkillParameter(name="output_tif", type="file_path", description="填洞后 GeoTIFF 输出路径", required=False),
             SkillParameter(name="output_mask", type="file_path", description="空洞掩膜 GeoTIFF 输出路径（1=估计像元，0=原始有效）", required=False),
+            SkillParameter(name="region_geojson", type="file_path", description="研究区 GeoJSON 路径（可选）：只对研究区矢量范围内的空洞做填补，区外保持 NoData", required=False),
             SkillParameter(name="max_level", type="number", description="金字塔最大下采样层数，默认 8", required=False, default=8),
         ]
 
@@ -67,6 +68,7 @@ class LSTGapFillSkill(BaseSkill):
         output_dir = params.get("output_dir", "")
         output_tif = params.get("output_tif", "")
         output_mask = params.get("output_mask", "")
+        region_geojson = params.get("region_geojson", "")
         try:
             max_level = int(params.get("max_level", 8))
         except (TypeError, ValueError):
@@ -97,6 +99,7 @@ class LSTGapFillSkill(BaseSkill):
                 output_tif=output_tif,
                 output_mask_tif=output_mask,
                 max_level=max_level,
+                region_geojson=region_geojson,
                 progress_callback=lambda pct, msg: (
                     progress_callback("lst_gapfill", pct, msg) if progress_callback else None
                 ),
@@ -139,7 +142,7 @@ class LSTGapFillSkill(BaseSkill):
                 f"（占总像元 {stats.get('filled_ratio', 0) * 100:.1f}%），"
                 f"填洞后温度范围 {stats.get('after', {}).get('min', 'N/A'):.2f}–"
                 f"{stats.get('after', {}).get('max', 'N/A'):.2f} K；"
-                f"未改变无云区数值，空洞掩膜已同步输出。"
+                f"未改变无云区数值，空洞掩膜已同步输出"
             ),
             data={
                 "filled_tif": output_tif,

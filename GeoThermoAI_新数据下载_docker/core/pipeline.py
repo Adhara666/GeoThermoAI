@@ -1,10 +1,10 @@
 """
-EasyLST 完整处理流水线（A-08 重写）
+EasyLST 完整处理流水线（重写）
 
 修复内容：
-    - 固定路径断链：TTRI 原地覆盖 train.csv/validate.csv/test.csv，本模块不再
-      声明或读取不存在的 ``*_with_TTRI.csv``；
-    - evaluation 固定传入完整30m约束层 + 10m meta（A-05/A-07 两套协议分别调用）；
+    - 固定路径断链：TTRI 原地覆盖 train.parquet/validate.parquet/test.parquet，本模块不再
+      声明或读取不存在的 ``*_with_TTRI.parquet``；
+    - evaluation 固定传入完整30m约束层 + 10m meta（两套协议分别调用）；
     - fail-fast：任一步骤失败后不再"默认继续"，立即停止且不启动下游，也不再
       用字符串排序去"捡"旧模型兜底；
     - 新增固定 run_manifest.json：记录每个 stage 的输入签名、完成状态、
@@ -12,7 +12,7 @@ EasyLST 完整处理流水线（A-08 重写）
 
 将所有核心模块串联为统一的自动化流水线:
     预处理(含完整30m约束层) → 数据集划分(空间块+guard buffer) → TTRI(仅train拟合)
-    → RF训练 → 测试集预测 → 独立预测评估 → TTRI(预测集) → TCR → LST_final
+    → RF训练 → 测试集预测 → TTRI(预测集) → TCR → LST_final
     → GeoTIFF导出 → 粗尺度闭合评估
 
 支持:
@@ -35,7 +35,7 @@ from .rf_model import train_random_forest, predict_test_set
 from .tcr import compute_tcr, MODE_BLOCK_CONSTANT
 from .lst_final import compute_lst_final
 from .export_geotiff import export_geotiff
-from .evaluation import evaluate_independent_prediction, evaluate_coarse_constraint_closure
+from .evaluation import evaluate_coarse_constraint_closure
 
 # ── 日志级别常量 ──────────────────────────────────────────────────────
 LOG_INFO = "INFO"
@@ -84,7 +84,6 @@ class EasyLSTPipeline:
             {"name": "ttri_train", "label": "TTRI训练集计算（仅train拟合一次）", "run": self._run_ttri_train},
             {"name": "train_rf", "label": "RF模型训练", "run": self._run_train_rf},
             {"name": "predict_test", "label": "测试集预测", "run": self._run_predict_test},
-            {"name": "evaluate_independent", "label": "独立预测评估", "run": self._run_evaluate_independent},
             {"name": "ttri_predict", "label": "TTRI预测集计算", "run": self._run_ttri_predict},
             {"name": "tcr", "label": "TCR计算", "run": self._run_tcr},
             {"name": "lst_final", "label": "LST最终计算", "run": self._run_lst_final},
@@ -136,28 +135,28 @@ class EasyLSTPipeline:
 
         return {
             "output_dir": output_dir,
-            # 预处理输出
-            "train_csv": os.path.join(output_dir, "30m_features_step2.csv"),
+            # 预处理输出（升级：中间产物表统一 Parquet）
+            "train_csv": os.path.join(output_dir, "30m_features_step2.parquet"),
             "train_meta": os.path.join(output_dir, "30m_features_step2_meta.json"),
-            "constraint_csv": os.path.join(output_dir, "30m_constraint_grid.csv"),
+            "constraint_csv": os.path.join(output_dir, "30m_constraint_grid.parquet"),
             "constraint_meta": os.path.join(output_dir, "30m_constraint_grid_meta.json"),
-            "predict_csv": os.path.join(output_dir, "10m_predict_features.csv"),
+            "predict_csv": os.path.join(output_dir, "10m_predict_features.parquet"),
             "predict_meta": os.path.join(output_dir, "10m_predict_features_meta.json"),
-            # 划分输出（固定文件名，A-04 修复后直接原地含 TTRI 列，不再有 *_with_TTRI.csv）
-            "train_split": os.path.join(train_dir, "train.csv"),
-            "val_split": os.path.join(train_dir, "validate.csv"),
-            "test_split": os.path.join(train_dir, "test.csv"),
+            # 划分输出（固定文件名，修复后直接原地含 TTRI 列，不再有 *_with_TTRI.parquet）
+            "train_split": os.path.join(train_dir, "train.parquet"),
+            "val_split": os.path.join(train_dir, "validate.parquet"),
+            "test_split": os.path.join(train_dir, "test.parquet"),
             "split_info": os.path.join(train_dir, "split_info.json"),
             "ttri_coefficients": os.path.join(train_dir, "ttri_coefficients.json"),
             # RF模型
             "train_results_dir": train_results,
             "test_results_dir": os.path.join(results_dir, "test"),
             # TTRI预测集（原地新增TTRI列）
-            "predict_with_ttri": os.path.join(predict_dir, "10m_predict_features.csv"),
+            "predict_with_ttri": os.path.join(predict_dir, "10m_predict_features.parquet"),
             # TCR 中间产物（固定名；lst_export 完成后由 manifest 标记为"可清理的重复产物"）
-            "tcr_output": os.path.join(predict_dir, "tcr_predict.csv"),
+            "tcr_output": os.path.join(predict_dir, "tcr_predict.parquet"),
             # LST final
-            "lst_final_csv": os.path.join(predict_results, "rf_10m_predict.csv"),
+            "lst_final_csv": os.path.join(predict_results, "rf_10m_predict.parquet"),
             # GeoTIFF
             "lst_final_tif": os.path.join(predict_results, "rf_10m_lst_final.tif"),
             # 评估（两套协议，各自固定文件名，见 evaluation.py）
@@ -285,7 +284,7 @@ class EasyLSTPipeline:
     # ==================================================================
 
     def _run_preprocessing(self, progress_callback, log_callback) -> Dict:
-        """执行数据预处理步骤（含完整30m约束层，A-05）。"""
+        """执行数据预处理步骤（含完整30m约束层）。"""
         paths = self.get_default_paths()
         result = process_preprocessing(
             landsat_path=self.config.get("landsat_path", ""),
@@ -318,7 +317,7 @@ class EasyLSTPipeline:
         return result
 
     def _run_split_dataset(self, progress_callback, log_callback) -> Dict:
-        """执行数据集划分步骤（空间块 + guard buffer，B-01）。"""
+        """执行数据集划分步骤（空间块 + guard buffer）。"""
         paths = self.get_default_paths()
         train_dir = os.path.dirname(paths["train_split"])
         result = split_dataset(
@@ -342,7 +341,7 @@ class EasyLSTPipeline:
         return result
 
     def _run_ttri_train(self, progress_callback, log_callback) -> Dict:
-        """执行TTRI计算步骤：仅 train 拟合一次，train/validate/test 复用同一组系数（A-04）。"""
+        """执行TTRI计算步骤：仅 train 拟合一次，train/validate/test 复用同一组系数。"""
         paths = self.get_default_paths()
         train_dir = os.path.dirname(paths["train_split"])
         result = compute_ttri_for_splits(
@@ -412,40 +411,8 @@ class EasyLSTPipeline:
             )
         return result
 
-    def _run_evaluate_independent(self, progress_callback, log_callback) -> Dict:
-        """独立预测评估（A-07 协议一）。"""
-        paths = self.get_default_paths()
-        model_path = self.config.get("_model_path", "")
-        if not model_path:
-            raise PipelineStageError("evaluate_independent", RuntimeError("上游 RF 模型不存在，无法评估"))
-
-        split_info = None
-        try:
-            import json
-
-            with open(paths["split_info"], "r", encoding="utf-8") as f:
-                split_info = json.load(f)
-        except Exception:
-            pass
-
-        result = evaluate_independent_prediction(
-            test_csv=paths["test_split"],
-            model_path=model_path,
-            output_dir=paths["eval_dir"],
-            split_info=split_info,
-            progress_callback=progress_callback,
-        )
-        output_dir = self.config.get("output_dir", ".")
-        if output_dir and output_dir != ".":
-            run_manifest.record_stage(
-                output_dir, "evaluate_independent", run_manifest.STATUS_COMPLETED,
-                artifacts={"output_path": result.get("output_path", "")},
-                stats={"metrics": result.get("metrics", {})},
-            )
-        return result
-
     def _run_ttri_predict(self, progress_callback, log_callback) -> Dict:
-        """执行TTRI预测集计算步骤（基于完整30m约束层的统一仿射映射插值，A-05/A-06）。"""
+        """执行TTRI预测集计算步骤（基于完整30m约束层的统一仿射映射插值）。"""
         paths = self.get_default_paths()
         coefficients_path = self.config.get("_ttri_coefficients_path") or paths["ttri_coefficients"]
         result = compute_ttri_predict(
@@ -468,7 +435,7 @@ class EasyLSTPipeline:
         return result
 
     def _run_tcr(self, progress_callback, log_callback) -> Dict:
-        """执行TCR计算步骤（A-06：默认 block_constant，统一仿射映射）。"""
+        """执行TCR计算步骤（默认 block_constant，统一仿射映射）。"""
         paths = self.get_default_paths()
         model_path = self.config.get("_model_path", "")
         if not model_path:
@@ -514,7 +481,7 @@ class EasyLSTPipeline:
         return result
 
     def _run_export_geotiff(self, progress_callback, log_callback) -> Dict:
-        """执行GeoTIFF导出步骤（B-07：严格按 row,col 写入）。"""
+        """执行GeoTIFF导出步骤（严格按 row,col 写入）。"""
         paths = self.get_default_paths()
         result = export_geotiff(
             lst_final_csv=paths["lst_final_csv"],
@@ -532,7 +499,7 @@ class EasyLSTPipeline:
         return result
 
     def _run_evaluate_closure(self, progress_callback, log_callback) -> Dict:
-        """粗尺度闭合评估（A-07 协议二）。"""
+        """粗尺度闭合评估。"""
         paths = self.get_default_paths()
         result = evaluate_coarse_constraint_closure(
             constraint_csv=paths["constraint_csv"],

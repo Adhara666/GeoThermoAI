@@ -1,7 +1,7 @@
 """
-统一细→粗像元几何映射模块（对应审查文档 A-06）
+统一细→粗像元几何映射模块
 
-背景问题（已在 small_pipeline 实证中确认，见审查文档 §12.3）：
+背景问题（已在 small_pipeline 实证中确认）：
     - ttri.py 用 row/3, col/3
     - tcr.py Phase 1 用像元角点坐标 + KDTree 最近邻（无最大距离/有效父格检查）
     - tcr.py Phase 2 又回到 row/3, col/3
@@ -100,7 +100,7 @@ def check_exact_ratio_grid(
     """诊断细/粗栅格是否满足"无旋转、原点对齐、分辨率恰为 expected_ratio:1"的
     快捷条件（只有满足时，row//ratio, col//ratio 才与仿射精确映射等价）。
 
-    仅用于诊断/manifest 记录，不控制主映射逻辑分支——A-06 要求所有模块统一改为
+    仅用于诊断/manifest 记录，不控制主映射逻辑分支——所有模块统一改为
     真实仿射映射；当前实测数据（30m/10m 像元比 3.0059328343）本就不满足该快捷
     条件，因此默认路径必须始终是精确仿射映射。
     """
@@ -145,7 +145,7 @@ def assert_same_crs(crs_a: Optional[str], crs_b: Optional[str], context: str = "
 def build_dense_grid_interpolator(grid: np.ndarray):
     """把稠密 (height, width) 数组包装为按"像元索引"为坐标轴的双线性插值器。
 
-    供 TTRI 10m 空间化插值、TCR smooth_recentered 平滑场共用（A-06 统一实现，
+    供 TTRI 10m 空间化插值、TCR smooth_recentered 平滑场共用（
     避免各模块各自构造 RegularGridInterpolator 的坐标轴假设不一致）。
     """
     from scipy.interpolate import RegularGridInterpolator
@@ -215,7 +215,7 @@ def aggregate_by_coarse_cell(
     coarse_width: int,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """用 np.bincount 对 (coarse_row, coarse_col, value) 按粗格线性索引做 sum/count
-    聚合，避免 Python dict 存全部粗格对象开销（对应 B-03/7.2 节建议）。
+    聚合，避免 Python dict 存全部粗格对象开销。
 
     调用方需先用 fine_to_coarse_index 返回的 inside_footprint 过滤越界像元。
 

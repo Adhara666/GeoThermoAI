@@ -1,17 +1,17 @@
 """
-评价模块（A-07 重写 + 第6节 5K判据删除 / 用户确认第4、5条）
+评价模块（重写 + 5K判据删除 + 移除独立预测协议）
 
 旧版 ``evaluate_spatial_consistency`` 把两件不同的事混在一份 JSON 里：
-    - RF 对测试集的独立预测精度；
+    - RF 对测试集的预测精度（与测试集评估共用同一 test 集与模型，已由
+      rf_model 阶段的测试集评估覆盖，不再单列协议）；
     - TCR 用了拆分前完整30m标签做约束后，10m结果回聚合到30m是否闭合。
     第二组指标其实用了包含 test 标签的完整参考做闭合，再拿同一个 test 对比，
     容易被误当成"独立精度"。
 
-本模块拆成两个函数、两个固定 JSON schema，互不混用：
-    - evaluate_independent_prediction():   独立预测协议（TCR 前，未见标签）
+本模块保留粗尺度闭合协议（TCR 后，生产模式）：
     - evaluate_coarse_constraint_closure(): 粗尺度闭合协议（TCR 后，生产模式）
 
-同时按用户确认第5条彻底删除 5K 阈值判据：不再输出 max_abs_deviation /
+同时彻底删除 5K 阈值判据：不再输出 max_abs_deviation /
 threshold_K / passed 字段及"通过/超出"文案；主展示只保留"各自完整有效输出
 范围"的最低/最高端**有符号**温差；共同覆盖端点差作为可选后台诊断单独保存，
 不在前端默认展示的字段路径下。
@@ -27,14 +27,13 @@ from sklearn.metrics import r2_score
 
 from . import grid_mapping
 from .atomic_io import atomic_write_json
-from .rf_model import load_model_and_features
+from .table_io import iter_chunks, read_table
 
-INDEPENDENT_PREDICTION_FILENAME = "independent_prediction.json"
 COARSE_CONSTRAINT_CLOSURE_FILENAME = "coarse_constraint_closure.json"
 
 
 def _safe_r2(y_true: np.ndarray, y_pred: np.ndarray) -> Tuple[Optional[float], Optional[str]]:
-    """R² 在样本数<2或参考方差为0时返回 (None, 原因)，不把 NaN 写进 JSON（A-07要求）。"""
+    """R² 在样本数<2或参考方差为0时返回 (None, 原因)，不把 NaN 写进 JSON。"""
     n = len(y_true)
     if n < 2:
         return None, f"n={n} < 2，R² 无法定义"
@@ -50,97 +49,7 @@ def _load_transform_from_meta(meta_path: str) -> dict:
 
 
 # ======================================================================
-#  协议一：独立预测（TCR 前，未见标签的 30m 测试集）
-# ======================================================================
-
-
-def evaluate_independent_prediction(
-    test_csv: str,
-    model_path: str,
-    output_dir: str,
-    split_info: Optional[dict] = None,
-    progress_callback=None,
-) -> Dict:
-    """独立预测协议：test 不参与 TTRI 拟合、调参或 TCR，报告 R²/RMSE/MAE/MB、
-    样本数和空间范围。固定输出 ``independent_prediction.json``。
-
-    Args:
-        test_csv:     30m测试集CSV路径（空间块+guard buffer 划分产物）
-        model_path:   已训练RF模型.pkl路径
-        output_dir:   输出目录
-        split_info:   可选，split_dataset.py 产出的 split_info.json 内容，
-                      用于在报告中注明所用划分方法与 guard buffer
-        progress_callback: 进度回调
-
-    Returns:
-        dict: 写入的完整 JSON 内容 + output_path
-    """
-    if progress_callback:
-        progress_callback("evaluation_independent", 0, "开始独立预测评估...")
-
-    os.makedirs(output_dir, exist_ok=True)
-
-    model, feature_cols, model_meta = load_model_and_features(model_path)
-    df_test = pd.read_csv(test_csv)
-    missing = [c for c in feature_cols + ["LST"] if c not in df_test.columns]
-    if missing:
-        raise ValueError(f"测试集缺少必需的列: {missing}")
-
-    X_test = df_test[feature_cols].values
-    y_test = df_test["LST"].values.astype(np.float64)
-    y_pred = model.predict(X_test).astype(np.float64)
-
-    r2, r2_reason = _safe_r2(y_test, y_pred)
-    rmse = float(np.sqrt(np.mean((y_pred - y_test) ** 2)))
-    mae = float(np.mean(np.abs(y_pred - y_test)))
-    mb = float(np.mean(y_pred - y_test))
-
-    spatial_extent = None
-    if "row" in df_test.columns and "col" in df_test.columns:
-        spatial_extent = {
-            "min_row": int(df_test["row"].min()), "max_row": int(df_test["row"].max()),
-            "min_col": int(df_test["col"].min()), "max_col": int(df_test["col"].max()),
-        }
-
-    result = {
-        "schema_version": 1,
-        "protocol": "independent_prediction",
-        "description": (
-            "test 集在空间上与 train/validate 隔离（含 guard buffer），且不参与 "
-            "TTRI 拟合、调参或 TCR；本结果反映模型在未见空间区域的30m预测泛化能力，"
-            "不含任何粗尺度约束信息"
-        ),
-        "mb_definition": "MB = mean(prediction - reference)，单位 K；正值表示预测整体偏暖",
-        "n_samples": int(len(df_test)),
-        "metrics": {
-            "R2": r2, "r2_null_reason": r2_reason,
-            "RMSE_K": round(rmse, 6),
-            "MAE_K": round(mae, 6),
-            "MB_K": round(mb, 6),
-        },
-        "spatial_extent_rowcol": spatial_extent,
-        "split_method": (split_info or {}).get("method", "unknown"),
-        "guard_buffer_m": (split_info or {}).get("guard_buffer_m"),
-        "block_size_px": (split_info or {}).get("block_size_px"),
-        "model_path": model_path,
-        "features": feature_cols,
-    }
-
-    output_path = os.path.join(output_dir, INDEPENDENT_PREDICTION_FILENAME)
-    atomic_write_json(output_path, result)
-    result["output_path"] = output_path
-
-    if progress_callback:
-        progress_callback(
-            "evaluation_independent", 1.0,
-            f"独立预测评估完成: R²={r2}, RMSE={rmse:.4f}K, MAE={mae:.4f}K, MB={mb:.4f}K",
-        )
-
-    return result
-
-
-# ======================================================================
-#  协议二：粗尺度闭合（生产模式，TCR 后）
+#  协议：粗尺度闭合（生产模式，TCR 后）
 # ======================================================================
 
 
@@ -158,13 +67,13 @@ def evaluate_coarse_constraint_closure(
     的算术均值闭合情况；不称为独立10m精度，不称能量/辐射守恒。
     固定输出 ``coarse_constraint_closure.json``。
 
-    同时按用户确认第5条计算"各自完整有效输出范围"的最低/最高端有符号温差
+    同时计算"各自完整有效输出范围"的最低/最高端有符号温差
     （主展示口径），以及仅供后台的 common_valid_footprint 诊断（不建议前端默认展示）。
 
     Args:
-        constraint_csv:        完整30m约束层CSV路径（30m_constraint_grid.csv）
+        constraint_csv:        完整30m约束层Parquet路径（30m_constraint_grid.parquet）
         constraint_meta_json:  完整30m约束层元数据JSON路径
-        lst_final_csv:         TCR阶段输出的最终结果CSV路径（含 row,col,LST_final）
+        lst_final_csv:         TCR阶段输出的最终结果Parquet路径（含 row,col,LST_final）
         meta_10m_json:         10m元数据JSON路径
         output_dir:            输出目录
         tcr_mode:              可选，记录本轮使用的 TCR 模式（block_constant / smooth_recentered）
@@ -192,7 +101,7 @@ def evaluate_coarse_constraint_closure(
     if progress_callback:
         progress_callback("evaluation_closure", 0.1, "加载完整30m约束层参考...")
 
-    df_30m = pd.read_csv(constraint_csv, usecols=["row", "col", "LST"])
+    df_30m = read_table(constraint_csv, columns=["row", "col", "LST"])
     full_30m_min = float(df_30m["LST"].min())
     full_30m_max = float(df_30m["LST"].max())
     n_valid_30m = int(len(df_30m))
@@ -215,7 +124,7 @@ def evaluate_coarse_constraint_closure(
     out_of_grid = 0
     chunk_idx = 0
 
-    for chunk in pd.read_csv(lst_final_csv, chunksize=chunk_size, usecols=["row", "col", "LST_final"]):
+    for chunk in iter_chunks(lst_final_csv, columns=["row", "col", "LST_final"], batch_size=chunk_size):
         mask = chunk["LST_final"].notna()
         n_valid = int(mask.sum())
         if n_valid == 0:
@@ -276,7 +185,7 @@ def evaluate_coarse_constraint_closure(
 
     subpixel_counts = count_agg[matched]
 
-    # ── 步骤4: 值域范围（用户确认第5条：各自完整有效输出范围的有符号端点差）──
+    # ── 步骤4: 值域范围（各自完整有效输出范围的有符号端点差）──
     low_end_diff = full_10m_min - full_30m_min
     high_end_diff = full_10m_max - full_30m_max
 
@@ -292,7 +201,7 @@ def evaluate_coarse_constraint_closure(
         "description": (
             "生产模式下 TCR 使用完整30m参考格网，10m最终结果回聚合到30m产品格网后"
             "与参考的算术均值闭合度；不是独立10m精度，不是未见标签预测，"
-            "不代表辐射或能量守恒（A-06/A-07）"
+            "不代表辐射或能量守恒"
         ),
         "mb_definition": "MB = aggregate_10m_K - reference_30m_K；正值表示回聚合结果偏暖，负值偏冷",
         "tcr_mode": tcr_mode,

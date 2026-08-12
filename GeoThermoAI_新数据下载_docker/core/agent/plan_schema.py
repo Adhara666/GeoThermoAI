@@ -1,5 +1,5 @@
 """
-结构化执行计划 schema（技术方案 4.5）
+结构化执行计划 schema
 
 向后兼容硬性要求：`steps[].skill / params / reason` 三个字段的形状与旧格式完全一致，
 因此 `_normalize_plan_paths` 与执行引擎无需改动即可消费本模块产出的 plan；
@@ -40,7 +40,7 @@ STAGE_OF_SKILL: Dict[str, str] = {
 # 产品类型枚举（城市热岛等新功能只在此预留位置，本次不实现）
 PRODUCTS = ("lst_10m",)
 
-# 意图取值（技术方案 4.3；postprocess 为结果后处理，如对已有 10m LST 做空洞填补）
+# 意图取值（postprocess 为结果后处理，如对已有 10m LST 做空洞填补）
 INTENTS = ("chat", "qa", "task", "modify", "unclear", "postprocess")
 
 DEFAULT_APPROVAL_NODES = ("pair_selection", "tuning_decision", "final_report")
@@ -76,7 +76,7 @@ def _clean_step(step: Any, index: int) -> Optional[Dict[str, Any]]:
 def parse(obj: Any, registry=None) -> Dict[str, Any]:
     """解析并补全 plan；旧格式 `{"steps": [...]}` 自动获得默认字段。
 
-    registry 非空时剔除注册表里不存在的 skill（技术方案 4.6 规则 P4）。
+    registry 非空时剔除注册表里不存在的 skill（规则 P4）。
     非法输入返回空步骤的合法 plan，绝不抛异常。
     """
     src = obj if isinstance(obj, dict) else {}
@@ -143,7 +143,7 @@ def skill_names(plan: Dict[str, Any]) -> List[str]:
 
 
 def is_full_workflow(plan: Dict[str, Any]) -> bool:
-    """steps 是否正好是 7 步全流程且顺序正确（技术方案 4.6 规则 P5）。"""
+    """steps 是否正好是 7 步全流程且顺序正确（规则 P5）。"""
     return tuple(skill_names(plan)) == WORKFLOW_STEPS
 
 

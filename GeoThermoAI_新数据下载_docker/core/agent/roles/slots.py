@@ -1,5 +1,5 @@
 """
-槽位解析工具（技术方案 4.4）
+槽位解析工具
 
 只做**确定性**解析：研究区文件名匹配、中文时间表达解析。
 需要语义判断的部分（中文近似地名、模糊时间澄清）交给规划 Agent 的 LLM 与反问。
@@ -54,7 +54,7 @@ def normalize_cn_numerals(text: str) -> str:
     return _CN_MONTH_RE.sub(lambda m: str(_cn_month_value(m.group(1))), out)
 
 # 系统可能有数据的最早年份：Sentinel-2A 于 2015 年发射，早于该年份没有可用影像（知识条目 K11）。
-# 实现期修订 v1.2：用于拦截「125年」这类明显不合理的年份，避免不加甄别地原样复述反问月份。
+# 用于拦截「125年」这类明显不合理的年份，避免不加甄别地原样复述反问月份。
 MIN_DATA_YEAR = 2015
 
 
@@ -192,9 +192,8 @@ def is_executable(precision: str) -> bool:
 def time_range_valid(start: str, end: str, today: Optional[datetime.date] = None) -> str:
     """校验时间范围（规则 P2）；合法返回空串，非法返回中文原因。
 
-    实现期修订 v1.2：补下界校验。此前只查「起始<=结束」「不晚于今天」，若用户把年和月
-    一次说全但年份手误（如「125年7月」），会被 `merge_time_parts` 判为可执行（月份齐全）
-    却生成 `start_date="0125-07-01"` 这种荒谬日期，一路带进 data_acquisition 才崩溃。
+    补下界校验：若年份手误（如「125年7月」）会被 `merge_time_parts` 判为可执行（月份齐全），
+    生成 `start_date="0125-07-01"` 这种荒谬日期一路带进 data_acquisition 才崩溃。
     """
     today = today or datetime.date.today()
     try:

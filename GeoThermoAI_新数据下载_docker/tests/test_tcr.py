@@ -35,8 +35,8 @@ r30, c30 = np.meshgrid(np.arange(H30), np.arange(W30), indexing='ij')
 r30 = r30.ravel(); c30 = c30.ravel()
 lst_true = 295.0 + 0.5 * r30 - 0.3 * c30  # smooth synthetic reference field
 constraint_df = pd.DataFrame({'row': r30, 'col': c30, 'LST': lst_true})
-constraint_csv = os.path.join(workdir, '30m_constraint_grid.csv')
-constraint_df.to_csv(constraint_csv, index=False)
+constraint_csv = os.path.join(workdir, '30m_constraint_grid.parquet')
+constraint_df.to_parquet(constraint_csv, index=False)
 
 coarse_transform = [30.0, 0.0, 500000.0, 0.0, -30.0, 4000000.0]
 constraint_meta = {'height': H30, 'width': W30, 'crs': 'EPSG:32650', 'transform': coarse_transform}
@@ -56,10 +56,10 @@ n10 = len(r10)
 rng2 = np.random.default_rng(1)
 feat_data = {f: rng2.uniform(0, 1, n10) for f in FEATS}
 predict_df = pd.DataFrame({'row': r10, 'col': c10, **feat_data})
-predict_csv = os.path.join(workdir, '10m_predict_features.csv')
-predict_df.to_csv(predict_csv, index=False)
+predict_csv = os.path.join(workdir, '10m_predict_features.parquet')
+predict_df.to_parquet(predict_csv, index=False)
 
-output_bc = os.path.join(workdir, 'tcr_predict_block_constant.csv')
+output_bc = os.path.join(workdir, 'tcr_predict_block_constant.parquet')
 res_bc = tcr.compute_tcr(
     constraint_csv, constraint_meta_json, predict_csv, predict_meta_json,
     model_path, output_bc, mode='block_constant', batch_size=50,
@@ -69,7 +69,7 @@ print('block_constant validity:', res_bc['validity'])
 assert res_bc['validity']['out_of_grid'] == 0
 assert res_bc['validity']['reference_30m_valid_cells'] == H30 * W30
 
-out_bc = pd.read_csv(output_bc)
+out_bc = pd.read_parquet(output_bc)
 merged = out_bc.copy()
 merged['coarse_row'] = merged['row'] // 3
 merged['coarse_col'] = merged['col'] // 3
@@ -80,7 +80,7 @@ print('block_constant closure max abs error (should be ~0, allow 4-decimal round
 assert closure_err.max() < 1e-3, f'block_constant does not exactly close: {closure_err.max()}'
 print('OK: block_constant achieves exact per-cell arithmetic-mean closure')
 
-output_sr = os.path.join(workdir, 'tcr_predict_smooth_recentered.csv')
+output_sr = os.path.join(workdir, 'tcr_predict_smooth_recentered.parquet')
 res_sr = tcr.compute_tcr(
     constraint_csv, constraint_meta_json, predict_csv, predict_meta_json,
     model_path, output_sr, mode='smooth_recentered', batch_size=50,
@@ -90,7 +90,7 @@ post_err = res_sr['smooth_recentered_diagnostics']['post_recenter']['cell_mean_a
 print('smooth_recentered post-recenter max cell mean abs error:', post_err)
 assert post_err is not None and post_err < 1e-3, 'smooth_recentered failed to close after recentering'
 
-out_sr = pd.read_csv(output_sr)
+out_sr = pd.read_parquet(output_sr)
 merged_sr = out_sr.copy()
 merged_sr['coarse_row'] = merged_sr['row'] // 3
 merged_sr['coarse_col'] = merged_sr['col'] // 3
@@ -117,7 +117,7 @@ fine_transform2 = [9.5, 0.0, 500000.0, 0.0, -9.5, 4000000.0]  # slightly mismatc
 predict_meta2 = {'height': H10, 'width': W10, 'crs': 'EPSG:32650', 'transform': fine_transform2}
 predict_meta_json2 = os.path.join(workdir, '10m_predict_features_meta2.json')
 json.dump(predict_meta2, open(predict_meta_json2, 'w', encoding='utf-8'))
-output_bc2 = os.path.join(workdir, 'tcr_predict_mismatched.csv')
+output_bc2 = os.path.join(workdir, 'tcr_predict_mismatched.parquet')
 res_bc2 = tcr.compute_tcr(
     constraint_csv, constraint_meta_json, predict_csv, predict_meta_json2,
     model_path, output_bc2, mode='block_constant', batch_size=50,

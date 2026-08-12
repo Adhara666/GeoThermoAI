@@ -1,8 +1,8 @@
 """
-数据轻反思：确定性规则 D1–D7（技术方案 5.3）
+数据轻反思：确定性规则 D1–D7
 
 在 `data_acquisition → data_pipeline → ttri_compute` 三步全部执行完之后统一做一次。
-**任一规则不通过 → 禁止往下跑**（修复 1.5(4)「_check_exceptions 不拦截」）。
+**任一规则不通过 → 禁止往下跑**。
 LLM 只负责把失败原因翻译成人话并给出建议排序，不参与放行决策。
 
 各探针（栅格 / CSV / 元数据）都可注入，便于合成测试零依赖运行。
@@ -42,8 +42,8 @@ REQUIRED_RASTERS = ("landsat_lst.tif", "landsat_qa_pixel.tif",
 # D2 要求已完成的阶段
 REQUIRED_STAGES = ("data_acquisition", "data_pipeline", "ttri_compute")
 
-# D6 检查的三个划分 CSV
-SPLIT_CSVS = ("train.csv", "validate.csv", "test.csv")
+# D6 检查的三个划分表（升级：中间产物表统一 Parquet）
+SPLIT_CSVS = ("train.parquet", "validate.parquet", "test.parquet")
 
 # 每条规则不通过时的建议动作（按可行性排序，供 LLM 与气泡使用）
 SUGGESTIONS = {
@@ -82,24 +82,24 @@ def default_raster_probe(path: str) -> Tuple[bool, str]:
 
 
 def default_csv_probe(path: str) -> Dict[str, Any]:
-    """默认 CSV 探针：返回 {exists, has_ttri, ttri_std, rows}。"""
+    """默认表格探针：返回 {exists, has_ttri, ttri_std, rows}（Parquet 版）。"""
     out = {"exists": os.path.isfile(path), "has_ttri": False, "ttri_std": None, "rows": 0}
     if not out["exists"]:
         return out
     try:
-        import pandas as pd
+        from ...table_io import read_table
 
-        head = pd.read_csv(path, nrows=1)
+        head = read_table(path)
         out["has_ttri"] = "TTRI" in head.columns
         if out["has_ttri"]:
-            sample = pd.read_csv(path, usecols=["TTRI"], nrows=20000)
+            sample = read_table(path, columns=["TTRI"]).head(20000)
             series = sample["TTRI"].dropna()
             out["rows"] = int(len(sample))
             out["ttri_std"] = float(series.std()) if len(series) > 1 else 0.0
             if series.empty:
                 out["ttri_std"] = None
     except Exception as e:
-        logger.warning(f"[data] CSV 探针失败（按未通过处理）: {e}")
+        logger.warning(f"[data] 表格探针失败（按未通过处理）: {e}")
     return out
 
 
@@ -222,7 +222,7 @@ def _check_d6(processed_dir: str, probe: Callable[[str], Dict[str, Any]]) -> Lis
     problems = []
     for name in SPLIT_CSVS:
         info = probe(os.path.join(processed_dir, name) if processed_dir else name)
-        label = {"train.csv": "训练集", "validate.csv": "验证集", "test.csv": "测试集"}[name]
+        label = {"train.parquet": "训练集", "validate.parquet": "验证集", "test.parquet": "测试集"}[name]
         if not info.get("exists"):
             problems.append(f"{label}数据文件缺失")
             continue
@@ -239,12 +239,10 @@ def _check_d6(processed_dir: str, probe: Callable[[str], Dict[str, Any]]) -> Lis
 
 def _check_d7(pipeline: dict, processed_dir: str,
               probe: Callable[[str], Dict[str, Any]]) -> List[str]:
-    """有效像元占比必须用**完整 30 米约束层**（`30m_constraint_grid.csv`，覆盖全部云掩膜后
-    有效像元）计算，不能用 `30m_features_step2.csv` 的训练抽样行数（`step=2` 等间隔抽样，
+    """有效像元占比必须用**完整 30 米约束层**（`30m_constraint_grid.parquet`，覆盖全部云掩膜后
+    有效像元）计算，不能用 `30m_features_step2.parquet` 的训练抽样行数（`step=2` 等间隔抽样，
     行数约为完整约束层的四分之一）——分子分母的抽样步长必须一致，否则会把真实占比系统性
-    低估约 4 倍，导致云量正常的影像被误判为不合格（实现期修订 v1.2：修复「换了时间段仍
-    反复报有效像元占比偏低」的 bug，根因就是此前误读了 `30m_features_step2_meta.json` 与
-    `train_rows`）。
+    低估约 4 倍，导致云量正常的影像被误判为不合格。
     """
     meta = probe(os.path.join(processed_dir, "30m_constraint_grid_meta.json")
                  if processed_dir else "30m_constraint_grid_meta.json")

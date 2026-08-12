@@ -1,5 +1,5 @@
 """
-原子写入与产物写前校验工具（对应审查文档 A-02 / A-08 / 7.2 节）
+原子写入与产物写前校验工具
 
 统一约定：任何"可能被下游依赖、且一旦写坏会被误当成功"的产物，
 必须先写到同目录下的固定 ``<final_name>.partial``，经调用方校验通过后，
@@ -93,7 +93,7 @@ def write_verified(
     validator: Callable[[str], Tuple[bool, str]],
 ) -> str:
     """先在 ``<final_path>.partial`` 上调用 build_fn 写入产物，validator 校验通过后
-    原子替换为 final_path；校验失败时删除 partial 并抛异常（A-02：禁止假成功）。
+    原子替换为 final_path；校验失败时删除 partial 并抛异常（禁止假成功）。
 
     Args:
         build_fn:  接受输出路径（.partial 路径），执行实际写入。

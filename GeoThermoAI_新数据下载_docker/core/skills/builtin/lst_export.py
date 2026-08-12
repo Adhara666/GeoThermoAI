@@ -3,7 +3,7 @@
 
 调用 compute_lst_final() 和 export_geotiff()：
     1. 计算 LST_final = LST_pred + TCR
-    2. 将结果导出为带地理参考的GeoTIFF影像（严格按CSV的row,col写入）
+    2. 将结果导出为带地理参考的GeoTIFF影像（严格按Parquet的row,col写入）
 """
 
 import os
@@ -28,12 +28,12 @@ class LSTExportSkill(BaseSkill):
 
     @property
     def description(self) -> str:
-        return "计算 LST_final = LST_pred + TCR，并严格按CSV的row,col将10m地表温度结果导出为带地理参考的GeoTIFF栅格影像。"
+        return "计算 LST_final = LST_pred + TCR，并严格按Parquet的row,col将10m地表温度结果导出为带地理参考的GeoTIFF栅格影像。"
 
     @property
     def parameters(self) -> List[SkillParameter]:
         return [
-            SkillParameter(name="input_csv", type="file_path", description="含LST_pred和TCR列的CSV路径", required=True),
+            SkillParameter(name="input_csv", type="file_path", description="含LST_pred和TCR列的Parquet路径", required=True),
             SkillParameter(name="meta_10m_json", type="file_path", description="10m元数据JSON路径（含height, width, transform, crs）", required=True),
             SkillParameter(name="output_dir", type="file_path", description="输出目录路径", required=True),
             SkillParameter(name="chunk_size", type="number", description="批处理大小，默认 500000", required=False, default=500000),
@@ -42,7 +42,7 @@ class LSTExportSkill(BaseSkill):
     @property
     def input_schema(self) -> Dict[str, str]:
         return {
-            "input_csv": "含LST_pred和TCR列的CSV路径",
+            "input_csv": "含LST_pred和TCR列的Parquet路径",
             "meta_10m_json": "10m元数据JSON路径",
             "output_dir": "输出目录",
         }
@@ -66,7 +66,7 @@ class LSTExportSkill(BaseSkill):
         meta_10m_json = params.get("meta_10m_json", "")
         output_dir = params.get("output_dir", "")
         chunk_size = params.get("chunk_size", 500000)
-        # 升级点 4：执行引擎注入带日期的输出路径（未注入时回退固定名）
+        # 执行引擎注入带日期的输出路径（未注入时回退固定名）
         lst_final_csv_override = params.get("lst_final_csv", "")
         output_tif_override = params.get("output_tif", "")
 
@@ -96,7 +96,7 @@ class LSTExportSkill(BaseSkill):
         if log_callback:
             log_callback("INFO", "开始计算 LST_final = LST_pred + TCR...")
 
-        lst_final_csv = lst_final_csv_override or os.path.join(results_dir, "rf_10m_predict.csv")
+        lst_final_csv = lst_final_csv_override or os.path.join(results_dir, "rf_10m_predict.parquet")
 
         try:
             lst_result = compute_lst_final(
@@ -151,7 +151,7 @@ class LSTExportSkill(BaseSkill):
                 artifacts={"tif_path": tif_path, "csv_path": lst_final_csv},
                 stats={"stats": stats, "image_size": tif_result.get("image_size", {})},
             )
-            # GeoTIFF 导出完成后，LST_final 全网格 CSV 已无下游消费方（闭合评估用 tcr_result.csv），立即清理
+            # GeoTIFF 导出完成后，LST_final 全网格 Parquet 已无下游消费方（闭合评估用 tcr_result.parquet），立即清理
             cleanup_stage(project_root, "lst_export")
 
         if progress_callback:

@@ -1,5 +1,5 @@
 <script setup>
-// 通用审批卡片（技术方案 9.2）：渲染 title/summary + 单选选项列表，
+// 通用审批卡片：渲染 title/summary + 单选选项列表，
 // 选中项带 fields 时展开数值输入框；确认后调用 chat.resumeApproval。
 // 字段声明（label/min/max/step/default）全部来自后端载荷，前端不硬编码任何超参。
 import { computed, ref, watch } from 'vue'

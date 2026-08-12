@@ -5,22 +5,28 @@ import { api } from '../../api'
 
 const project = useProjectStore()
 const loading = ref(false)
-const independent = ref({ status: 'missing' })
+const test = ref({ status: 'missing' })
 const closure = ref({ status: 'missing' })
 
-const hasIndependent = computed(() => independent.value.status === 'ok')
+const hasTest = computed(() => test.value.status === 'ok' && !!test.value.data?.metrics)
 const hasClosure = computed(() => closure.value.status === 'ok')
-const hasAny = computed(() => hasIndependent.value || hasClosure.value)
+const hasAny = computed(() => hasTest.value || hasClosure.value)
+
+/** 闭合对照的 30m/10m 值域与填洞产物值域（填补产物未生成时为 null） */
+const vr = computed(() =>
+  closure.value.status === 'ok' ? (closure.value.data?.value_range || {}) : {})
+const filledRange = computed(() =>
+  closure.value.status === 'ok' ? (closure.value.data?.filled_range || null) : null)
 
 async function refresh() {
   if (!project.currentConv) return
   loading.value = true
   try {
     const r = await api.get(`/api/accuracy?conv=${encodeURIComponent(project.currentConv)}`)
-    independent.value = r.independent_prediction || { status: 'missing' }
+    test.value = r.test_metrics || { status: 'missing' }
     closure.value = r.coarse_constraint_closure || { status: 'missing' }
   } catch (_) {
-    independent.value = { status: 'missing' }
+    test.value = { status: 'missing' }
     closure.value = { status: 'missing' }
   } finally {
     loading.value = false
@@ -37,6 +43,10 @@ function fmtSigned(v, digits = 4) {
   const sign = v >= 0 ? '+' : ''
   return `${sign}${v.toFixed(digits)}`
 }
+function fmtRange(lo, hi, digits = 4) {
+  if (typeof lo !== 'number' || typeof hi !== 'number') return '—'
+  return `${lo.toFixed(digits)} – ${hi.toFixed(digits)} K`
+}
 </script>
 
 <template>
@@ -48,29 +58,32 @@ function fmtSigned(v, digits = 4) {
 
     <p v-if="!hasAny" class="form-hint" style="margin-top:10px">暂无精度数据，请先运行完整流程</p>
 
-    <div v-if="hasIndependent" class="acc-section">
+    <div v-if="hasTest" class="acc-section">
       <div class="acc-section__title">测试区精度</div>
-      <p v-if="independent.status === 'error'" class="form-hint" style="color:var(--danger)">读取失败：{{ independent.message }}</p>
+      <p v-if="test.status === 'error'" class="form-hint" style="color:var(--danger)">读取失败：{{ test.message }}</p>
       <table v-else class="metric-table">
         <tbody>
-          <tr><td>R²</td><td>{{ independent.data.metrics.r2_null_reason ? '—' : fmt(independent.data.metrics.R2) }}</td></tr>
-          <tr><td>RMSE (K)</td><td>{{ fmt(independent.data.metrics.RMSE_K) }}</td></tr>
-          <tr><td>MAE (K)</td><td>{{ fmt(independent.data.metrics.MAE_K) }}</td></tr>
-          <tr><td>平均偏差 (K)</td><td>{{ fmtSigned(independent.data.metrics.MB_K) }}</td></tr>
-          <tr><td>样本数</td><td>{{ independent.data.n_samples ?? '—' }}</td></tr>
+          <tr><td>R²</td><td>{{ test.data.metrics.r2_null_reason ? '—' : fmt(test.data.metrics.R2) }}</td></tr>
+          <tr><td>MAE (K)</td><td>{{ fmt(test.data.metrics.MAE) }}</td></tr>
+          <tr><td>RMSE (K)</td><td>{{ fmt(test.data.metrics.RMSE) }}</td></tr>
+          <tr><td>平均偏差 (K)</td><td>{{ fmtSigned(test.data.metrics.MB) }}</td></tr>
+          <tr><td>样本数</td><td>{{ test.data.n_samples ?? '—' }}</td></tr>
         </tbody>
       </table>
     </div>
 
     <div v-if="hasClosure" class="acc-section">
-      <div class="acc-section__title">与 30 m 温度对照</div>
+      <div class="acc-section__title">与 30m 温度对照</div>
       <p v-if="closure.status === 'error'" class="form-hint" style="color:var(--danger)">读取失败：{{ closure.message }}</p>
       <template v-else>
-        <div class="acc-subtitle">温度高低端差异（正值表示 10 m 更高）</div>
+        <div class="acc-subtitle">温度高低端差异（正值表示 10m 更高）</div>
         <table class="metric-table">
           <tbody>
-            <tr><td>最低温度差</td><td>{{ fmtSigned(closure.data.value_range.low_end_difference_K) }} K</td></tr>
-            <tr><td>最高温度差</td><td>{{ fmtSigned(closure.data.value_range.high_end_difference_K) }} K</td></tr>
+            <tr><td>最低温度差</td><td>{{ fmtSigned(vr.low_end_difference_K) }} K</td></tr>
+            <tr><td>最高温度差</td><td>{{ fmtSigned(vr.high_end_difference_K) }} K</td></tr>
+            <tr><td>30m 地表温度值域范围</td><td>{{ fmtRange(vr.min_30m_K, vr.max_30m_K) }}</td></tr>
+            <tr><td>10m 地表温度（有空洞）值域范围</td><td>{{ fmtRange(vr.min_10m_K, vr.max_10m_K) }}</td></tr>
+            <tr v-if="filledRange"><td>10m 地表温度（填补空洞后）值域范围</td><td>{{ fmtRange(filledRange.min_K, filledRange.max_K) }}</td></tr>
           </tbody>
         </table>
       </template>

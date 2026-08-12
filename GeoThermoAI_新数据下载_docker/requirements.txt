@@ -21,6 +21,8 @@ scikit-learn>=1.0
 joblib>=1.2
 # 数据处理
 pandas>=1.5
+# 中间产物表统一 Parquet（列式存储 + zstd 压缩，替代 CSV；分块读写见 core/table_io.py）
+pyarrow>=14.0
 geopandas>=0.12
 shapely>=2.0
 pyshp>=2.3

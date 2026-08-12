@@ -25,6 +25,7 @@ import threading
 import time
 import uuid
 import contextvars
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -34,6 +35,7 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from core import auth
+from core.memtrim import release_rss_memory as _memtrim_release
 from core.ai_assistant import GeoThermoAI_Assistant
 from core.skills.skill_registry import SkillRegistry
 from core.agent.geo_thermo_agent import GeoThermoAgent
@@ -75,13 +77,13 @@ _AGENT_KEYWORDS = [
 
 _WORKFLOW_KEYWORDS = ["全流程", "一键", "跑完全流程", "执行全流程", "处理", "下载", "获取"]
 
-# 工作流面板标签：单一来源在 core/agent/presentation.py（技术方案 9.4），
+# 工作流面板标签：单一来源在 core/agent/presentation.py，
 # 避免同一阶段在后端两处出现不一致的中文名
 _WORKFLOW_LABELS = presentation.WORKFLOW_LABELS
 
 
 def _is_agent_command(message: str) -> bool:
-    """关键词路由。角色化后降级为「LLM 不可用时的兜底」，不删除（技术方案 10.3）。"""
+    """关键词路由。角色化后降级为「LLM 不可用时的兜底」，不删除。"""
     return any(kw in message for kw in _AGENT_KEYWORDS)
 
 
@@ -90,7 +92,7 @@ def _is_workflow_command(message: str) -> bool:
 
 
 # 审批等待超时（秒）：默认取 settings.agent.approval_wait_seconds，
-# 可用环境变量 GTAI_APPROVAL_WAIT_SECONDS 覆盖（技术方案 3.4c）
+# 可用环境变量 GTAI_APPROVAL_WAIT_SECONDS 覆盖
 def _approval_wait_seconds_from(agent_cfg: dict) -> int:
     env = os.environ.get("GTAI_APPROVAL_WAIT_SECONDS", "").strip()
     if env:
@@ -118,7 +120,7 @@ def format_bubble(thinking: str, content: str, streaming: bool = False, elapsed:
         )
     if content:
         parts.append(content)
-    # 流式占位改为空串：不再插入 "▍" 块状字符（前端用打字光标指示生成中，升级点 14）
+    # 流式占位改为空串：不再插入 "▍" 块状字符（前端用打字光标指示生成中）
     return "\n\n".join(parts)
 
 
@@ -127,11 +129,42 @@ def strip_thinking(text: str) -> str:
     return re.sub(r"<details[^>]*>.*?</details>", "", text or "", flags=re.DOTALL).strip()
 
 
+def release_rss_memory() -> None:
+    """任务线程结束（成功/暂停/失败/纯对话）后，把进程空闲堆归还操作系统。
+
+    流程中的大量小分配（RF 树节点数组、pandas/pyarrow 分块缓冲）被 glibc
+    malloc 的 arena 保留在进程地址空间：Python 侧 `del` + gc 后 RSS 不会回落
+    （实测 150k×32KB 小分配释放后 RSS 保持 4.7GB 不降），但可继续复用。
+    主动调 `malloc_trim(0)` 可把完全空闲的堆页归还系统（实测 4.7GB → 32MB），
+    让日志区内存读数在流程结束后回落。实现见 core/memtrim.py（单一来源）。
+    """
+    return _memtrim_release()
+
+
+# 默认时区偏移（小时）：前端 EventSource 连接时会携带用户本地时区偏移
+# （如 UTC+8 → 8、UTC-5 → -5），日志时间戳按每个用户本地时区生成。
+# 容器默认 UTC，旧客户端未传 tz 时回退为北京时间（UTC+8）。
+_DEFAULT_TZ_OFFSET = 8.0
+
+
+def _stamp_log_lines(text: str, tz_offset: float = _DEFAULT_TZ_OFFSET) -> str:
+    """日志行前缀时间戳（按用户本地时区 年-月-日 时:分:秒），空行保持原样。
+
+    tz_offset：用户本地时区相对 UTC 的偏移小时数（东八区为 8，西五区为 -5）。
+    """
+    tz = timezone(timedelta(hours=float(tz_offset or 0)))
+    ts = datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S")
+    out = []
+    for ln in str(text).split("\n"):
+        out.append(f"[{ts}] {ln}" if ln.strip() else ln)
+    return "\n".join(out)
+
+
 # ── 业务后端（移植自 GradioAPI，去除 Gradio 耦合） ─────────────
 
 class AppBackend:
     def __init__(self):
-        # 启动期启用 GDAL/OSR 异常模式（A-01）：把静默返回 None/错误码的契约问题
+        # 启动期启用 GDAL/OSR 异常模式：把静默返回 None/错误码的契约问题
         # 尽早转成可捕获的异常，而不是等到某次下载中途才发现坐标是 inf。
         enable_gdal_osr_exceptions()
         settings = self._load_global_settings()
@@ -163,14 +196,18 @@ class AppBackend:
         self._agent_threads: Dict[str, threading.Thread] = {}
         self._stream_starts: Dict[str, float] = {}
         self._deleted_convs: set = set()
+        # 填洞产物值域缓存（按 路径+mtime+size 键控，产物不变不重复读栅格）
+        self._filled_range_cache: Dict[tuple, Optional[dict]] = {}
         # SSE 连接代际号：新连接递增代际，让旧（已断开但服务端未感知的）生成器自行退出
         self._stream_gen: Dict[str, int] = {}
         # 每个对话已累积的流式内容：断线重连/流结束后的重连用于补齐完整气泡
         self._stream_content: Dict[str, str] = {}
-        # 每个对话已累积的思考过程（reasoning_content，升级点 15）：断线重连补齐折叠链
+        # 每个对话已累积的思考过程（reasoning_content）：断线重连补齐折叠链
         self._stream_thinking: Dict[str, str] = {}
-        # 每个对话已计算的思考用时（升级点 16）：断线重连/切回对话恢复 (用时XX秒)
+        # 每个对话已计算的思考用时：断线重连/切回对话恢复 (用时XX秒)
         self._stream_thinking_seconds: Dict[str, float] = {}
+        # 每个对话已累积的实时日志（日志面板权威全量）：刷新/断线重连后恢复日志连续性
+        self._stream_logs: Dict[str, list] = {}
 
     # ── 内部工具 ───────────────────────────────────────────────
 
@@ -231,7 +268,7 @@ class AppBackend:
     def _auto_project_dir(self, name: str) -> Path:
         """按用户隔离的项目目录：{WORKSPACE_ROOT}/{uid}/workspace/{name}
 
-        路径完全由后端分配（升级规划 3.12），前端不接收用户自定义路径，
+        路径完全由后端分配，前端不接收用户自定义路径，
         从根本上杜绝不同用户填相同路径导致的数据互写与越权读取。
         """
         safe = re.sub(r"[^A-Za-z0-9_\-\u4e00-\u9fff]", "_", name.strip()) or "project"
@@ -501,7 +538,7 @@ class AppBackend:
 
     def create_project(self, name: str, path: str = "") -> dict:
         """创建项目；项目目录由后端按用户自动分配（{WORKSPACE_ROOT}/{uid}/workspace/{name}），
-        忽略前端传入的 path（升级规划 3.12：目录物理隔离）"""
+        忽略前端传入的 path（目录物理隔离）"""
         name = (name or "").strip()
         convs = self.load_conversations()
         if not name:
@@ -553,7 +590,7 @@ class AppBackend:
         if pid not in convs:
             return {"ok": False, "message": "项目不存在"}
         # 级联删除记忆（experiments/preferences/ChromaDB Collection）放后台线程，
-        # 主线程先完成文件与状态删除，立即返回提示（升级点 24：删除慢体验优化）
+        # 主线程先完成文件与状态删除，立即返回提示（删除慢体验优化）
         try:
             project_id = self._project_id(pid)
             if project_id and (self._user_dir() / "memory").exists():
@@ -597,7 +634,7 @@ class AppBackend:
             logging.warning(f"[memory] 后台删除项目记忆失败: {e}")
 
     def _conv_project_dir(self, project_root: str, conv_id: str) -> str:
-        """对话级独立工作目录（方案 A：并行互不干扰）。
+        """对话级独立工作目录（各对话并行互不干扰）。
 
         每个对话使用 {项目根}/convs/{对话id} 作为自己的 project_dir，
         所有影像/产物/清单都写在该子目录内，对话之间不共享文件、可并行执行。
@@ -640,7 +677,7 @@ class AppBackend:
                 ev.set()
             except Exception:
                 pass
-        # 方案 A：删除该对话的工作目录 {项目根}/convs/{cid}（后台线程）。
+        # 删除该对话的工作目录 {项目根}/convs/{cid}（后台线程）。
         # 项目级共享缓存（pairs/{研究区}/、dem_{研究区}.tif）在项目根，
         # 不属于单个对话，保留供其他对话复用，不会因删除对话而丢失。
         try:
@@ -671,6 +708,7 @@ class AppBackend:
         self._stream_starts.pop(cid, None)
         self._stream_gen.pop(cid, None)
         self._stream_content.pop(cid, None)
+        self._stream_logs.pop(cid, None)
         self._stream_thinking.pop(cid, None)
 
     def delete_conversation(self, cid: str, pid: str) -> dict:
@@ -678,7 +716,7 @@ class AppBackend:
         if pid not in convs or cid not in convs[pid]:
             return {"ok": False, "message": "对话不存在"}
         # 级联删除该对话产生的实验记忆放后台线程，主线程先完成文件与状态删除，
-        # 立即返回提示（升级点 24：删除慢体验优化）
+        # 立即返回提示（删除慢体验优化）
         try:
             project_id = self._project_id(pid)
             if project_id and (self._user_dir() / "memory").exists():
@@ -703,7 +741,7 @@ class AppBackend:
 
     def save_project_dir(self, pid: str, path: str) -> dict:
         """保存项目目录。路径由后端按用户自动分配（与 create_project 一致），
-        忽略前端传入路径，杜绝把项目指向他人目录（升级规划 3.12）。"""
+        忽略前端传入路径，杜绝把项目指向他人目录。"""
         convs = self.load_conversations()
         if pid not in convs:
             return {"ok": False, "message": "请先选择项目"}
@@ -754,6 +792,49 @@ class AppBackend:
         except Exception:
             pass
 
+    def _persist_stream_content(self, pid: str, cid: str, content: str,
+                                thinking: str = "", thinking_seconds: float = 0.0):
+        """把当前累积的流内容写回对话历史（节流调用）。
+
+        服务重启 / SSE 断线时内存态（_stream_content 等）会丢失，这里定期落盘
+        备份，保证断线恢复后气泡不是空的；任何失败仅告警，绝不影响主流程。
+        """
+        try:
+            convs = self.load_conversations()
+            if pid not in convs or cid not in convs[pid]:
+                return
+            msgs = convs[pid][cid].get("messages", [])
+            if not msgs or msgs[-1].get("role") != "assistant":
+                return
+            msgs[-1]["content"] = content
+            if thinking:
+                msgs[-1]["thinking"] = thinking
+            if thinking_seconds:
+                msgs[-1]["thinking_seconds"] = thinking_seconds
+            self._save_history(pid, cid, msgs)
+        except Exception as e:
+            logging.warning(f"[stream] 流内容落盘失败（已忽略）: {e}")
+
+    def _last_stream_content(self, cid: str) -> tuple:
+        """从对话历史取**最后一条** assistant 气泡内容（流式节流落盘的备份）。
+
+        服务重启后内存态清空，用它恢复当前流的部分结果。只取最后一条（哪怕是空的），
+        不向前跳历史消息——否则会把上一条已完成的气泡误填进当前正在生成的气泡。
+        返回 (content, thinking, thinking_seconds)。
+        """
+        try:
+            convs = self.load_conversations()
+            for _p, items in convs.items():
+                if cid in items:
+                    for m in reversed(items[cid].get("messages", [])):
+                        if m.get("role") == "assistant":
+                            return (m.get("content", ""), m.get("thinking", ""),
+                                    m.get("thinking_seconds", 0.0))
+                    break
+        except Exception:
+            pass
+        return "", "", 0.0
+
     # ── API 设置 ───────────────────────────────────────────────
 
     @staticmethod
@@ -771,7 +852,7 @@ class AppBackend:
         return {
             "api_format": api.get("api_format", "openai"),
             "base_url": api.get("api_base_url", ""),
-            # 凭据不回传明文（升级规划 3.12.1）：只给掩码与长度（供前端按真实长度显示黑点）
+            # 凭据不回传明文：只给掩码与长度（供前端按真实长度显示黑点）
             "api_key": "",
             "has_api_key": bool(raw_key),
             "api_key_masked": self._mask_secret(raw_key),
@@ -954,7 +1035,7 @@ class AppBackend:
     # ── 工作流 / 精度 ──────────────────────────────────────────
 
     def get_workflow_status(self, cid: Optional[str]) -> List[dict]:
-        """返回各 stage 状态；与固定 run_manifest.json 交叉核对（A-08 前端联动）。
+        """返回各 stage 状态；与固定 run_manifest.json 交叉核对（前端联动）。
 
         Agent 的内存态回调（wp/steps_map）反映"是否尝试执行过"，是乐观状态；
         run_manifest.json 由各 Skill 在产物通过校验后才写 completed，或在失败时
@@ -973,7 +1054,7 @@ class AppBackend:
         project_dir = self._get_project_dir(cid)
         if project_dir:
             try:
-                # 升级点 2：manifest 落在影像对独立目录（pairs/L{date}_S{date}），
+                # manifest 落在影像对独立目录（pairs/L{date}_S{date}），
                 # 无配对时兼容旧的项目根布局
                 manifest_root = self._latest_pair_root(project_dir)
                 manifest_stages = run_manifest.load_manifest(manifest_root).get("stages", {})
@@ -1008,7 +1089,7 @@ class AppBackend:
 
     def _read_eval_json(self, path: str) -> dict:
         """读取评估 JSON，区分 missing（未生成）/ error（存在但损坏）/ ok（正常），
-        不把缺失或损坏都填成 0（B-08：禁止把缺数据伪装成完美零误差）。"""
+        不把缺失或损坏都填成 0（禁止把缺数据伪装成完美零误差）。"""
         if not os.path.isfile(path):
             return {"status": "missing"}
         try:
@@ -1018,26 +1099,85 @@ class AppBackend:
             return {"status": "error", "message": str(e)}
 
     def get_accuracy_summary(self, cid: Optional[str]) -> dict:
-        """返回两套独立协议（A-07）：independent_prediction 与
-        coarse_constraint_closure，不再混成一张表，也不再输出 5K 阈值/
-        passed 等字段（用户确认第4/5条）。"""
-        empty = {"independent_prediction": {"status": "missing"}, "coarse_constraint_closure": {"status": "missing"}}
+        """返回测试集评估指标（test_metrics）与粗尺度闭合协议（coarse_constraint_closure）；
+        闭合对照附带上已生成的填洞产物值域（无则 None）。"""
+        empty = {"test_metrics": {"status": "missing"},
+                 "coarse_constraint_closure": {"status": "missing"}}
         if not cid:
             return empty
         project_dir = self._get_project_dir(cid)
         if not project_dir:
             return empty
-        # 升级点 2：评估结果位于影像对独立目录（取最近修改的一对）
+        # 评估结果位于影像对独立目录（取最近修改的一对）
         results_dir = os.path.join(self._latest_pair_root(project_dir), "results")
+        test_metrics = self._read_eval_json(self._latest_test_metrics_path(results_dir))
+        closure = self._read_eval_json(os.path.join(results_dir, "coarse_constraint_closure.json"))
+        if closure.get("status") == "ok" and isinstance(closure.get("data"), dict):
+            closure["data"]["filled_range"] = self._filled_product_range(results_dir)
         return {
-            "independent_prediction": self._read_eval_json(os.path.join(results_dir, "independent_prediction.json")),
-            "coarse_constraint_closure": self._read_eval_json(os.path.join(results_dir, "coarse_constraint_closure.json")),
+            "test_metrics": test_metrics,
+            "coarse_constraint_closure": closure,
         }
+
+    @staticmethod
+    def _latest_test_metrics_path(results_dir: str) -> str:
+        """测试集评估结果 JSON（predict_test_set 输出，含 metrics/n_samples）。
+
+        优先 results/test/（调优收尾 promote 后最佳轮副本），其次调优中途的
+        tuning/*/test/，两者取 mtime 最新。
+        """
+        import glob
+        cands = glob.glob(os.path.join(results_dir, "test", "rf_ttri_predict_run*.json"))
+        cands += glob.glob(os.path.join(results_dir, "tuning", "*", "test", "rf_ttri_predict_run*.json"))
+        return max(cands, key=os.path.getmtime) if cands else ""
+
+    def _filled_product_range(self, results_dir: str) -> Optional[dict]:
+        """读最近一份填洞产物（rf_10m_lst_final_filled_*.tif，排除掩膜）的有效像元
+        温度范围；没有填洞产物时返回 None（前端据此隐藏「填补空洞后」行）。
+        块级流式读取 + 按 (路径, mtime, size) 缓存，避免整幅读入内存、避免重复读栅格。
+        """
+        try:
+            import glob
+            cands = [p for p in glob.glob(os.path.join(results_dir, "rf_10m_lst_final_filled_*.tif"))
+                     if "_cloud_mask" not in os.path.basename(p)]
+            if not cands:
+                return None
+            path = max(cands, key=os.path.getmtime)
+            key = (path, os.path.getmtime(path), os.path.getsize(path))
+            cached = self._filled_range_cache.get(key)
+            if cached is not None:
+                return cached
+            import numpy as np
+            import rasterio
+            with rasterio.open(path) as ds:
+                nd = ds.nodata
+                lo = hi = None
+                for _, win in ds.block_windows(1):
+                    blk = ds.read(1, window=win)
+                    blk = blk.astype(np.float64)
+                    ok = np.isfinite(blk)
+                    # nodata 可能是 NaN（填充产品常见），finite 已排除；其余非 NaN
+                    # nodata 值（如 -9999）需要显式排除，两者叠加过滤
+                    if nd is not None and np.isfinite(float(nd)):
+                        ok &= (blk != float(nd))
+                    blk = blk[ok]
+                    if blk.size == 0:
+                        continue
+                    bmin, bmax = float(blk.min()), float(blk.max())
+                    lo = bmin if lo is None else min(lo, bmin)
+                    hi = bmax if hi is None else max(hi, bmax)
+            if lo is None or hi is None:
+                return None
+            result = {"min_K": lo, "max_K": hi}
+            self._filled_range_cache[key] = result
+            return result
+        except Exception:
+            return None
 
     # ── 地图 ──────────────────────────────────────────────────
 
     def _latest_pair_root(self, project_dir: str) -> str:
-        """项目下最近修改的影像对独立目录（升级点 2：pairs/L{date}_S{date}）。
+        """项目下最近修改的影像对独立目录（pairs/L{date}_S{date}）。
 
         无 pairs 目录或为空时返回项目根，兼容旧布局；取最近修改对保证
         工作流进度 / 精度 / 地图等只读接口始终对准用户当前正在处理的一对。
@@ -1144,7 +1284,7 @@ class AppBackend:
 
     def list_project_files(self, project_dir: str) -> dict:
         project_dir = (project_dir or "").strip()
-        # 归属校验：只能访问当前用户自己的项目目录（升级规划 3.12，堵越权读取）
+        # 归属校验：只能访问当前用户自己的项目目录（堵越权读取）
         if not self._owns_project_dir(project_dir):
             return {"ok": False, "message": "无权访问该目录", "files": []}
         if not project_dir or not os.path.isdir(project_dir):
@@ -1155,7 +1295,7 @@ class AppBackend:
                 # 中间过程产物（会被阶段清理删除）不在下载面板展示
                 if name in INTERMEDIATE_FILENAMES:
                     continue
-                # 升级点 28：生成中的文件不展示 —— .partial 是原子写入的半成品，
+                # 生成中的文件不展示 —— .partial 是原子写入的半成品，
                 # 0 字节是刚创建还没写入内容，都要等文件生成完整后才出现在列表
                 if name.endswith(".partial"):
                     continue
@@ -1175,7 +1315,7 @@ class AppBackend:
         rel_path = (rel_path or "").strip()
         if not rel_path:
             return None, "未选择文件"
-        # 归属校验：只能下载当前用户自己的项目文件（升级规划 3.12，堵越权下载）
+        # 归属校验：只能下载当前用户自己的项目文件（堵越权下载）
         if not self._owns_project_dir(project_dir):
             return None, "无权访问该目录"
         if not project_dir or not os.path.isdir(project_dir):
@@ -1187,7 +1327,7 @@ class AppBackend:
         # 中间过程产物不提供下载（与下载面板过滤规则一致）
         if os.path.basename(target) in INTERMEDIATE_FILENAMES:
             return None, "该文件为中间过程产物，不提供下载"
-        # 升级点 28：生成中的文件不提供下载（与下载面板过滤规则一致）
+        # 生成中的文件不提供下载（与下载面板过滤规则一致）
         if os.path.basename(target).endswith(".partial"):
             return None, "该文件正在生成中，请稍后再试"
         if not os.path.isfile(target):
@@ -1246,7 +1386,7 @@ class AppBackend:
         return "\n".join(lines)
 
     def test_cdse_connection(self) -> str:
-        """Copernicus Data Space 连通性测试（升级点 9：测试页补齐 Copernicus）。
+        """Copernicus Data Space 连通性测试（测试页补齐 Copernicus）。
 
         与 test_planetary_connection 同口径：STAC API 可达性 + Sentinel-2 搜索。
         """
@@ -1297,7 +1437,7 @@ class AppBackend:
         return "\n".join(lines)
 
     def test_gdal_status(self) -> str:
-        """GDAL 与投影链路自检（A-01 升级版）。
+        """GDAL 与投影链路自检（升级版）。
 
         不再只做"能 import"这类导入级检查：按 Server 实际使用顺序导入
         osgeo/rasterio/geopandas/pyogrio，对武汉/北京/南半球三个真实 bbox 做
@@ -1338,7 +1478,7 @@ class AppBackend:
         try:
             path = "/vsimem/gdal_selftest.tif"
             drv = gdal.GetDriverByName("GTiff")
-            ds = drv.Create(path, 4, 4, 1, gdal.GDT_Float32, options=["COMPRESS=LZW"])
+            ds = drv.Create(path, 4, 4, 1, gdal.GDT_Float32, options=["COMPRESS=DEFLATE", "PREDICTOR=3"])
             ds.SetGeoTransform([100, 30, 0, 200, 0, -30])
             ds.GetRasterBand(1).Fill(2.0)
             ds.FlushCache()
@@ -1441,7 +1581,7 @@ class AppBackend:
         agent_cfg = self._agent_settings()
         roles_enabled = agent_cfg["roles_enabled"]
 
-        # 执行模式（技术方案 3.5）：本次请求 > 会话已记录 > settings 默认值
+        # 执行模式：本次请求 > 会话已记录 > settings 默认值
         resolved_mode = normalize_exec_mode(
             exec_mode,
             normalize_exec_mode(conv_state.get("exec_mode"), agent_cfg["default_exec_mode"]),
@@ -1453,7 +1593,7 @@ class AppBackend:
             pass
 
         # 工作流类命令前置检查。
-        # 角色化开启后交给规划 Agent 以对话方式引导（拍板结论 3），这里不再硬拦截。
+        # 角色化开启后交给规划 Agent 以对话方式引导，这里不再硬拦截。
         if (not roles_enabled) and _is_workflow_command(user_msg) and _is_agent_command(user_msg):
             uploaded = self.list_study_areas()
             if not uploaded:
@@ -1474,6 +1614,8 @@ class AppBackend:
         # 创建流式队列 + 后台线程
         q: "queue.Queue" = queue.Queue()
         self._stream_queues[cid] = q
+        # 同一对话多轮执行的日志不断追加（不重置），避免后一轮覆盖前一轮日志
+        self._stream_logs.setdefault(cid, [])
         pause_event = threading.Event()
         self._pause_events[cid] = pause_event
 
@@ -1492,7 +1634,7 @@ class AppBackend:
         def _runner():
             ctx_token = _uid_ctx.set(uid)  # 后台线程不带请求 contextvars，需显式恢复用户
             try:
-                # 升级点 17：Chat 模式 = 只读对话。禁止执行任何 Skill / 工作流、
+                # Chat 模式 = 只读对话。禁止执行任何 Skill / 工作流、
                 # 禁止生成或修改文件，Agent 只能基于现有信息回答问题。
                 if chat_mode == "chat":
                     context = {
@@ -1524,9 +1666,9 @@ class AppBackend:
                         q.put(("token", content))
 
                     def pause_callback(pause_data):
-                        """等待用户在审批节点做出选择（技术方案 3.4c）。
+                        """等待用户在审批节点做出选择。
 
-                        角色路径：分片轮询 + 超时挂起，绝不替用户做决定（拍板结论 1）。
+                        角色路径：分片轮询 + 超时挂起，绝不替用户做决定。
                         旧路径（roles_enabled=False）：保持改造前的 300 秒 + 静默选第一组。
                         """
                         q.put(("pause", pause_data))
@@ -1612,6 +1754,41 @@ class AppBackend:
                 q.put(("error", str(e)))
             finally:
                 _uid_ctx.reset(ctx_token)
+                # 兜底持久化流尾部：长流程中（如空洞填补）SSE 生成器可能已断线/
+                # 被接管，队列里最后一条 token（气泡全文，含完成提示）没被消费，
+                # 气泡会停在半截。清理队列前把最后一次 token 内容补进流状态并
+                # 落盘，断线后重进对话/刷新页面都能恢复到完整气泡。
+                try:
+                    _tail_content = ""
+                    while True:
+                        try:
+                            _evt = q.get_nowait()
+                        except queue.Empty:
+                            break
+                        if isinstance(_evt, tuple) and len(_evt) == 2 \
+                                and _evt[0] == "token":
+                            _tail_content = _evt[1]
+                    if _tail_content:
+                        self._stream_content[cid] = _tail_content
+                        if pid:
+                            self._persist_stream_content(
+                                pid, cid,
+                                format_bubble("", _tail_content, streaming=False))
+                except Exception:
+                    pass
+                # 任务线程结束 = 本轮流结束：统一在这里清理临时流状态。
+                # 断线/刷新场景下 SSE 生成器可能已被 Starlette 取消（无法自清理），
+                # 若由生成器清理会把队列误删，导致刷新后重连 active=False、
+                # 气泡光标消失且不再更新；content/thinking/logs 保留供重连补齐
+                self._stream_queues.pop(cid, None)
+                self._pause_events.pop(cid, None)
+                self._pause_responses.pop(cid, None)
+                self._agent_threads.pop(cid, None)
+                self._stream_starts.pop(cid, None)
+                self._stream_gen.pop(cid, None)
+                # 本轮流结束后归还进程空闲堆，让日志区内存读数回落
+                #（不影响仍在用的对象，只释放已 free 的 arena 页）
+                release_rss_memory()
 
         thread = threading.Thread(target=_runner, daemon=True)
         thread.start()
@@ -1619,33 +1796,53 @@ class AppBackend:
         self._stream_starts[cid] = time.time()
         return {"ok": True, "messages": history}
 
-    def chat_stream(self, cid: str):
+    def chat_stream(self, cid: str, tz: float = _DEFAULT_TZ_OFFSET):
         """SSE 生成器：消费流式队列，输出事件流
 
         代际号接管：若上一个 SSE 连接已断开（如代理空闲超时）但服务端未感知
         （半开连接），新连接会递增代际号；旧生成器在下次读取队列时发现代际
         不符，把事件还给队列后自行退出，避免旧连接长期占用导致气泡冻结。
+
+        tz：用户本地时区相对 UTC 的偏移小时数，用于日志行时间戳盖戳。
         """
         thread = self._agent_threads.get(cid)
         q = self._stream_queues.get(cid)
         pause_event = self._pause_events.get(cid)
         if not thread or not q or not pause_event:
-            # 流已结束（含断线后重连）：把已累积内容一次性交付，避免气泡停在半截
+            # 流已结束（含断线后重连）：把已累积内容一次性交付，避免气泡停在半截。
+            # 内存态可能因服务重启被清空 → 回退读对话历史里节流落盘的备份；
+            # 两者都没有（执行在产出前就中断）→ 明确告知用户，而不是静默空气泡
             saved = self._stream_content.get(cid, "")
+            thinking = self._stream_thinking.get(cid, "")
+            thinking_seconds = self._stream_thinking_seconds.get(cid, 0.0)
+            if not saved:
+                saved, thinking, thinking_seconds = self._last_stream_content(cid)
             if saved:
-                thinking = self._stream_thinking.get(cid, "")
                 yield ("event: done\ndata: " + json.dumps(
-                    {"content": format_bubble("", saved, streaming=False),
-                     "thinking": thinking},
+                    {"content": saved, "thinking": thinking,
+                     "thinking_seconds": thinking_seconds},
                     ensure_ascii=False) + "\n\n")
             else:
-                yield "event: done\ndata: {}\n\n"
+                yield ("event: done\ndata: " + json.dumps(
+                    {"content": "> 本次执行在过程中断（服务重启或连接中断），"
+                                "已生成的部分结果可在工作面板查看；如需完整结果请重新发起执行。",
+                     "thinking": ""}, ensure_ascii=False) + "\n\n")
             return
+        # 重连接管（刷新/切回）：若任务正暂停等待审批或选影像，把待处理载荷
+        # 重放进队列，让新连接重新收到 pause 事件，前端恢复暂停弹窗（不丢暂停态）
+        conv_state = self._get_conv_state(cid)
+        if thread.is_alive() and not pause_event.is_set():
+            pp = conv_state.get("pending_pairs")
+            if pp:
+                q.put(("pause", {"pairs": pp}))
+            pa = conv_state.get("pending_approval")
+            if pa:
+                q.put(("pause", pa))
         gen = self._stream_gen.get(cid, 0) + 1
         self._stream_gen[cid] = gen
-        yield from self._stream_events(cid, thread, q, pause_event, gen)
+        yield from self._stream_events(cid, thread, q, pause_event, gen, tz)
 
-    def _stream_events(self, cid, thread, q, pause_event, gen):
+    def _stream_events(self, cid, thread, q, pause_event, gen, tz: float = _DEFAULT_TZ_OFFSET):
         paused = False
         convs = self.load_conversations()
         # 找到 pid/cid
@@ -1657,9 +1854,10 @@ class AppBackend:
         accumulated = self._stream_content.get(cid, "")
         thinking = self._stream_thinking.get(cid, "")
         start_time = self._stream_starts.get(cid, time.time())
-        thinking_started = None  # 思考开始时刻，用于计算思考用时（升级点 16）
+        thinking_started = None  # 思考开始时刻，用于计算思考用时
         thinking_seconds = self._stream_thinking_seconds.get(cid, 0.0)
         last_emit = time.time()
+        last_persist = 0.0  # 流内容节流落盘时间点（服务重启/断线后不丢气泡）
 
         def _emit(event: str, data: Any):
             yield f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
@@ -1700,18 +1898,26 @@ class AppBackend:
                     if thinking_started is None:
                         # 新一轮思考开始（含决策后 resume 的后续反思），启动计时
                         thinking_started = time.time()
-                    # 独立 thinking 事件实时推送思考增量（升级点 15 实时显示），
+                    # 独立 thinking 事件实时推送思考增量（实时显示），
                     # content 事件只承载正文，思考链由前端独立折叠块渲染
                     yield from _emit("thinking", {"thinking": thinking})
                 elif event_type == "token":
-                    # 第一个正文 token 到达 → 思考结束，结算本次思考用时（升级点 16）
+                    # 第一个正文 token 到达 → 思考结束，结算本次思考用时
                     if thinking_started is not None:
                         thinking_seconds = round(time.time() - thinking_started, 1)
                         thinking_started = None  # 本轮思考结束；下次 thinking 重新计时
                         self._stream_thinking_seconds[cid] = thinking_seconds
                     accumulated = data
                     self._stream_content[cid] = accumulated
-                    yield from _emit("token", {"content": format_bubble("", accumulated, streaming=True)})
+                    if pid and time.time() - last_persist >= 8:
+                        self._persist_stream_content(
+                            pid, cid, format_bubble("", accumulated, streaming=False),
+                            thinking, thinking_seconds)
+                        last_persist = time.time()
+                    # token 事件也带上思考用时：正文开始后（思考已结束）就展示「用时」，
+                    # 避免流程中断/长流程未到 done 时前端一直看不到思考时间
+                    yield from _emit("token", {"content": format_bubble("", accumulated, streaming=True),
+                                               "thinking_seconds": thinking_seconds})
                 elif event_type == "append":
                     if thinking_started is not None:
                         thinking_seconds = round(time.time() - thinking_started, 1)
@@ -1719,20 +1925,33 @@ class AppBackend:
                         self._stream_thinking_seconds[cid] = thinking_seconds
                     accumulated += data
                     self._stream_content[cid] = accumulated
-                    yield from _emit("token", {"content": format_bubble("", accumulated, streaming=True)})
+                    if pid and time.time() - last_persist >= 8:
+                        self._persist_stream_content(
+                            pid, cid, format_bubble("", accumulated, streaming=False),
+                            thinking, thinking_seconds)
+                        last_persist = time.time()
+                    yield from _emit("token", {"content": format_bubble("", accumulated, streaming=True),
+                                               "thinking_seconds": thinking_seconds})
                 elif event_type == "pause":
+                    # 暂停（如由我批准模式 plan_confirm/选影像处）前先结算思考用时：
+                    # 规划思考后若直接暂停（正文还没开始），不结算的话 pause 携带的
+                    # 用时恒为 0，前端「思考过程」块就不显示思考时间。
+                    if thinking_started is not None:
+                        thinking_seconds = round(time.time() - thinking_started, 1)
+                        thinking_started = None
+                        self._stream_thinking_seconds[cid] = thinking_seconds
                     payload = data if isinstance(data, dict) else {}
                     pairs = payload.get("pairs", [])
                     if pairs:
                         # 保存待选配对，供 chat_resume 根据用户选择索引恢复
                         self._get_conv_state(cid)["pending_pairs"] = pairs
-                        # pause 时同步带上思考用时（升级点 16）：由我批准模式在
+                        # pause 时同步带上思考用时：由我批准模式在
                         # plan_confirm / 选影像处暂停，done 事件不会走到，用时须在此送达
                         yield from _emit("pause", {"pairs": pairs, "thinking_seconds": thinking_seconds})
                         paused = True
                         return
                     if payload.get("type") == "approval":
-                        # 通用审批节点（技术方案 3.4a）：保存待处理载荷供 chat_resume 校验
+                        # 通用审批节点：保存待处理载荷供 chat_resume 校验
                         self._get_conv_state(cid)["pending_approval"] = payload
                         yield from _emit("pause", {"approval": payload, "thinking_seconds": thinking_seconds})
                         paused = True
@@ -1743,7 +1962,16 @@ class AppBackend:
                 elif event_type == "workflow":
                     yield from _emit("workflow", {"steps": self.get_workflow_status(cid)})
                 elif event_type == "log":
-                    yield from _emit("log", {"text": data})
+                    # 日志行统一加时间戳（年月日时分秒，按用户本地时区）；累积供刷新/重连恢复，
+                    # 上限与前端 LOG_ALL_MAX 一致，超出丢弃最旧
+                    stamped = _stamp_log_lines(data, tz)
+                    logs = self._stream_logs.get(cid)
+                    if logs is None:
+                        logs = self._stream_logs[cid] = []
+                    logs.append(stamped)
+                    if len(logs) > 20000:
+                        del logs[: len(logs) - 20000]
+                    yield from _emit("log", {"text": stamped})
                 elif event_type == "done":
                     break
                 elif event_type == "error":
@@ -1759,7 +1987,7 @@ class AppBackend:
                 if cid in convs.get(pid, {}):
                     last = convs[pid][cid]["messages"][-1]
                     last["content"] = final
-                    # 思考链独立字段持久化，供重新进入对话时前端渲染折叠块（升级点 15/16）
+                    # 思考链独立字段持久化，供重新进入对话时前端渲染折叠块
                     if thinking:
                         last["thinking"] = thinking
                     if thinking_seconds:
@@ -1785,18 +2013,13 @@ class AppBackend:
                             self._save_history(pid, cid, msgs)
                 except Exception:
                     pass
-            # 只有当前代际的连接才清理对话流状态（被接管的旧连接不清理）
-            if not paused and self._stream_gen.get(cid, 0) == gen:
-                self._stream_queues.pop(cid, None)
-                self._pause_events.pop(cid, None)
-                self._pause_responses.pop(cid, None)
-                self._agent_threads.pop(cid, None)
-                self._stream_starts.pop(cid, None)
-                self._stream_gen.pop(cid, None)
-                # _stream_content / _stream_thinking 保留：流结束后的重连用于补齐完整气泡
+            # 流状态清理统一由 _runner 线程结束时的 finally 兜底执行，这里不再 pop：
+            # 断线/刷新时旧生成器可能被 Starlette 取消，若在此 pop 队列会让刷新后
+            # 的重连误判 active=False，导致气泡光标消失、不再更新
+            # （_stream_content / _stream_thinking / _stream_logs 保留供重连补齐）
 
     def chat_resume(self, cid: str, payload: dict) -> dict:
-        """恢复被暂停的流，支持两种协议（技术方案 3.4b）。
+        """恢复被暂停的流，支持两种协议。
 
         旧：`{"pair_index": 0}`（配对选择，逻辑保持不变）
         新：`{"option_id": "manual_tune", "values": {...}}`（通用审批节点）
@@ -1835,7 +2058,7 @@ class AppBackend:
 
 # 瓦片渲染并发信号量：限制同时渲染的瓦片数量，防止大 GeoTIFF 的瓦片渲染风暴
 # 占满 FastAPI 线程池、饿死其他 API 请求（见 render_layer_tile）。
-# 升级点 29：后端已有 lru_cache（同瓦片重复请求直接命中），并发从 3 提高到 8，
+# 后端已有 lru_cache（同瓦片重复请求直接命中），并发从 3 提高到 8，
 # 显著加速首次平移/缩放时的冷瓦片加载。
 _TILE_RENDER_SEM = threading.BoundedSemaphore(8)
 
@@ -2117,7 +2340,7 @@ def layer_png(layer_id: str, conv: str = ""):
 
 @app.get("/api/layer/{layer_id}/tile/{z}/{x}/{y}")
 def layer_tile(layer_id: str, z: int, x: int, y: int, conv: str = ""):
-    # 升级点 29：允许浏览器缓存瓦片（同一图层同一 URL 平移/缩放时直接本地取，
+    # 允许浏览器缓存瓦片（同一图层同一 URL 平移/缩放时直接本地取，
     # 不再重复请求后端）；图层更新时前端 tileUrl 的 t 参数变化，自动失效拉新
     _cache_headers = {"Cache-Control": "public, max-age=300"}
     png = backend.render_layer_tile(layer_id, conv or None, z, x, y)
@@ -2143,10 +2366,10 @@ def chat_start(payload: dict):
 
 
 @app.get("/api/chat/stream")
-def chat_stream(conv: str = ""):
+def chat_stream(conv: str = "", tz: float = _DEFAULT_TZ_OFFSET):
     if not conv:
         return JSONResponse({"error": "缺少 conv"}, status_code=400)
-    return _sse(backend.chat_stream(conv))
+    return _sse(backend.chat_stream(conv, tz=float(tz or _DEFAULT_TZ_OFFSET)))
 
 
 @app.get("/api/chat/streaming")
@@ -2158,15 +2381,24 @@ def chat_streaming(conv: str = ""):
 @app.get("/api/chat/current")
 def chat_current(conv: str = ""):
     """返回该对话当前流式生成的累积内容（切回对话时立即显示最新气泡，
-    避免先显示会话文件中的旧快照再等 SSE 慢慢同步）"""
+    避免先显示会话文件中的旧快照再等 SSE 慢慢同步）。
+
+    服务重启后内存态清空，回退读对话历史里节流落盘的备份，保证切回对话
+    时气泡不是空的（运行中项目被重启后的恢复路径）。
+    """
     if not conv:
         return {"active": False, "content": ""}
     content = backend._stream_content.get(conv, "")
+    thinking = backend._stream_thinking.get(conv, "")
+    thinking_seconds = backend._stream_thinking_seconds.get(conv, 0.0)
+    if not content:
+        content, thinking, thinking_seconds = backend._last_stream_content(conv)
     return {
         "active": conv in backend._stream_queues,
         "content": format_bubble("", content, streaming=False) if content else "",
-        "thinking": backend._stream_thinking.get(conv, ""),
-        "thinking_seconds": backend._stream_thinking_seconds.get(conv, 0.0),
+        "thinking": thinking,
+        "thinking_seconds": thinking_seconds,
+        "logs": backend._stream_logs.get(conv, []),
     }
 
 
@@ -2204,7 +2436,7 @@ def download(project_dir: str = "", path: str = ""):
 
 @app.post("/api/download/multiple")
 def download_multiple(payload: dict):
-    """批量下载（升级点 26）：paths 数组 → 打包为 zip 返回"""
+    """批量下载：paths 数组 → 打包为 zip 返回"""
     project_dir = str(payload.get("project_dir") or "")
     paths = payload.get("paths") or []
     if not isinstance(paths, list) or not paths:
@@ -2241,7 +2473,7 @@ def test_planetary():
 
 @app.post("/api/test/cdse")
 def test_cdse():
-    """Copernicus Data Space 连通性测试（升级点 9）。"""
+    """Copernicus Data Space 连通性测试。"""
     return {"result": backend.test_cdse_connection()}
 
 

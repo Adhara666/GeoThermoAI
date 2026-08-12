@@ -1,8 +1,8 @@
 """
 TCR 热约束残差修正 Skill
 
-    - 30m 参考为完整 30m 约束层 30m_constraint_grid.csv；Agent 固定注入的
-      data_30m_csv 参数仍指向 30m_features_step2.csv，仅用于定位约束层所在
+    - 30m 参考为完整 30m 约束层 30m_constraint_grid.parquet；Agent 固定注入的
+      data_30m_csv 参数仍指向 30m_features_step2.parquet，仅用于定位约束层所在
       目录（即预处理阶段的 processed_dir），本 Skill 按固定命名约定自动推导
       完整约束层路径，不需要 Agent 额外注入新参数；
     - 细→粗映射使用 core.grid_mapping 的仿射逆变换；
@@ -25,7 +25,7 @@ def _derive_constraint_paths(params: Dict[str, Any]) -> Dict[str, str]:
     processed_dir = os.path.dirname(legacy_csv) if legacy_csv else ""
     return {
         "constraint_csv": params.get("constraint_csv")
-                          or (os.path.join(processed_dir, "30m_constraint_grid.csv") if processed_dir else ""),
+                          or (os.path.join(processed_dir, "30m_constraint_grid.parquet") if processed_dir else ""),
         "constraint_meta": params.get("constraint_meta_json") or params.get("constraint_meta")
                            or (os.path.join(processed_dir, "30m_constraint_grid_meta.json") if processed_dir else ""),
     }
@@ -49,12 +49,12 @@ class TCRComputeSkill(BaseSkill):
     @property
     def parameters(self) -> List[SkillParameter]:
         return [
-            SkillParameter(name="data_30m_csv", type="file_path", description="30m step2抽样CSV路径（仅用于定位同目录下的完整约束层，不直接作为TCR参考）", required=True),
+            SkillParameter(name="data_30m_csv", type="file_path", description="30m step2抽样Parquet路径（仅用于定位同目录下的完整约束层，不直接作为TCR参考）", required=True),
             SkillParameter(name="meta_30m_json", type="file_path", description="30m step2元数据JSON路径（同上，仅用于定位）", required=True),
-            SkillParameter(name="predict_10m_csv", type="file_path", description="10m预测数据CSV路径（含TTRI列）", required=True),
+            SkillParameter(name="predict_10m_csv", type="file_path", description="10m预测数据Parquet路径（含TTRI列）", required=True),
             SkillParameter(name="meta_10m_json", type="file_path", description="10m元数据JSON路径", required=True),
             SkillParameter(name="model_path", type="file_path", description="训练好的RF模型.pkl文件路径", required=True),
-            SkillParameter(name="output_path", type="file_path", description="输出CSV路径", required=True),
+            SkillParameter(name="output_path", type="file_path", description="输出Parquet路径", required=True),
             SkillParameter(name="tcr_mode", type="string", description="TCR模式：block_constant（默认）或 smooth_recentered（实验性，附加诊断）", required=False, default="block_constant", choices=["block_constant", "smooth_recentered"]),
             SkillParameter(name="batch_size", type="number", description="批处理大小，默认 500000", required=False, default=500000),
         ]
@@ -62,18 +62,18 @@ class TCRComputeSkill(BaseSkill):
     @property
     def input_schema(self) -> Dict[str, str]:
         return {
-            "data_30m_csv": "30m全量数据CSV路径",
+            "data_30m_csv": "30m全量数据Parquet路径",
             "meta_30m_json": "30m元数据JSON路径",
-            "predict_10m_csv": "10m预测数据CSV路径",
+            "predict_10m_csv": "10m预测数据Parquet路径",
             "meta_10m_json": "10m元数据JSON路径",
             "model_path": "RF模型文件路径",
-            "output_path": "输出CSV路径",
+            "output_path": "输出Parquet路径",
         }
 
     @property
     def output_schema(self) -> Dict[str, str]:
         return {
-            "predict_with_tcr": "含TCR的10m预测CSV路径",
+            "predict_with_tcr": "含TCR的10m预测Parquet路径",
             "tcr_statistics": "TCR统计信息",
             "validity": "有效性诊断",
         }
@@ -170,7 +170,7 @@ class TCRComputeSkill(BaseSkill):
                 artifacts={"output_path": result.get("output_path", "")},
                 stats={"tcr_statistics": tcr_stats, "validity": validity, "mode": result.get("mode")},
             )
-            # TCR 计算完成后，10m 预测特征 CSV（含 TTRI 列）已无下游消费方，立即清理
+            # TCR 计算完成后，10m 预测特征 Parquet（含 TTRI 列）已无下游消费方，立即清理
             cleanup_stage(project_root, "tcr_compute")
 
         if progress_callback:

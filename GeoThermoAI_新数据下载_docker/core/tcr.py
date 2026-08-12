@@ -1,26 +1,26 @@
 """
-TCR（热约束残差，Thermal Constraint Residual）+ LST_final 计算模块（A-06 重写）
+TCR（热约束残差，Thermal Constraint Residual）+ LST_final 计算模块（重写）
 
 与旧实现的关键差异：
-    - 30m 参考不再是 step2 抽样 CSV（约60m锚点间距），而是完整30m约束层
-      ``30m_constraint_grid.csv``（A-05），粗格就是真实30m像元，不是稀疏锚点；
+    - 30m 参考不再是 step2 抽样 Parquet（约60m锚点间距），而是完整30m约束层
+      ``30m_constraint_grid.parquet``，粗格就是真实30m像元，不是稀疏锚点；
     - 细→粗映射统一改用 core.grid_mapping 的仿射逆变换（Phase 1 聚合、Phase 2
       回写使用同一个映射函数），不再是 Phase 1 用 KDTree 角点最近邻、Phase 2 用
       row/3、evaluation 又用另一套手工除法这种三套不一致算子；
-    - 聚合使用 np.bincount 稠密数组，不用 Python dict 存全部粗格（B-03/7.2）；
-    - 提供两种命名清晰的模式（用户确认第3条，默认 block_constant）：
+    - 聚合使用 np.bincount 稠密数组，不用 Python dict 存全部粗格；
+    - 提供两种命名清晰的模式（默认 block_constant）：
         * block_constant（默认）：每个30m格内所有细像元加同一残差，在同一父格/
           同一有效像元集合/同一权重下精确满足算术均值闭合，边界可能块状；
         * smooth_recentered（可选，未过验收前不作默认）：先生成平滑残差场，
           再按同一父格重中心化，格内均值闭合同样精确成立，但需额外给出
           格内误差与边界跳变统计，不能预先承诺全局连续；
     - 越界/掩膜洞不再被无最大距离的最近邻硬吸附到边界锚点；
-    - 输出 spectral/ttri/tcr/lst_final 有效性与 out_of_grid 计数（B-03）。
+    - 输出 spectral/ttri/tcr/lst_final 有效性与 out_of_grid 计数。
 
 TCR_30m = LST_true_30m - mean(LST_pred_in_30m_cell)
 LST_final = LST_pred + TCR
 
-本模块只讨论"30m 产品格网算术均值闭合"，不宣称辐射或能量守恒（A-06/A-07）。
+本模块只讨论"30m 产品格网算术均值闭合"，不宣称辐射或能量守恒。
 """
 
 import json
@@ -32,8 +32,12 @@ import joblib
 import numpy as np
 import pandas as pd
 
+import pyarrow as pa
+import pyarrow.parquet as pq
+
 from . import grid_mapping
 from .atomic_io import write_verified
+from .table_io import TableWriter, iter_chunks, read_table
 
 # ── 常量 ──────────────────────────────────────────────────────────────
 TARGET_COL = "LST"
@@ -74,14 +78,42 @@ def _is_valid_row(df_slice: pd.DataFrame) -> np.ndarray:
     return df_slice[SPECTRAL_COLS].notna().all(axis=1)
 
 
+class _ChunkedPredReader:
+    """按需从 Phase 1 落盘的预测 .partial 文件顺序取 n 个预测值。
+
+    内部维护一个小缓冲，内存占用 O(batch_size)，替代旧实现把全部 10m 预测
+    结果缓存在内存（``lst_pred_cache``）的做法——大研究区下后者可达数 GB。
+    """
+
+    def __init__(self, path: str, batch_size: int):
+        self._it = pq.ParquetFile(path).iter_batches(
+            batch_size=max(int(batch_size), 1), columns=["lst_pred"]
+        )
+        self._buf = np.empty(0, dtype=np.float32)
+
+    def take(self, n: int) -> np.ndarray:
+        while len(self._buf) < n:
+            try:
+                batch = next(self._it)
+            except StopIteration:
+                raise RuntimeError(
+                    "TCR Phase 2 预测回读行数不足：Phase 1 与 Phase 2 的有效行判定不一致"
+                )
+            arr = np.asarray(batch.column(0), dtype=np.float32)
+            self._buf = np.concatenate([self._buf, arr])
+        out = self._buf[:n]
+        self._buf = self._buf[n:]
+        return out
+
+
 class _BoundaryJumpAccumulator:
     """在不要求整幅栅格常驻内存的前提下，逐块累积"格内相邻像元差异"统计。
 
-    利用预测CSV按行优先(row-major)写出的约定：在同一个 chunk 内，
+    利用预测Parquet按行优先(row-major)写出的约定：在同一个 chunk 内，
     - 索引 i, i+1 若 row 相同且 col 相邻，即为水平相邻像元对；
     - 索引 i, i+width 若 col 相同且 row 相邻，即为垂直相邻像元对。
     分别按"落在同一30m格" vs "跨30m格边界"分类，用 sum/sumsq/count/max
-    做在线累积，避免保存全部差值（对应7.2节的内存约束）。
+    做在线累积，避免保存全部差值（内存约束）。
     """
 
     def __init__(self, width: int):
@@ -163,12 +195,12 @@ def compute_tcr(
     """计算TCR（热约束残差）+ LST_final。
 
     Args:
-        constraint_csv:        完整30m约束层CSV路径（30m_constraint_grid.csv，含LST列）
+        constraint_csv:        完整30m约束层Parquet路径（30m_constraint_grid.parquet，含LST列）
         constraint_meta_json:  完整30m约束层元数据JSON路径
-        predict_10m_csv:       10m预测数据CSV路径（含TTRI列）
+        predict_10m_csv:       10m预测数据Parquet路径（含TTRI列）
         meta_10m_json:         10m元数据JSON路径
         model_path:            训练好的RF模型.pkl路径
-        output_path:           输出CSV路径（含 LST_pred, TCR, LST_final）
+        output_path:           输出Parquet路径（含 LST_pred, TCR, LST_final）
         mode:                  "block_constant"（默认，精确满足算术均值闭合，边界可能块状）
                                 或 "smooth_recentered"（可选，先平滑后按格重中心化，
                                 仍满足格内均值闭合，但不预先承诺全局连续，附加格内
@@ -177,7 +209,7 @@ def compute_tcr(
         progress_callback:     进度回调
 
     Returns:
-        dict: 输出路径、TCR统计信息、有效性诊断（B-03）
+        dict: 输出路径、TCR统计信息、有效性诊断
     """
     if mode not in VALID_MODES:
         raise ValueError(f"未知 TCR 模式: {mode}，可选: {VALID_MODES}")
@@ -204,8 +236,10 @@ def compute_tcr(
     if progress_callback:
         progress_callback("tcr", 0.05, "加载完整30m约束层...")
 
-    df_30m = pd.read_csv(constraint_csv, usecols=["row", "col", TARGET_COL])
-    lst_true_dense = np.full(coarse_height * coarse_width, np.nan, dtype=np.float64)
+    df_30m = read_table(constraint_csv, columns=["row", "col", TARGET_COL])
+    # LST/TCR 等"取值栅格"用 float32（温度显示级精度足够，7 位有效数字），
+    # 相比全 float64 各数组直接减半内存；累加器 sum_pred 仍保持 float64。
+    lst_true_dense = np.full(coarse_height * coarse_width, np.nan, dtype=np.float32)
     c_row = df_30m["row"].values.astype(np.int64)
     c_col = df_30m["col"].values.astype(np.int64)
     in_range_30m = (c_row >= 0) & (c_row < coarse_height) & (c_col >= 0) & (c_col < coarse_width)
@@ -214,8 +248,8 @@ def compute_tcr(
     del df_30m
 
     sum_pred = np.zeros(coarse_height * coarse_width, dtype=np.float64)
-    count_pred = np.zeros(coarse_height * coarse_width, dtype=np.int64)
-    lst_pred_cache = []
+    # count_pred 每格子像元数极小（≤ 数十），int32 足够，比 int64 省一半
+    count_pred = np.zeros(coarse_height * coarse_width, dtype=np.int32)
     out_of_grid = 0
     total_spectral_valid = 0
     total_invalid = 0
@@ -229,7 +263,15 @@ def compute_tcr(
     t_phase1 = time.time()
     batch_count_1 = 0
 
-    for chunk in pd.read_csv(predict_10m_csv, chunksize=batch_size):
+    # 10m 预测结果不再全量缓存在内存（原 lst_pred_cache 在大研究区可达数 GB），
+    # 改为按批落盘到 <output_path>.lst_pred.partial（.partial 后缀在下载面板中
+    # 被过滤，且 Phase 2 按同序分块读回，内存占用降为 O(batch_size)）。
+    tmp_pred_path = output_path + ".lst_pred.partial"
+    pred_writer = pq.ParquetWriter(
+        tmp_pred_path, pa.schema([pa.field("lst_pred", pa.float32())]), compression="zstd"
+    )
+
+    for chunk in iter_chunks(predict_10m_csv, batch_size=batch_size):
         valid_mask = _is_valid_row(chunk)
         n_valid = int(valid_mask.sum())
         total_spectral_valid += n_valid
@@ -239,7 +281,12 @@ def compute_tcr(
             valid_chunk = chunk.loc[valid_mask]
             X = valid_chunk[feature_cols].values.astype(np.float64)
             lst_pred = model.predict(X)
-            lst_pred_cache.append(lst_pred.astype(np.float32))
+            pred_writer.write_table(
+                pa.Table.from_pandas(
+                    pd.DataFrame({"lst_pred": lst_pred.astype(np.float32)}),
+                    preserve_index=False,
+                ).cast(pred_writer.schema)
+            )
 
             fine_row = valid_chunk["row"].values.astype(np.float64)
             fine_col = valid_chunk["col"].values.astype(np.float64)
@@ -263,6 +310,7 @@ def compute_tcr(
                 f"耗时 {time.time() - t_phase1:.0f}s",
             )
 
+    pred_writer.close()
     t_phase1_elapsed = time.time() - t_phase1
 
     # ─── 计算 TCR_30m（稠密数组，覆盖真实30m格网，不是稀疏锚点）───────
@@ -272,12 +320,17 @@ def compute_tcr(
     valid_cells = (count_pred > 0) & np.isfinite(lst_true_dense)
     n_valid_cells = int(valid_cells.sum())
     if n_valid_cells == 0:
+        pred_writer.close()
+        if os.path.exists(tmp_pred_path):
+            try:
+                os.remove(tmp_pred_path)
+            except OSError:
+                pass
         raise RuntimeError("TCR 计算失败：没有任何30m格同时具有有效参考LST和至少一个10m预测子像元")
 
-    mean_pred = np.zeros_like(sum_pred)
-    mean_pred[valid_cells] = sum_pred[valid_cells] / count_pred[valid_cells]
-    tcr_dense = np.full(coarse_height * coarse_width, np.nan, dtype=np.float64)
-    tcr_dense[valid_cells] = lst_true_dense[valid_cells] - mean_pred[valid_cells]
+    # 直接由 sum_pred/count_pred 计算 TCR，不再物化全尺寸的 mean_pred 中间数组
+    tcr_dense = np.full(coarse_height * coarse_width, np.nan, dtype=np.float32)
+    tcr_dense[valid_cells] = lst_true_dense[valid_cells] - sum_pred[valid_cells] / count_pred[valid_cells]
 
     valid_tcr_values = tcr_dense[valid_cells]
     subpixel_counts = count_pred[valid_cells]
@@ -300,8 +353,7 @@ def compute_tcr(
     # 无 TCR 的 30m 格（约束层外/无子像元）用最近有效 TCR 回退，
     # 保证每个预测样本都有 TCR（预测数据只按 S2 去云，不再额外扣点）
     tcr_nearest = grid_mapping.nearest_valid_index(tcr_grid_2d)
-    lst_pred_all = np.concatenate(lst_pred_cache) if lst_pred_cache else np.array([], dtype=np.float32)
-    del lst_pred_cache, sum_pred, count_pred, mean_pred, lst_true_dense
+    del sum_pred, count_pred, lst_true_dense
 
     smooth_interp = None
     correction_dense = None
@@ -317,9 +369,8 @@ def compute_tcr(
         smooth_sum = np.zeros(coarse_height * coarse_width, dtype=np.float64)
         smooth_count = np.zeros(coarse_height * coarse_width, dtype=np.int64)
         pre_boundary = _BoundaryJumpAccumulator(fine_width)
-        lst_pred_offset = 0
 
-        for chunk in pd.read_csv(predict_10m_csv, chunksize=batch_size):
+        for chunk in iter_chunks(predict_10m_csv, batch_size=batch_size):
             valid_mask = _is_valid_row(chunk)
             n_valid = int(valid_mask.sum())
             if n_valid == 0:
@@ -350,7 +401,7 @@ def compute_tcr(
         has_smooth = smooth_count > 0
         smooth_mean_dense[has_smooth] = smooth_sum[has_smooth] / smooth_count[has_smooth]
 
-        correction_dense = np.zeros(coarse_height * coarse_width, dtype=np.float64)
+        correction_dense = np.zeros(coarse_height * coarse_width, dtype=np.float32)
         can_correct = valid_cells & has_smooth
         correction_dense[can_correct] = tcr_dense[can_correct] - smooth_mean_dense[can_correct]
         correction_dense = correction_dense.reshape(coarse_height, coarse_width)
@@ -373,8 +424,9 @@ def compute_tcr(
         progress_callback("tcr", 0.55, f"Phase 2: 回写TCR（{mode}）+ 计算LST_final...")
 
     t_phase2 = time.time()
-    lst_pred_offset = 0
-    output_written = False
+    # 从 Phase 1 落盘的预测 .partial 文件按同序分块读回（内存 O(batch)）
+    pred_reader = _ChunkedPredReader(tmp_pred_path, batch_size)
+    output_writer = None
     total_valid_2 = 0
     total_invalid_2 = 0
     tcr_valid_count = 0
@@ -384,7 +436,7 @@ def compute_tcr(
     post_cell_sum = np.zeros(coarse_height * coarse_width, dtype=np.float64) if mode == MODE_SMOOTH_RECENTERED else None
     post_cell_count = np.zeros(coarse_height * coarse_width, dtype=np.int64) if mode == MODE_SMOOTH_RECENTERED else None
 
-    for chunk in pd.read_csv(predict_10m_csv, chunksize=batch_size):
+    for chunk in iter_chunks(predict_10m_csv, batch_size=batch_size):
         valid_mask = _is_valid_row(chunk)
         n_valid = int(valid_mask.sum())
         n_invalid = int((~valid_mask).sum())
@@ -453,9 +505,7 @@ def compute_tcr(
             tcr_vals[valid_mask.values] = local_tcr
             tcr_valid_count += int(np.isfinite(local_tcr).sum())
 
-            batch_lst_pred = lst_pred_all[lst_pred_offset:lst_pred_offset + n_valid]
-            lst_pred_vals[valid_mask.values] = batch_lst_pred
-            lst_pred_offset += n_valid
+            lst_pred_vals[valid_mask.values] = pred_reader.take(n_valid)
 
         lst_final_vals = lst_pred_vals + tcr_vals
         lst_final_valid_count += int(np.isfinite(lst_final_vals).sum())
@@ -467,10 +517,9 @@ def compute_tcr(
             TCR_COL: np.round(tcr_vals, 4),
             LST_FINAL_COL: np.round(lst_final_vals, 4),
         })
-        out.to_csv(output_path, mode="w" if not output_written else "a",
-                   header=not output_written, index=False, encoding="utf-8-sig",
-                   na_rep="")
-        output_written = True
+        if output_writer is None:
+            output_writer = TableWriter(output_path)
+        output_writer.write(out)
         batch_count_2 += 1
 
         if progress_callback and (batch_count_2 % 20 == 0 or batch_count_2 <= 5):
@@ -478,6 +527,16 @@ def compute_tcr(
                 "tcr", 0.55 + 0.40 * min(batch_count_2 / 100, 1.0),
                 f"Phase 2 批次 {batch_count_2}: {n_valid:,} 有效",
             )
+
+    if output_writer is not None:
+        output_writer.close()
+
+    # 删除 Phase 1 落盘的预测临时文件（正常路径；异常残留的 .partial 也被下载面板过滤）
+    if os.path.exists(tmp_pred_path):
+        try:
+            os.remove(tmp_pred_path)
+        except OSError:
+            pass
 
     t_phase2_elapsed = time.time() - t_phase2
     total_elapsed = time.time() - t_start
@@ -529,6 +588,6 @@ def compute_tcr(
         "total_seconds": round(total_elapsed, 1),
         "energy_conservation_disclaimer": (
             "TCR 反映的是10m预测回聚合到30m产品格网后的算术均值闭合程度，"
-            "不代表辐射或能量守恒（A-06/A-07）。"
+            "不代表辐射或能量守恒。"
         ),
     }

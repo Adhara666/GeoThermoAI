@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-训练 Agent 两种模式合成测试（技术方案 11.2）
+训练 Agent 两种模式合成测试
 
 运行：python tests/test_train_agent_modes.py
 覆盖：
@@ -141,7 +141,7 @@ def test_approval_asks_even_when_accurate():
         options = [o["id"] for o in hooks.payloads[0]["options"]]
         _assert(options == [Option.AI_TUNE, Option.MANUAL_TUNE, Option.ACCEPT,
                             Option.RESELECT_PAIR, Option.REPLAN],
-                "五个选项齐全且顺序与技术方案 6.1 一致")
+                "五个选项齐全且顺序一致")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -238,7 +238,88 @@ def test_tuning_round_asks_every_round():
         agent.on_trained(_result(0.62, 0.55, 2.10), ctx, hooks=hooks)
         decision = agent.on_trained(_result(0.70, 0.64, 1.80), ctx, hooks=hooks)
         _assert(decision.action == StepDecision.CONTINUE, "停止调优 → 继续下一步")
-        _assert("采用第 2 轮" in ctx.text(), "取误差最小的一轮（第 2 轮）")
+        _assert("采用调优第 1 轮（总第 2 轮）的结果" in ctx.text(),
+                "取误差最小的一轮（调优第 1 轮，总第 2 轮）")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_tuning_round_manual_option():
+    print("[4.1] tuning_round 弹窗也支持「我自己设置参数」且生效")
+    tmp = tempfile.mkdtemp(prefix="train_agent_")
+    try:
+        ctx = _Ctx(tmp)
+        hooks = _Hooks(ExecMode.APPROVAL,
+                       choices=[{"option_id": Option.AI_TUNE},
+                                {"option_id": Option.MANUAL_TUNE,
+                                 "values": {"max_depth": 12, "min_samples_leaf": 20}}])
+        agent = _agent()
+        agent.on_trained(_result(0.62, 0.55, 2.10), ctx, hooks=hooks)   # 第 1 轮
+        decision = agent.on_trained(_result(0.70, 0.64, 1.80), ctx, hooks=hooks)  # 第 2 轮
+        _assert(Option.MANUAL_TUNE in [o["id"] for o in hooks.payloads[1]["options"]],
+                "tuning_round 弹窗包含「我自己设置参数」")
+        _assert(decision.action == StepDecision.RETRY, "tuning_round 选手动调参 → 重跑")
+        _assert(decision.new_params["max_depth"] == 12
+                and decision.new_params["min_samples_leaf"] == 20,
+                "使用用户在弹窗表单里填的参数")
+        _assert("按你设置的参数" in ctx.text(), "气泡说明用了用户参数")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_ai_rounds_manual_reset():
+    print("[4.2] 手动调优打断 AI 连续计数，AI 上限从重新介入后重算")
+    tmp = tempfile.mkdtemp(prefix="train_agent_")
+    try:
+        ctx = _Ctx(tmp)
+        hooks = _Hooks(ExecMode.APPROVAL, choices=[
+            {"option_id": Option.AI_TUNE},                          # 第 1 轮后：AI 调优
+            {"option_id": Option.MANUAL_TUNE, "values": {"max_depth": 12}},  # 第 2 轮后：手动
+            {"option_id": Option.NEXT_ROUND},                       # 第 3 轮后：继续（AI）
+            {"option_id": Option.NEXT_ROUND},                       # 第 4 轮后：继续（AI）
+            {"option_id": Option.ACCEPT},                           # 第 5 轮后：接受
+        ])
+        agent = _agent(max_rounds=2)
+        agent.on_trained(_result(0.60, 0.55, 2.10), ctx, hooks=hooks)  # round0 初始
+        agent.on_trained(_result(0.65, 0.60, 1.90), ctx, hooks=hooks)  # round1 AI#1
+        agent.on_trained(_result(0.68, 0.63, 1.80), ctx, hooks=hooks)  # round2 手动
+        agent.on_trained(_result(0.72, 0.66, 1.70), ctx, hooks=hooks)  # round3 AI#1（重算后）
+        decision = agent.on_trained(_result(0.75, 0.70, 1.60), ctx, hooks=hooks)  # round4 AI#2
+        _assert(decision.action == StepDecision.CONTINUE,
+                "手动轮打断后 AI 重新计数，连续 2 轮 AI（round3/round4）后停止")
+        _assert("采用调优第 4 轮（总第 5 轮）的结果" in ctx.text(),
+                "取误差最小的调优第 4 轮（总第 5 轮）")
+        _assert("已达上限" in ctx.text(), "R7 提示 AI 连续调优已达上限")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def test_six_rounds_popup_note():
+    print("[4.3] 总训练达 6 轮（初始 1 + 调优 5）后，弹窗提示继续调优收益可能不显著")
+    tmp = tempfile.mkdtemp(prefix="train_agent_")
+    try:
+        ctx = _Ctx(tmp)
+        hooks = _Hooks(ExecMode.APPROVAL, choices=[
+            {"option_id": Option.AI_TUNE},                            # 第 1 轮后：AI 调优
+            {"option_id": Option.NEXT_ROUND},                         # 第 2 轮后
+            {"option_id": Option.NEXT_ROUND},                         # 第 3 轮后
+            {"option_id": Option.NEXT_ROUND},                         # 第 4 轮后
+            {"option_id": Option.NEXT_ROUND},                         # 第 5 轮后
+            {"option_id": Option.ACCEPT},                             # 第 6 轮后：接受
+        ])
+        agent = TrainAgent(_ScriptedLLM(), _registry(), max_rounds=5)
+        for metrics in ((0.70, 0.60, 2.00), (0.72, 0.63, 1.90), (0.74, 0.66, 1.80),
+                        (0.76, 0.69, 1.70), (0.78, 0.72, 1.60), (0.80, 0.75, 1.50)):
+            agent.on_trained(_result(*metrics), ctx, hooks=hooks)
+        _assert(len(hooks.payloads) == 6, "tuning_decision ×1 + tuning_round ×5")
+        round6 = hooks.payloads[5]
+        _assert(round6["node"] == Node.TUNING_ROUND, "第 6 轮仍弹 tuning_round")
+        _assert("当前训练轮数已达 6 轮（调优轮数已达 5 轮），继续调优的收益可能不显著"
+                in round6["summary"], "第 6 轮弹窗带「已达 6 轮」提示")
+        _assert("已达 6 轮" not in hooks.payloads[1]["summary"],
+                "第 2 轮（总轮数 2）不提前出现该提示")
+        _assert(Option.MANUAL_TUNE in [o["id"] for o in round6["options"]],
+                "第 6 轮弹窗仍保留「我自己设置参数」")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -263,19 +344,26 @@ def test_auto_mode_no_prompt():
         state = RunState(exec_mode="auto")
         hooks = _Hooks(ExecMode.AUTO, run_state=state)
         llm = _ScriptedLLM()
-        agent = TrainAgent(llm, _registry(), max_rounds=3)
+        agent = TrainAgent(llm, _registry(), max_rounds=2)
 
         d1 = agent.on_trained(_result(0.62, 0.55, 2.10), ctx, hooks=hooks)
         _assert(hooks.payloads == [], "完全执行模式一次也不弹窗")
         _assert(d1.action == StepDecision.RETRY, "精度过低 → 自动继续调优")
         _assert(d1.new_params["n_estimators"] == 300, "采用大模型给出的新参数")
+        _assert("开始调优训练（总第2轮，调优第1轮）" in ctx.text(),
+                "调优公告写明总轮数与调优序号（初始轮不算调优轮）")
+        _assert("  - 开始调优训练" in ctx.text(),
+                "调优公告用项目符号，与「- 模型训练（第N轮）完成：…」摘要对齐")
 
         d2 = agent.on_trained(_result(0.70, 0.64, 1.80), ctx, hooks=hooks)
-        _assert(d2.action == StepDecision.RETRY, "仍在调优")
+        _assert(d2.action == StepDecision.RETRY, "AI 连续 1 轮，仍在调优（上限 2 不含初始轮）")
+        _assert("开始调优训练（总第3轮，调优第2轮）" in ctx.text(),
+                "第二轮调优公告序号顺延（总第3轮，调优第2轮）")
         d3 = agent.on_trained(_result(0.88, 0.86, 1.25), ctx, hooks=hooks)
-        _assert(d3.action == StepDecision.CONTINUE, "达到轮数上限（R7）→ 停止并继续下一步")
-        _assert("已达上限" in ctx.text(), "气泡说明调优已达上限（升级点 10：不带 [规则] 编号）")
-        _assert("采用第 3 轮" in ctx.text(), "取误差最小的第 3 轮")
+        _assert(d3.action == StepDecision.CONTINUE, "AI 连续调优达上限（R7）→ 停止并继续下一步")
+        _assert("已达上限" in ctx.text(), "气泡说明调优已达上限（不带 [规则] 编号）")
+        _assert("采用调优第 2 轮（总第 3 轮）的结果" in ctx.text(),
+                "取误差最小的调优第 2 轮（总第 3 轮）")
         _assert(len(ctx.exp_state["tuning_trace"]) == 3, "调优轨迹写入实验记录草稿")
         _assert(ctx.exp_state["final_params"], "最终生效参数写入实验记录草稿")
         _assert(state.tuning_rounds == 2, "流程状态记录了调优轮次")
@@ -286,7 +374,7 @@ def test_auto_mode_no_prompt():
         decision = TrainAgent(_ScriptedLLM(), _registry()).on_trained(
             _result(0.92, 0.90, 0.95), ctx, hooks=hooks)
         _assert(decision.action == StepDecision.CONTINUE, "首轮已达 0.90（R2）→ 直接继续")
-        _assert("不再继续调优" in ctx.text(), "气泡说明精度已达标（升级点 10：不带 [规则] 编号）")
+        _assert("不再继续调优" in ctx.text(), "气泡说明精度已达标（不带 [规则] 编号）")
 
         # 大模型不可用：给不出调优方向时不空转，说明原因后继续下一步
         ctx = _Ctx(tmp)
@@ -303,7 +391,7 @@ def test_auto_mode_no_prompt():
         _assert(decision.action == StepDecision.RETRY,
                 "精度过低时 R1 的兜底方向让调优继续进行")
         _assert("偏低" in ctx.text() or "低于" in ctx.text(),
-                "气泡说明精度偏低（升级点 10：不带 [规则] 编号）")
+                "气泡说明精度偏低（不带 [规则] 编号）")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -319,29 +407,30 @@ def test_round_dirs_and_promotion():
             os.makedirs(d, exist_ok=True)
             with open(os.path.join(d, name), "wb") as f:
                 f.write(b"model" + str(i).encode())
-            with open(os.path.join(tmp, "results", "tuning", f"round_{i}",
-                                   "independent_prediction.json"), "w",
-                      encoding="utf-8") as f:
-                f.write('{"R2": %s}' % (0.7 + i * 0.1))
             time.sleep(0.01)
 
         state = RunState(exec_mode="auto")
         hooks = _Hooks(ExecMode.AUTO, run_state=state)
-        agent = TrainAgent(_ScriptedLLM(), _registry(), max_rounds=2)
+        agent = TrainAgent(_ScriptedLLM(), _registry(), max_rounds=1)
         d1 = agent.on_trained(_result(0.70, 0.62, 1.90), ctx, hooks=hooks)
         _assert(d1.new_params["output_dir"].endswith("round_1"), "第 2 轮写入 round_1")
-        # 第 2 轮误差更小 → 应被采纳
+        # 第 2 轮误差更小 → 应被采纳（AI 连续调优达上限 1 → 第 2 轮完成即采纳）
         agent.on_trained(_result(0.88, 0.86, 1.20), ctx, hooks=hooks)
 
         promoted = os.path.join(tmp, "results", "train")
         _assert(os.path.isdir(promoted), "最佳轮的 train 目录被复制到 results/train")
         pkls = sorted(os.listdir(promoted))
         _assert("rf_ttri_model_r1.pkl" in pkls, "被接受的第 2 轮模型进入 results/train")
-        _assert(os.path.isfile(os.path.join(tmp, "results",
-                                            "independent_prediction.json")),
-                "独立预测结果也复制到规范位置，供精度面板读取")
-        _assert(os.path.isdir(os.path.join(tmp, "results", "tuning", "round_0")),
-                "调优轨迹保留（复制而非移动）")
+        # 磁盘瘦身：非最佳轮目录整个删除；最佳轮目录保留轻量记录但 pkl 副本已删
+        _assert(not os.path.isdir(os.path.join(tmp, "results", "tuning", "round_0")),
+                "非最佳轮（round_0）目录已删除，不保留冗余 pkl")
+        r1_dir = os.path.join(tmp, "results", "tuning", "round_1", "train")
+        if os.path.isdir(r1_dir):
+            _assert(not [f for f in os.listdir(r1_dir) if f.lower().endswith(".pkl")],
+                    "最佳轮在 tuning 里的 pkl 副本已删除（模型只在 results/train 一份）")
+        _assert(len(agent.rounds) == 2 and agent.rounds[0]["test_r2"] == 0.62
+                and agent.rounds[1]["test_r2"] == 0.86,
+                "每一轮调优的指标仍记录在内存（tuning_trace 照常写入记忆），不因删文件丢失")
 
         # 下游按「results/train 下最新 pkl」推断，必须取到被接受的那一轮
         newest = max((os.path.join(promoted, n) for n in os.listdir(promoted)),
@@ -408,14 +497,55 @@ def test_no_replan_from_train_itself():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_approval_mode_keeps_only_best_pkl():
+    print("[10] 由我批准模式：调优结束后也只保留最佳轮 pkl，其他轮次全部删除")
+    tmp = tempfile.mkdtemp(prefix="train_agent_")
+    try:
+        ctx = _Ctx(tmp)
+        # 构造两轮的真实产物目录
+        for i, name in ((0, "rf_ttri_model_r0.pkl"), (1, "rf_ttri_model_r1.pkl")):
+            d = os.path.join(tmp, "results", "tuning", f"round_{i}", "train")
+            os.makedirs(d, exist_ok=True)
+            with open(os.path.join(d, name), "wb") as f:
+                f.write(b"model" + str(i).encode())
+            time.sleep(0.01)
+
+        hooks = _Hooks(ExecMode.APPROVAL, choices=[
+            {"option_id": Option.AI_TUNE},
+            {"option_id": Option.ACCEPT},
+        ])
+        agent = TrainAgent(_ScriptedLLM(), _registry(), max_rounds=3)
+        agent.on_trained(_result(0.70, 0.62, 1.90), ctx, hooks=hooks)   # 第 1 轮
+        agent.on_trained(_result(0.88, 0.86, 1.20), ctx, hooks=hooks)   # 第 2 轮（最佳）
+
+        promoted = os.path.join(tmp, "results", "train")
+        _assert(os.path.isdir(promoted), "最佳轮模型提升到 results/train")
+        _assert("rf_ttri_model_r1.pkl" in os.listdir(promoted),
+                "被接受的第 2 轮模型进入 results/train")
+        _assert(not os.path.isdir(os.path.join(tmp, "results", "tuning", "round_0")),
+                "非最佳轮（round_0）目录已删除，不保留冗余 pkl")
+        r1_dir = os.path.join(tmp, "results", "tuning", "round_1", "train")
+        _assert(not [f for f in os.listdir(r1_dir) if f.lower().endswith(".pkl")],
+                "最佳轮在 tuning 里的 pkl 副本已删除（模型只在 results/train 一份）")
+        pkl_count = sum(len([f for f in files if f.lower().endswith(".pkl")])
+                        for _r, _d, files in os.walk(os.path.join(tmp, "results")))
+        _assert(pkl_count == 1, f"由我批准模式全项目只剩 1 份 pkl（实际 {pkl_count}）")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == "__main__":
     test_before_train_sets_round_dir()
     test_approval_asks_even_when_accurate()
     test_five_options_mapping()
     test_tuning_round_asks_every_round()
+    test_tuning_round_manual_option()
+    test_ai_rounds_manual_reset()
+    test_six_rounds_popup_note()
     test_auto_mode_no_prompt()
     test_round_dirs_and_promotion()
     test_project_root_from_round_dir()
     test_defer_cleanup_respected()
     test_no_replan_from_train_itself()
+    test_approval_mode_keeps_only_best_pkl()
     print("\n✅ 训练 Agent 两种模式测试全部通过")

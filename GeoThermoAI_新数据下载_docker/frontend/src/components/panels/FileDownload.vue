@@ -36,7 +36,11 @@ function fmtSize(n) {
 }
 
 async function refresh() {
+  // 目录为空（如刚删除项目）：必须清空文件列表与勾选状态，
+  // 否则旧文件会残留显示（此前直接 return 导致刷新不清空，只有重建组件才消失）
   if (!project.projectDir) {
+    files.value = []
+    selectedSet.value = new Set()
     status.value = '❌ 请先在左侧边栏新建项目'
     return
   }
@@ -58,7 +62,7 @@ async function refresh() {
   }
 }
 
-// 多选（升级点 26）：点击行切换勾选；点击文件行默认选中该项
+// 多选：点击行切换勾选；点击文件行默认选中该项
 const selectedCount = computed(() => selectedSet.value.size)
 const totalSize = computed(() => {
   let sum = 0
@@ -260,7 +264,7 @@ watch(() => project.projectDir, () => refresh())
 </template>
 
 <style scoped>
-/* 下载说明与刷新按钮间距：与下方「状态 → 列表」组件的间距保持一致（升级点：间距统一） */
+/* 下载说明与刷新按钮间距：与下方「状态 → 列表」组件的间距保持一致（间距统一） */
 .dl-tip { margin-bottom: 10px; }
 /* 状态行：SVG 图标 + 文本（替换 emoji） */
 .dl-status { margin: 8px 0; display: flex; align-items: flex-start; gap: 6px; }

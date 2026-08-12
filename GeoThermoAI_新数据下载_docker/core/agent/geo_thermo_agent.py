@@ -41,6 +41,44 @@ _BASIC_KNOWLEDGE = """- TTRI（地形热响应指数）= a*DEM + b*Slope + c*cos
 _STEP_DESCRIPTIONS = presentation.LEGACY_STEP_DESCRIPTIONS
 
 
+# 结果后处理（空洞填补）请求关键词：命中即对当前对话已有结果执行，
+# 不再重新规划全流程（否则规划 Agent 会反过来问研究区/时间范围——用户已有结果时不该被问）
+_POSTPROCESS_KEYWORDS = ("无空洞", "空洞填补", "填补空洞", "空洞填充",
+                         "填洞", "补洞", "去空洞", "结果后处理", "gapfill", "gap fill")
+
+# 明确要求跑完整流程的说法：即使提到「结果后处理/无空洞」，也是全流程的一部分，
+# 不是单独的后处理请求（如「对武汉…做全流程处理，包括结果后处理」）
+_FULLWORKFLOW_MARKERS = ("全流程", "一键", "跑完全流程", "执行全流程", "跑全流程", "做全流程")
+
+
+def _is_postprocess_request(user_input: str) -> bool:
+    """是否**单独提出**的结果后处理请求（而不是全流程里顺带提到）。
+
+    例如「根据我现有的结果，生成无空洞的10m的地表温度」→ True；
+    「对武汉市2024年7月的数据做地表温度降尺度全流程处理，包括结果后处理」→ False。
+    """
+    text = (user_input or "").strip()
+    if not text:
+        return False
+    # 疑问句/咨询（"有空洞会怎样"、"为什么有空洞"、"什么是结果后处理"）不走后处理路径
+    if text.endswith("？") or text.endswith("?") or text.endswith("吗") \
+            or "为什么" in text or "原因" in text or "什么是" in text or "是什么" in text:
+        return False
+    # 明确要求跑完整流程的请求不算单独的后处理请求
+    if any(m in text for m in _FULLWORKFLOW_MARKERS):
+        return False
+    # 「包括结果后处理/包括最终的无空洞结果」→ 后处理只是全流程的一部分
+    if "包括" in text and any(kw in text for kw in _POSTPROCESS_KEYWORDS):
+        return False
+    if any(kw in text for kw in _POSTPROCESS_KEYWORDS):
+        return True
+    # 兜底组合：「空洞」+ 动作词，覆盖「把空洞填补一下」这类松散说法
+    if "空洞" in text and any(w in text for w in ("填补", "填充", "处理",
+                                                   "去掉", "去除", "补上", "生成")):
+        return True
+    return False
+
+
 _PROJECT_DIR_PROMPT = """## 项目目录（已由用户设置）
 用户已选择项目目录：{0}
 所有输出路径都在此目录下的 raw/、processed/、results/ 子目录中。
@@ -67,7 +105,7 @@ class GeoThermoAgent:
         5. 解析并执行计划（收尾自动写入实验记录）
 
         on_token: 可选回调，用于流式输出执行进度（气泡：阶段开始/完成摘要/最终结果）
-        on_thinking: 可选回调，透传 LLM 思考过程（reasoning_content，升级点 15）
+        on_thinking: 可选回调，透传 LLM 思考过程（reasoning_content）
         on_log:   可选回调，用于输出过程日志（日志页：进度百分比/INFO/WARN/详细过程）
         pause_callback: 可选回调，当 Agent 需要用户输入时调用，
                         返回 {"paused": True, "data": {...}} 表示暂停，
@@ -78,12 +116,24 @@ class GeoThermoAgent:
         project_id:       当前项目稳定 id（记忆按项目隔离）
         memory_manager:   MemoryManager 实例（None 则跳过记忆读写，向后兼容）
         exec_mode:        执行模式（approval / auto）；空则由角色编排取默认值
-        prior_messages:   完整对话历史（修复「Agent 路径看不到上文」，技术方案 1.5(1)）
-        session_state:    本对话已确认槽位（技术方案 8.2）
+        prior_messages:   完整对话历史（修复「Agent 路径看不到上文」）
+        session_state:    本对话已确认槽位
 
         以上三个参数均为可选，不传时行为与角色化改造前完全一致。
         """
-        # 角色编排开关（技术方案第 12 章）：开启时走多角色路径，
+        # 结果后处理（空洞填补）请求：角色编排开启时**交由规划 Agent 判断**——
+        # 规划 Agent 用 LLM 意图分类理解用户消息（intent=postprocess），并生成只含
+        # lst_gapfill 的单步计划，执行阶段再由结果 Agent（EvalAgent）接管填洞；
+        # 只有角色编排关闭（旧路径）时才在入口拦截，走 _handle_postprocess_request。
+        if _is_postprocess_request(user_input) \
+                and not self._agent_settings(settings_path)["roles_enabled"]:
+            return self._handle_postprocess_request(
+                user_input, on_token=on_token, on_log=on_log,
+                pause_callback=pause_callback, project_dir=project_dir,
+                project_id=project_id, conv_id=conv_id,
+                memory_manager=memory_manager, study_areas_dir=study_areas_dir)
+
+        # 角色编排开关：开启时走多角色路径，
         # 关闭时完全走下面的现有旧路径，行为与改造前一致
         if self._agent_settings(settings_path)["roles_enabled"]:
             return self.process_command_with_roles(
@@ -100,7 +150,8 @@ class GeoThermoAgent:
         # 保证气泡按"完整累积文本"展示整个中间过程（而不是被末尾覆盖）
         _stream_acc: List[str] = []
         def _emit(text):
-            _stream_acc.append(text)
+            # 气泡文案统一数字两侧空格（幂等）
+            _stream_acc.append(presentation.normalize_number_spacing(text))
             if on_token:
                 on_token("".join(_stream_acc))
 
@@ -222,7 +273,7 @@ class GeoThermoAgent:
 
         return self._execute_plan(plan, on_token=on_token, on_log=on_log, pause_callback=pause_callback, project_dir=project_dir, workflow_callback=workflow_callback, stream_acc=_stream_acc, settings_path=settings_path, study_areas_dir=study_areas_dir, conv_id=conv_id, project_id=project_id, memory_manager=memory_manager)
 
-    # ── 角色编排入口（技术方案 2.1：Plan 交规划 Agent，Solve 由本类调度）────
+    # ── 角色编排入口（Plan 交规划 Agent，Solve 由本类调度）────
 
     def _agent_settings(self, settings_path: str = "") -> Dict[str, Any]:
         """解析 settings.agent：每用户设置的 agent 段 > 全局 config/settings.json > 代码默认。"""
@@ -297,6 +348,170 @@ class GeoThermoAgent:
             end_date = "2024-07-31"
 
         return {"region": bbox, "start_date": start_date, "end_date": end_date}
+
+    # ── 结果后处理（空洞填补）路由：复用结果 Agent 的 lst_gapfill ──
+
+    def _latest_pair(self, project_dir: str) -> Optional[dict]:
+        """从**当前对话**工作区找最近一次生成 10m LST 产品的影像对。
+
+        目录布局：{project_dir}/pairs/L{landsat_date}_S{sentinel2_date}/results/…
+        project_dir 由 server 按对话隔离（{项目根}/convs/{对话id}），因此只可能
+        命中本对话的结果，不会张冠李戴。
+        返回 {"landsat_date": "YYYY-MM-DD", "sentinel2_date": "YYYY-MM-DD"}，
+        找不到返回 None。
+        """
+        base = pathlib.Path(project_dir or "") / "pairs"
+        if not base.is_dir():
+            return None
+        best, best_mtime = None, -1.0
+        for pdir in base.iterdir():
+            if not pdir.is_dir():
+                continue
+            results = pdir / "results"
+            tifs = list(results.glob("rf_10m_lst_final_*.tif")) if results.is_dir() else []
+            if not tifs:
+                continue
+            mtime = max(t.stat().st_mtime for t in tifs)
+            if mtime <= best_mtime:
+                continue
+            best_mtime = mtime
+            parts = pdir.name.split("_")
+            if len(parts) >= 2 and parts[0].startswith("L") and parts[1].startswith("S"):
+                l, s = parts[0][1:], parts[1][1:]
+                if len(l) == 8 and len(s) == 8 and l.isdigit() and s.isdigit():
+                    best = {"landsat_date": f"{l[:4]}-{l[4:6]}-{l[6:]}",
+                            "sentinel2_date": f"{s[:4]}-{s[4:6]}-{s[6:]}"}
+        return best
+
+    def _handle_postprocess_request(self, user_input: str, *,
+                                    on_token=None, on_log=None,
+                                    pause_callback=None, project_dir: str = "",
+                                    project_id: str = "", conv_id: str = "",
+                                    memory_manager=None, study_areas_dir: str = "") -> str:
+        """处理单独提出的结果后处理请求：先查结果 → 有则问、没有则告知。
+
+        结果存在 → 弹确认（复用审批节点 POSTPROCESS），用户确认才执行 lst_gapfill；
+        结果不存在 → 明确告知未找到本对话的 10m 地表温度初始结果。
+        """
+        stream_acc: List[str] = []
+
+        def _emit(text: str, to_log: bool = False):
+            if to_log:
+                if on_log:
+                    on_log(text)
+                return
+            # 气泡文案统一数字两侧空格（幂等）
+            stream_acc.append(presentation.normalize_number_spacing(text))
+            if on_token:
+                on_token("".join(stream_acc))
+
+        if not project_dir:
+            _emit("还没有设置项目目录，请先在左侧选择或创建项目，我再对已有结果做空洞填补。\n")
+            return "\n".join(stream_acc)
+
+        pair = self._latest_pair(project_dir)
+        if pair is None:
+            _emit("当前对话没有找到已生成的 10m 地表温度初始结果（含空洞），无法做结果后处理。\n")
+            _emit("请先提供研究区和时间范围跑一次完整流程生成产品；"
+                  "如果是在别的对话里生成过结果，请切到那个对话再试。\n")
+            return "\n".join(stream_acc)
+
+        # 找到了本对话的结果 → 询问用户是否确认对该结果做空洞填补（避免误处理）
+        l = str(pair.get("landsat_date") or "").replace("-", "")
+        s = str(pair.get("sentinel2_date") or "").replace("-", "")
+        pair_label = f"L{l}_S{s}"
+        summary = (f"检测到当前对话已有 10m 地表温度产品"
+                   f"（影像对 {pair_label}，含空洞）。"
+                   f"是否对该结果做空洞填补，生成无空洞的 10m 地表温度产品？"
+                   f"（只估计空洞像元，不改变无云区数值）")
+        _emit("检测到已有结果，正在询问是否做结果后处理…\n")
+        payload = approval_proto.build_postprocess(summary)
+
+        choice = None
+        if pause_callback:
+            response = pause_callback(payload)
+            if isinstance(response, dict) and not response.get("paused"):
+                data = response.get("data")
+                choice = data.get("option_id") if isinstance(data, dict) else None
+        if choice is None:
+            # 超时挂起 / 对话被删 / 无回调：等待用户选择（同角色路径的暂停协议）
+            _emit(presentation.waiting_for_user())
+            return "\n".join(stream_acc) + f"\n{PAUSE_MARKER}"
+
+        if choice != Option.RUN_POSTPROCESS:
+            _emit("好的，保留当前带空洞的 10m 地表温度产品。\n")
+            return "\n".join(stream_acc)
+
+        return self._run_postprocess_only(user_input, pair, on_token=on_token,
+                                          on_log=on_log, project_dir=project_dir,
+                                          project_id=project_id,
+                                          memory_manager=memory_manager,
+                                          study_areas_dir=study_areas_dir)
+
+    def _run_postprocess_only(self, user_input: str, pair: dict, *,
+                              on_token=None, on_log=None, project_dir: str = "",
+                              project_id: str = "", memory_manager=None,
+                              study_areas_dir: str = "") -> str:
+        """把「对已有结果做空洞填补」交给结果 Agent（EvalAgent 的结果后处理路径）。
+
+        执行 lst_gapfill，填补结果与空洞掩膜写回该配对的 results 目录。
+        """
+        from .roles.eval_agent import EvalAgent
+        from .executor import pair_dirs
+
+        stream_acc: List[str] = []
+
+        def _emit(text: str, to_log: bool = False):
+            if to_log:
+                if on_log:
+                    on_log(text)
+                return
+            # 气泡文案统一数字两侧空格（幂等）
+            stream_acc.append(presentation.normalize_number_spacing(text))
+            if on_token:
+                on_token("".join(stream_acc))
+
+        raw_dir, processed_dir, results_dir = pair_dirs(project_dir, pair)
+
+        class _PostCtx:
+            """结果 Agent 后处理所需的最小执行上下文。"""
+
+        ctx = _PostCtx()
+        ctx.registry = self.registry
+        ctx.project_dir = project_dir
+        ctx.raw_dir, ctx.processed_dir, ctx.results_dir = raw_dir, processed_dir, results_dir
+        ctx.exp_state = {"pair": pair}
+        ctx.emit = _emit
+        # 独立请求路径没有 plan：优先复用该影像对生成时记录的研究区
+        #（region_study_area.json，保证填洞与产品同一区域，避免误用其他最新上传的研究区）；
+        # 回退：从用户研究区目录取最新上传的 GeoJSON，让填洞只作用于研究区矢量范围内
+        ctx.region_geojson = ""
+        for _cand in (os.path.join(os.path.dirname(results_dir),
+                                   "region_study_area.json"),
+                      os.path.join(project_dir, "region_study_area.json")):
+            try:
+                with open(_cand, encoding="utf-8") as _f:
+                    _raf = str(json.load(_f).get("study_area_file") or "")
+                if _raf and os.path.isfile(_raf):
+                    ctx.region_geojson = _raf
+                    break
+            except Exception:
+                continue
+        if not ctx.region_geojson and study_areas_dir:
+            try:
+                _files = sorted(
+                    pathlib.Path(study_areas_dir).glob("*.geojson"),
+                    key=lambda p: p.stat().st_mtime, reverse=True)
+                if _files:
+                    ctx.region_geojson = str(_files[0])
+            except Exception:
+                ctx.region_geojson = ""
+
+        _emit("好的，对当前对话已有的 10m 地表温度产品做空洞填补（结果后处理）。\n")
+        agent = EvalAgent(self.assistant, memory_manager=memory_manager,
+                          project_id=project_id, on_log=on_log)
+        agent._run_gapfill(ctx)
+        return "\n".join(stream_acc)
 
     def _build_full_workflow_plan(self, info: dict, study_areas_dir: str = "") -> dict:
         """构建标准全流程执行计划
@@ -523,9 +738,9 @@ class GeoThermoAgent:
                 if pk in params:
                     params[pk] = region_dir + "/raw/" + fn
 
-            # CSV 文件路径
-            for pk, fn in [("train_csv", "train.csv"), ("val_csv", "validate.csv"),
-                           ("test_csv", "test.csv"), ("full_30m_csv", "30m_features_step2.csv")]:
+            # Parquet 文件路径（升级：中间产物表统一 Parquet）
+            for pk, fn in [("train_csv", "train.parquet"), ("val_csv", "validate.parquet"),
+                           ("test_csv", "test.parquet"), ("full_30m_csv", "30m_features_step2.parquet")]:
                 if pk in params:
                     params[pk] = processed_dir + "/" + fn
 
@@ -536,8 +751,8 @@ class GeoThermoAgent:
                     params[pk] = processed_dir + "/" + fn
 
             # data_30m_csv / predict_10m_csv
-            for pk, fn in [("data_30m_csv", "30m_features_step2.csv"),
-                           ("predict_10m_csv", "10m_predict_features.csv")]:
+            for pk, fn in [("data_30m_csv", "30m_features_step2.parquet"),
+                           ("predict_10m_csv", "10m_predict_features.parquet")]:
                 if pk in params:
                     params[pk] = processed_dir + "/" + fn
 
@@ -555,31 +770,31 @@ class GeoThermoAgent:
                 else:
                     params["model_path"] = rf_output_dir + "/train/rf_ttri_model.pkl"
 
-            # TCR/LST 输出路径（使用 rf_model 的实际 output_dir）
+            # TCR/LST 输出路径（使用 rf_model 的实际 output_dir；中间产物表统一 Parquet）
             if skill == "tcr_compute" and "output_path" in params:
-                params["output_path"] = self._find_latest(rf_output_dir, "tcr_result_*.csv",
-                                                          rf_output_dir + "/tcr_result.csv")
+                params["output_path"] = self._find_latest(rf_output_dir, "tcr_result_*.parquet",
+                                                          rf_output_dir + "/tcr_result.parquet")
             if skill == "lst_export":
                 if "input_csv" in params:
-                    # 搜索实际的 tcr_result（文件名带日期，升级点 4）
-                    params["input_csv"] = self._find_latest(rf_output_dir, "tcr_result_*.csv",
-                                                            rf_output_dir + "/tcr_result.csv")
+                    # 搜索实际的 tcr_result（文件名带日期）
+                    params["input_csv"] = self._find_latest(rf_output_dir, "tcr_result_*.parquet",
+                                                            rf_output_dir + "/tcr_result.parquet")
             # accuracy_eval 的 predict_csv 指向 TCR 输出
             if skill == "accuracy_eval" and "predict_csv" in params:
-                params["predict_csv"] = self._find_latest(rf_output_dir, "tcr_result_*.csv",
-                                                          rf_output_dir + "/tcr_result.csv")
+                params["predict_csv"] = self._find_latest(rf_output_dir, "tcr_result_*.parquet",
+                                                          rf_output_dir + "/tcr_result.parquet")
 
             # 兜底：如果关键 CSV 参数仍为空，搜索 output 目录
             _csv_search = {
-                "data_30m_csv": "30m_features_step2.csv",
-                "predict_10m_csv": "10m_predict_features.csv",
-                "test_csv": "test.csv",
-                "full_30m_csv": "30m_features_step2.csv",
-                "predict_csv": "tcr_result.csv",
+                "data_30m_csv": "30m_features_step2.parquet",
+                "predict_10m_csv": "10m_predict_features.parquet",
+                "test_csv": "test.parquet",
+                "full_30m_csv": "30m_features_step2.parquet",
+                "predict_csv": "tcr_result.parquet",
             }
             for pk, fn in _csv_search.items():
                 if pk in params and not params[pk]:
-                    _f = os.path.join(processed_dir, fn) if "30m" in fn or "10m" in fn or fn == "test.csv" else os.path.join(rf_output_dir, fn)
+                    _f = os.path.join(processed_dir, fn) if "30m" in fn or "10m" in fn or fn == "test.parquet" else os.path.join(rf_output_dir, fn)
                     if not os.path.isfile(_f):
                         _output_root = os.path.join(os.path.dirname(__file__), "..", "..", "output")
                         _found = sorted(
@@ -593,7 +808,7 @@ class GeoThermoAgent:
         # 强制 data_acquisition 的 region 使用已上传研究区文件的绝对路径：
         # 一旦存在已上传研究区，就以它为准，彻底屏蔽 LLM 生成城市名/bbox/错误路径
         # 等不一致输出导致 "could not convert string to float" 的解析崩溃。
-        # plan 已由规划 Agent 解析出 region.study_area_file 时以它为准（技术方案 10.1）；
+        # plan 已由规划 Agent 解析出 region.study_area_file 时以它为准；
         # 旧格式 plan 无该字段，行为与改造前完全一致。
         planned_region = ""
         if isinstance(plan.get("region"), dict):
@@ -606,7 +821,7 @@ class GeoThermoAgent:
                     break
 
     def _find_latest(self, directory: str, pattern: str, fallback: str) -> str:
-        """在指定目录及全局 output 下找最新匹配文件（升级点 4：文件名带日期）。
+        """在指定目录及全局 output 下找最新匹配文件（文件名带日期）。
 
         先精确目录，再兜底搜索 output 根；均未命中回退固定名。
         """
@@ -627,10 +842,10 @@ class GeoThermoAgent:
     def _execute_plan(self, plan: dict, on_token=None, on_log=None, pause_callback=None, project_dir: str = "", workflow_callback=None, stream_acc: Optional[list] = None, settings_path: str = "", study_areas_dir: str = "", conv_id: str = "", project_id: str = "", memory_manager=None, hooks=None, exec_mode: str = "", run_state=None) -> str:
         """遍历计划中的步骤，获取对应 Skill，执行并收集结果（薄委托）
 
-        实现已平移到 `core/agent/executor.execute_plan`（技术方案 10.1/10.2）。
+        实现位于 `core/agent/executor.execute_plan`。
         本方法保留原有位置参数与关键字参数一字不改，是
         `tests/test_memory_synthetic.py` 的回归护栏；新增的 hooks / exec_mode /
-        run_state 均为可选参数，不传时行为与平移前等价。
+        run_state 均为可选参数，不传时行为与旧路径等价。
 
         on_token: 可选回调，用于流式输出气泡内容（阶段开始/完成摘要/最终结果）
         on_log:   可选回调，用于输出过程日志（进度百分比/INFO/WARN/详细过程）
@@ -783,7 +998,11 @@ class GeoThermoAgent:
             info = {
                 "index": i,
                 "landsat_date": str(pair.get("landsat_date", "?")),
-                "landsat_satellite": str(pair.get("landsat_satellite", "?")),
+                # 前端配对卡片模板是 `Landsat ${landsat_satellite}`：
+                # 传数字（8/9）即可渲染成「Landsat 8/Landsat 9」，不显示 L8/L9 代号
+                "landsat_satellite": str(
+                    {"L8": "8", "L9": "9"}.get(str(pair.get("landsat_satellite", "")),
+                                               pair.get("landsat_satellite") or "?")),
                 "landsat_count": pair.get("landsat_count", 1),
                 "landsat_scenes": pair.get("landsat_scenes", []),
                 "landsat_cloud": pair.get("landsat_cloud_cover", "?"),
@@ -794,7 +1013,7 @@ class GeoThermoAgent:
                 "sentinel_cloud": pair.get("sentinel2_cloud_cover", "?"),
                 "sentinel_coverage": pair.get("sentinel2_coverage", "?"),
             }
-            # 数据 Agent 打过分时透传推荐标记（技术方案 3.3：只增加两个字段）；
+            # 数据 Agent 打过分时透传推荐标记（只增加两个字段）；
             # 未打分时这两个字段不出现，前端旧逻辑完全不受影响
             if pair.get("recommended"):
                 info["recommended"] = True
@@ -872,6 +1091,8 @@ class GeoThermoAgent:
         """
         import pandas as pd
 
+        from ..table_io import read_table, read_row_count
+
         train_csv = pipeline_output.get("train_csv", "")
         if not train_csv:
             return {
@@ -887,7 +1108,7 @@ class GeoThermoAgent:
                 "lst_std": 0,
             }
 
-        df_train = pd.read_csv(train_csv)
+        df_train = read_table(train_csv)
 
         # 计算特征统计
         feature_stats: Dict[str, Dict[str, float]] = {}
@@ -903,8 +1124,8 @@ class GeoThermoAgent:
         # val / test 样本数
         val_csv = pipeline_output.get("val_csv", "")
         test_csv = pipeline_output.get("test_csv", "")
-        val_samples = len(pd.read_csv(val_csv)) if val_csv else 0
-        test_samples = len(pd.read_csv(test_csv)) if test_csv else 0
+        val_samples = read_row_count(val_csv) if val_csv else 0
+        test_samples = read_row_count(test_csv) if test_csv else 0
 
         return {
             "train_samples": len(df_train),

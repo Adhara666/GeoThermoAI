@@ -116,7 +116,7 @@ def _rebuild_processed(project_dir: str, log_callback=None) -> None:
     )
     sp = _load_split_params(project_dir)
     split_dataset(
-        input_csv=os.path.join(pdir, "30m_features_step2.csv"),
+        input_csv=os.path.join(pdir, "30m_features_step2.parquet"),
         output_dir=pdir,
         train_ratio=sp["train_ratio"], val_ratio=sp["val_ratio"], test_ratio=sp["test_ratio"],
         seed=sp["seed"], block_size_px=sp["block_size_px"], guard_buffer_m=sp["guard_buffer_m"],
@@ -132,14 +132,14 @@ def _rebuild_ttri_split(project_dir: str, log_callback=None) -> str:
     pdir = os.path.join(project_dir, "processed")
     _log(log_callback, "重建 TTRI 系数与 train/validate/test TTRI 列...")
     result = compute_ttri_for_splits(
-        train_csv=os.path.join(pdir, "train.csv"),
-        val_csv=os.path.join(pdir, "validate.csv"),
-        test_csv=os.path.join(pdir, "test.csv"),
+        train_csv=os.path.join(pdir, "train.parquet"),
+        val_csv=os.path.join(pdir, "validate.parquet"),
+        test_csv=os.path.join(pdir, "test.parquet"),
         output_dir=pdir,
         progress_callback=_progress(log_callback),
     )
     compute_ttri_for_constraint_grid(
-        os.path.join(pdir, "30m_constraint_grid.csv"), result["coefficients_path"]
+        os.path.join(pdir, "30m_constraint_grid.parquet"), result["coefficients_path"]
     )
     return result["coefficients_path"]
 
@@ -151,13 +151,13 @@ def _rebuild_ttri_predict(project_dir: str, log_callback=None) -> None:
     if not os.path.isfile(coef):
         coef = _rebuild_ttri_split(project_dir, log_callback)
     else:
-        compute_ttri_for_constraint_grid(os.path.join(pdir, "30m_constraint_grid.csv"), coef)
-    predict_csv = os.path.join(pdir, "10m_predict_features.csv")
+        compute_ttri_for_constraint_grid(os.path.join(pdir, "30m_constraint_grid.parquet"), coef)
+    predict_csv = os.path.join(pdir, "10m_predict_features.parquet")
     if not os.path.isfile(predict_csv):
-        raise RuntimeError("缺少 10m 预测特征 CSV，无法重建 TTRI 空间化")
+        raise RuntimeError("缺少 10m 预测特征 Parquet，无法重建 TTRI 空间化")
     tmp = predict_csv + ".ttri_tmp"
     compute_ttri_predict(
-        constraint_csv=os.path.join(pdir, "30m_constraint_grid.csv"),
+        constraint_csv=os.path.join(pdir, "30m_constraint_grid.parquet"),
         constraint_meta_json=os.path.join(pdir, "30m_constraint_grid_meta.json"),
         predict_10m_csv=predict_csv,
         predict_10m_meta_json=os.path.join(pdir, "10m_predict_features_meta.json"),
@@ -200,7 +200,7 @@ def _tcr_mode_from_manifest(project_dir: str) -> str:
 
 def _sdate_from_raw(project_dir: str) -> str:
     """从 raw 目录的 Sentinel-2 影像文件名推导日期后缀（如 20240722），
-    使重建产物与正常流程的带日期命名一致（tcr_result_{sdate}.csv）"""
+    使重建产物与正常流程的带日期命名一致（tcr_result_{sdate}.parquet）"""
     hits = sorted(glob.glob(os.path.join(project_dir, "raw", "sentinel2_bands*.tif")))
     if not hits:
         return ""
@@ -209,12 +209,12 @@ def _sdate_from_raw(project_dir: str) -> str:
 
 
 def _rebuild_tcr(project_dir: str, log_callback=None) -> None:
-    """重建 tcr_result.csv（含上游：预处理/划分/TTRI 空间化）。"""
+    """重建 tcr_result.parquet（含上游：预处理/划分/TTRI 空间化）。"""
     pdir = os.path.join(project_dir, "processed")
     rdir = os.path.join(project_dir, "results")
     _ensure_processed(project_dir, [
-        "30m_constraint_grid.csv", "30m_constraint_grid_meta.json",
-        "10m_predict_features.csv", "10m_predict_features_meta.json",
+        "30m_constraint_grid.parquet", "30m_constraint_grid_meta.json",
+        "10m_predict_features.parquet", "10m_predict_features_meta.json",
     ], log_callback)
     _rebuild_ttri_predict(project_dir, log_callback)
     model_path = _latest_model(project_dir)
@@ -222,12 +222,12 @@ def _rebuild_tcr(project_dir: str, log_callback=None) -> None:
         raise RuntimeError("未找到 RF 模型（results/train/*_model_*.pkl），无法重建 TCR")
     os.makedirs(rdir, exist_ok=True)
     sdate = _sdate_from_raw(project_dir)
-    out_name = f"tcr_result_{sdate}.csv" if sdate else "tcr_result.csv"
+    out_name = f"tcr_result_{sdate}.parquet" if sdate else "tcr_result.parquet"
     _log(log_callback, f"重建 TCR 中间产物（{out_name}）...")
     compute_tcr(
-        constraint_csv=os.path.join(pdir, "30m_constraint_grid.csv"),
+        constraint_csv=os.path.join(pdir, "30m_constraint_grid.parquet"),
         constraint_meta_json=os.path.join(pdir, "30m_constraint_grid_meta.json"),
-        predict_10m_csv=os.path.join(pdir, "10m_predict_features.csv"),
+        predict_10m_csv=os.path.join(pdir, "10m_predict_features.parquet"),
         meta_10m_json=os.path.join(pdir, "10m_predict_features_meta.json"),
         model_path=model_path,
         output_path=os.path.join(rdir, out_name),
@@ -261,26 +261,26 @@ def ensure_stage_inputs(project_dir: str, stage: str, log_callback=None) -> None
 
     if stage == "ttri_compute":
         _ensure_processed(project_dir, [
-            "train.csv", "validate.csv", "test.csv",
-            "30m_constraint_grid.csv", "30m_constraint_grid_meta.json",
-            "10m_predict_features.csv", "10m_predict_features_meta.json",
+            "train.parquet", "validate.parquet", "test.parquet",
+            "30m_constraint_grid.parquet", "30m_constraint_grid_meta.json",
+            "10m_predict_features.parquet", "10m_predict_features_meta.json",
             "30m_features_step2_meta.json",
         ], log_callback)
         return
 
     if stage == "rf_model":
         rebuilt = _ensure_processed(project_dir, [
-            "train.csv", "validate.csv", "test.csv",
+            "train.parquet", "validate.parquet", "test.parquet",
         ], log_callback)
-        # 重建后的划分 CSV 不含 TTRI 列，必须重新拟合系数并原地加列
+        # 重建后的划分 Parquet 不含 TTRI 列，必须重新拟合系数并原地加列
         if rebuilt or not os.path.isfile(os.path.join(pdir, "ttri_coefficients.json")):
             _rebuild_ttri_split(project_dir, log_callback)
         return
 
     if stage == "tcr_compute":
         _ensure_processed(project_dir, [
-            "30m_constraint_grid.csv", "30m_constraint_grid_meta.json",
-            "10m_predict_features.csv", "10m_predict_features_meta.json",
+            "30m_constraint_grid.parquet", "30m_constraint_grid_meta.json",
+            "10m_predict_features.parquet", "10m_predict_features_meta.json",
         ], log_callback)
         _rebuild_ttri_predict(project_dir, log_callback)
         if not _latest_model(project_dir):
@@ -288,15 +288,15 @@ def ensure_stage_inputs(project_dir: str, stage: str, log_callback=None) -> None
         return
 
     if stage == "lst_export":
-        if not glob.glob(os.path.join(rdir, "tcr_result*.csv")):
+        if not glob.glob(os.path.join(rdir, "tcr_result*.parquet")):
             _rebuild_tcr(project_dir, log_callback)
         return
 
     if stage == "accuracy_eval":
         _ensure_processed(project_dir, [
-            "30m_constraint_grid.csv", "30m_constraint_grid_meta.json",
+            "30m_constraint_grid.parquet", "30m_constraint_grid_meta.json",
             "10m_predict_features_meta.json",
         ], log_callback)
-        if not glob.glob(os.path.join(rdir, "tcr_result*.csv")):
+        if not glob.glob(os.path.join(rdir, "tcr_result*.parquet")):
             _rebuild_tcr(project_dir, log_callback)
         return

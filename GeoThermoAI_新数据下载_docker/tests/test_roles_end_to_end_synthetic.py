@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-多角色路径端到端合成测试（技术方案 11.3 的自动化版本）
+多角色路径端到端合成测试（自动化版本）
 
 运行：python tests/test_roles_end_to_end_synthetic.py
 用合成 Skill + FakeAssistant 走完整的 `process_command_with_roles`，零网络依赖。
@@ -10,7 +10,7 @@
 - 完全执行 · 全流程：一次跑完，自动选配对、自动调优、直接出报告
 - 由我批准 · 全流程：在配对选择、调优决策、每轮调优、最终报告都停下来问
 - 数据预处理失败：停下不进训练
-- 未设项目目录 / 未上传研究区：对话方式引导（拍板结论 3）
+- 未设项目目录 / 未上传研究区：对话方式引导
 - 特性开关关闭时完全走旧路径
 """
 
@@ -26,6 +26,7 @@ from core.agent import plan_schema
 from core.agent.executor import PAUSE_MARKER
 from core.agent.geo_thermo_agent import GeoThermoAgent
 from core.agent.orchestrator.approval import Node, Option
+from core.agent.orchestrator.run_state import RunState
 from core.memory import MemoryManager
 from core.skills.base_skill import BaseSkill, SkillResult
 from core.skills.skill_registry import SkillRegistry
@@ -56,13 +57,14 @@ def _write_rasters(raw_dir):
 
 
 def _write_tables(processed_dir):
-    """写 train/validate/test CSV（含取值有变化的 TTRI 列）与 30 米格网元数据。"""
+    """写 train/validate/test Parquet（含取值有变化的 TTRI 列）与 30 米格网元数据。"""
     os.makedirs(processed_dir, exist_ok=True)
-    for name in ("train.csv", "validate.csv", "test.csv"):
-        with open(os.path.join(processed_dir, name), "w", encoding="utf-8") as f:
-            f.write("row,col,NDVI,DEM,LST,TTRI\n")
-            for i in range(20):
-                f.write(f"{i},{i},0.3{i % 5},{100 + i},300.{i % 9},{1.0 + i * 0.1:.2f}\n")
+    import pandas as pd
+    for name in ("train.parquet", "validate.parquet", "test.parquet"):
+        rows = [{"row": i, "col": i, "NDVI": 0.3 + (i % 5) / 10,
+                 "DEM": 100 + i, "LST": 300.0 + (i % 9) / 10, "TTRI": 1.0 + i * 0.1}
+                for i in range(20)]
+        pd.DataFrame(rows).to_parquet(os.path.join(processed_dir, name), index=False)
     with open(os.path.join(processed_dir, "30m_features_step2_meta.json"), "w",
               encoding="utf-8") as f:
         json.dump({"height": 300, "width": 400}, f)
@@ -143,7 +145,6 @@ RF_DATA = {
     "feature_importance": [{"feature": "NDVI", "importance": 0.28},
                            {"feature": "TTRI", "importance": 0.20}],
     "params": {"n_estimators": 200, "max_depth": 25},
-    "independent_prediction": {"R2": 0.82, "RMSE_K": 1.41, "n_samples": 388869},
     "train_time_seconds": 12.3,
 }
 
@@ -232,11 +233,8 @@ def _train_accept():
 
 
 def _eval_text():
-    return ("产品概况：九江镇 2025 年 7 月十米地表温度产品，有效像元 4,231,905 个。\n"
-            "模型精度：测试集决定系数 0.87，属于优秀；独立预测决定系数 0.82。\n"
-            "闭合情况：平均偏差 0.05 开尔文，平均绝对误差 0.40 开尔文，"
-            "共比对 373,240 个格网；这是算术均值闭合，不是十米精度。\n"
-            "关键特征与局限：植被指数贡献最大；云掩膜区域没有结果。")
+    # LLM 只写「关键特征与局限」的定性短句（不含数字），报告数字由系统渲染
+    return "贡献最大的是植被指数，十米产品的细节更丰富；云掩膜区域没有结果。"
 
 
 # ── 测试环境搭建 ───────────────────────────────────────────────────
@@ -396,9 +394,9 @@ def test_auto_full_workflow():
         _assert(bubble.count("找到 2 组可用的影像组合") == 1,
                 "「找到 N 组可用的影像组合」只输出一次，不重复")
         _assert("数据检查通过" in bubble, "数据轻反思通过后才进训练")
-        _assert("模型训练完成" in bubble, "训练阶段有中文摘要")
+        _assert("模型训练（第 1 轮）完成" in bubble, "训练阶段有中文摘要")
         _assert("闭合校核完成" in bubble, "评估阶段有中文摘要")
-        _assert("不是十米精度" in bubble, "结果说明写明了闭合的口径")
+        _assert("不是 10m 独立精度" in bubble, "结果说明写明了闭合的口径")
 
         records = env.memory.experiment_log("p1").all()
         _assert(len(records) == 1 and records[0]["status"] == "success",
@@ -514,7 +512,7 @@ def test_pipeline_failure_blocks_training():
 
 
 def test_missing_project_dir_guided():
-    print("[7] 未设项目目录：对话方式引导（拍板结论 3）")
+    print("[7] 未设项目目录：对话方式引导")
     tmp = tempfile.mkdtemp(prefix="roles_e2e_")
     try:
         env = _Env(tmp)
@@ -582,7 +580,7 @@ def test_auto_tuning_rounds():
                 super().__init__("rf_model", message="模型训练完成")
                 self.round = 0
                 self.metrics = [(0.70, 0.58, 2.10), (0.82, 0.76, 1.55),
-                                (0.90, 0.86, 1.22)]
+                                (0.90, 0.86, 1.22), (0.91, 0.87, 1.20)]
 
             def execute(self, params, progress_callback=None, log_callback=None):
                 self.calls.append(dict(params))
@@ -606,22 +604,26 @@ def test_auto_tuning_rounds():
         agent = GeoThermoAgent(assistant, registry)
         env.run(agent, "跑全流程", exec_mode="auto")
 
-        _assert(len(rf.calls) == 3, f"按配置上限跑了 3 轮（实际 {len(rf.calls)} 轮）")
+        _assert(len(rf.calls) == 4,
+                f"AI 连续调优上限 3 轮（不含初始训练轮）+ 初始 1 轮 = 4 轮（实际 {len(rf.calls)} 轮）")
         _assert(rf.calls[0]["output_dir"].endswith("round_0"), "第 1 轮写入 round_0")
         _assert(rf.calls[1]["output_dir"].endswith("round_1"), "第 2 轮写入 round_1")
+        _assert(rf.calls[2]["output_dir"].endswith("round_2"), "第 3 轮写入 round_2")
+        _assert(rf.calls[3]["output_dir"].endswith("round_3"), "第 4 轮写入 round_3")
         _assert(all(c["defer_cleanup"] for c in rf.calls), "各轮都延迟清理中间产物")
         bubble = env.bubble()
-        _assert("采用第 3 轮" in bubble, "取误差最小的第 3 轮")
-        _assert("已达上限" in bubble, "气泡说明调优已达上限（升级点 10：不带 [规则] 编号）")
+        _assert("采用调优第 3 轮（总第 4 轮）的结果" in bubble,
+                "取误差最小的调优第 3 轮（总第 4 轮）")
+        _assert("已达上限" in bubble, "气泡说明调优已达上限（不带 [规则] 编号）")
         records = env.memory.experiment_log("p1").all()
-        _assert(records[0]["tuning_trace"] and len(records[0]["tuning_trace"]) == 3,
+        _assert(records[0]["tuning_trace"] and len(records[0]["tuning_trace"]) == 4,
                 "实验记录保留完整调优轨迹")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
 def test_reselect_pair_skips_replan():
-    print("[11] 「重新选择影像组合」直接复用原 plan 重跑，不经过规划 Agent 的整单 replan（v1.2）")
+    print("[11] 「重新选择影像组合」直接复用原 plan 重跑，不经过规划 Agent 的整单 replan")
     tmp = tempfile.mkdtemp(prefix="roles_e2e_")
     try:
         env = _Env(tmp)
@@ -671,6 +673,98 @@ def test_reselect_pair_skips_replan():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_acquisition_mode_hint_skips_popup():
+    print("[12] 用户指令直接指定获取方式 → 跳过弹窗直接进入对应模式")
+    from core.agent.orchestrator.role_flow import (
+        _detect_acquisition_mode_hint, ask_acquisition_mode_if_month)
+
+    # 关键词检测
+    _assert(_detect_acquisition_mode_hint("对 7 月做月度合成") == "monthly",
+            "「月度合成」→ monthly")
+    _assert(_detect_acquisition_mode_hint("按月合成处理") == "monthly",
+            "「按月合成」→ monthly")
+    _assert(_detect_acquisition_mode_hint("用配对模式处理") == "pair",
+            "「配对模式」→ pair")
+    _assert(_detect_acquisition_mode_hint("逐对影像处理") == "pair",
+            "「逐对」→ pair")
+    _assert(_detect_acquisition_mode_hint("做降尺度全流程") == "",
+            "未指定 → 空串（照旧弹窗）")
+    _assert(_detect_acquisition_mode_hint("") == "", "空输入 → 空串")
+
+    def _plan(start="2025-07-01", end="2025-07-31"):
+        return {
+            "intent": "task",
+            "region": {"name": "九江镇", "study_area_file": ""},
+            "time_range": {"start": start, "end": end},
+            "steps": [{"skill": "data_acquisition", "params": {}}],
+        }
+
+    # 指定月度合成：跳过弹窗、不暂停，composite=monthly 写入（非整月也生效）
+    p1 = _plan(start="2025-07-01", end="2025-07-15")
+    called1 = []
+    r1 = ask_acquisition_mode_if_month(
+        p1, lambda payload: called1.append(payload) or {"paused": True},
+        RunState(exec_mode="auto"), lambda *a, **k: None,
+        user_input="对 7 月上半月做月度合成处理")
+    _assert(r1 == "" and called1 == [], "指定月度合成：不弹窗、不暂停（非整月也生效）")
+    _assert(p1["steps"][0]["params"].get("composite") == "monthly",
+            "data_acquisition 以 composite=monthly 执行")
+
+    # 指定配对模式：跳过弹窗，composite=pair 写入
+    p2 = _plan()
+    called2 = []
+    r2 = ask_acquisition_mode_if_month(
+        p2, lambda payload: called2.append(payload) or {"paused": True},
+        RunState(exec_mode="approval"), lambda *a, **k: None,
+        user_input="用配对模式")
+    _assert(r2 == "" and called2 == [], "指定配对模式：不弹窗、不暂停")
+    _assert(p2["steps"][0]["params"].get("composite") == "pair",
+            "data_acquisition 以 composite=pair 执行")
+
+    # 未指定：整月 + 有 pause_callback 时照旧弹窗
+    p3 = _plan()
+    payloads = []
+    r3 = ask_acquisition_mode_if_month(
+        p3, lambda payload: payloads.append(payload) or
+        {"paused": False, "data": {"option_id": Option.PAIR_MODE}},
+        RunState(exec_mode="approval"), lambda *a, **k: None,
+        user_input="做全流程")
+    _assert(len(payloads) == 1, "未指定时照旧弹窗询问")
+    _assert(p3["steps"][0]["params"].get("composite") == "pair",
+            "弹窗选择配对模式后写入 composite=pair")
+
+
+def test_monthly_mode_skips_popup():
+    print("[13] 用户指令提到「月度合成」→ 批准模式也不弹获取方式弹窗，直接月度合成")
+    tmp = tempfile.mkdtemp(prefix="roles_monthly_")
+    try:
+        env = _Env(tmp)
+        registry = _registry()
+        assistant = _FakeAssistant([
+            _intent("task", region="九江镇", time_expr="2025年7月"),
+            _plan_json(env.region_file), _reflect(),
+            _train_accept(), _eval_text(),
+        ])
+        agent = GeoThermoAgent(assistant, registry)
+        pause = _scripted_pause([
+            (Node.PLAN_CONFIRM, Option.START, {}),
+            (Node.TUNING_DECISION, Option.ACCEPT, {}),
+            (Node.FINAL_REPORT, Option.DONE, {}),
+            (Node.POSTPROCESS, Option.SKIP_POSTPROCESS, {}),
+        ])
+        out = env.run(agent, "对九江镇 2025 年 7 月做月度合成处理",
+                      exec_mode="approval", pause_callback=pause)
+        nodes = [p.get("node") for p in pause.seen if isinstance(p, dict) and p.get("node")]
+        _assert(Node.ACQUISITION_MODE not in nodes,
+                f"不弹影像获取方式弹窗（实际 {nodes}）")
+        _assert(PAUSE_MARKER not in out, "流程直接跑完，没有卡在获取方式询问")
+        acq = registry.get("data_acquisition")
+        _assert(any(c.get("composite") == "monthly" for c in acq.calls),
+                "data_acquisition 以月度合成模式执行（composite=monthly）")
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 if __name__ == "__main__":
     test_chat_does_not_run_skills()
     test_multi_turn_never_wuhan()
@@ -683,4 +777,6 @@ if __name__ == "__main__":
     test_feature_switch_off_uses_old_path()
     test_auto_tuning_rounds()
     test_reselect_pair_skips_replan()
+    test_acquisition_mode_hint_skips_popup()
+    test_monthly_mode_skips_popup()
     print("\n✅ 多角色路径端到端合成测试全部通过")

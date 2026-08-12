@@ -101,7 +101,7 @@ async function onRenameConfirm() {
 }
 
 async function onSelectConv(p, c) {
-  // 升级点 13：切换项目时 selectProject 会自动加载第一个对话；
+  // 切换项目时 selectProject 会自动加载第一个对话；
   // 已在同项目时直接 selectConv（内部会加载该对话消息/进度/恢复流）
   if (p.project !== project.currentProject) {
     await project.selectProject(p.project)

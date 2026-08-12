@@ -1,9 +1,13 @@
 """
-评估轻反思：表述把关 E-R1 – E-R6（技术方案 7.3）
+评估轻反思：表述把关 E-R1 – E-R7
 
-**这是评估 Agent 的核心价值：防止 AI 乱说。** 确定性规则优先，命中即打回重写。
-两次重写仍不过 → 降级为模板化报告（纯指标表 + 固定口径说明），
-绝不输出未通过检查的文案。
+报告的数字、评级、闭合口径句全部由系统确定性渲染，LLM 只写不含数字的定性短句，
+只需过 `check_disallowed` / `check_extreme_negativity` 两项轻校验（见 eval_agent）。
+
+本模块保留 E-R1 – E-R7 全套规则与确定性修复函数作为**已测试的工具库**：
+- 数字出处（E-R1）、空指标（E-R3）、评级一致（E-R5）、口径（E-R6）、结构（E-R7）
+  用于需要校验「带数字的自由文本」的场景；
+- `repair_draft` 等确定性修复可在自由文本必须保留时兜底修正。
 """
 
 import re
@@ -11,9 +15,6 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from .result import Action, ReflectionResult
 from .train_rules import grade
-
-# 解读文本重写上限
-EVAL_REWRITE_MAX = 2
 
 RULES = {
     "E-R1": "文本里出现的每个指标数值都要能在结果文件里找到对应值",
@@ -24,23 +25,6 @@ RULES = {
     "E-R6": "不得把闭合指标描述为精度",
     "E-R7": "报告必须结构完整、不得停在半句话（防止生成预算耗尽后原样输出半截稿）",
 }
-
-# 面向用户的规则短名。报告里说明「为什么降级」时用这些中文名而不是 E-Rx 编号：
-# 一是编号对用户没有信息量，二是「E-R2」含子串「R2」会被 E-R1 当成决定系数关键词。
-RULE_LABELS = {
-    "E-R1": "数字出处",
-    "E-R2": "禁用表述",
-    "E-R3": "空指标不得编造",
-    "E-R4": "极值差不得作为负面依据",
-    "E-R5": "评级一致性",
-    "E-R6": "口径不得混用",
-    "E-R7": "结构完整",
-}
-
-
-def rule_labels(rule_hits: Any) -> List[str]:
-    """把命中的规则编号转成面向用户的中文短名。"""
-    return [RULE_LABELS.get(r, r) for r in (rule_hits or ())]
 
 # E-R7：报告必备小节（对应领域知识 E09）
 REQUIRED_SECTIONS = ("产品概况", "模型精度", "闭合", "局限")
@@ -58,7 +42,12 @@ DISALLOWED_WHEN_CLOSURE_OK = ("产品不可用", "产品质量差")
 
 # E-R4 极值词 + 负面判断词
 EXTREME_WORDS = ("最大值", "最小值", "值域", "极值", "端点")
-NEGATIVE_WORDS = ("差", "不好", "不理想", "有问题", "不可靠", "不可用", "偏差大")
+# 注意不能放裸「差」：它是「温差」「差异」「差值」等合法领域词的一部分，
+# 极值句里写「低端温差 -11.74 K」会被误判成负面结论。
+# 负面判断用复合词表达，覆盖「偏差明显/较大/大」「质量差/表现差/精度差」等。
+NEGATIVE_WORDS = ("不好", "不理想", "有问题", "不可靠", "不可用",
+                  "偏差大", "偏差较大", "偏差明显", "质量差", "表现差",
+                  "精度差", "很差", "较差")
 
 # E-R5 评级词
 GRADE_WORDS = ("优秀", "良好", "合格", "偏低")
@@ -98,7 +87,7 @@ def build_allowed_values(bundle: Dict[str, Any]) -> Dict[str, List[float]]:
     """从真实结果里组装「允许值表」（E-R1 的比对依据）。
 
     bundle 形状（缺项自动跳过）：
-      test_metrics / train_metrics / independent_prediction / closure / lst_stats
+      test_metrics / train_metrics / closure / lst_stats
     """
     allowed: Dict[str, List[float]] = {k: [] for k in METRIC_KEYWORDS}
 
@@ -114,19 +103,6 @@ def build_allowed_values(bundle: Dict[str, Any]) -> Dict[str, List[float]]:
         push("rmse", source.get("RMSE"))
         push("mae", source.get("MAE"))
         push("mb", source.get("MB"))
-
-    # 独立预测结果可能是「指标在 metrics 子字典里」的原始形状，两种都要认，
-    # 否则文本里写对了的独立预测数值会被 E-R1 误判成编造
-    indep = dict(bundle.get("independent_prediction") or {})
-    nested = indep.get("metrics")
-    if isinstance(nested, dict):
-        for key, value in nested.items():
-            indep.setdefault(key, value)
-    push("r2", indep.get("R2"))
-    push("rmse", indep.get("RMSE_K"))
-    push("mae", indep.get("MAE_K"))
-    push("mb", indep.get("MB_K"))
-    push("count", indep.get("n_samples"))
 
     closure = bundle.get("closure") or {}
     closure_metrics = closure.get("metrics") or {}
@@ -149,7 +125,7 @@ def build_allowed_values(bundle: Dict[str, Any]) -> Dict[str, List[float]]:
     push("count", size.get("height"))
     push("count", size.get("width"))
 
-    # 热约束残差统计（技术方案 7.1 列为评估要读的来源之一）：
+    # 热约束残差统计（列为评估要读的来源之一）：
     # 事实清单里给了这几个数，允许值表就必须收录，否则写对了也会被判成编造
     tcr = bundle.get("tcr_statistics") or {}
     push("mb", tcr.get("mean"))
@@ -174,7 +150,7 @@ def _last_keyword_pos(window: str, keyword: str) -> int:
     """window 中该关键词最后一次**合法**出现的位置；找不到返回 -1。
 
     「R2」会作为子串出现在规则编号「E-R2」里，那不是指标关键词，必须排除，
-    否则编号里的数字会被当成编造的决定系数（真实踩过的坑）。
+    否则编号里的数字会被当成编造的决定系数。
     """
     end = len(window)
     while True:
@@ -187,9 +163,23 @@ def _last_keyword_pos(window: str, keyword: str) -> int:
         end = pos
 
 
+_SENTENCE_SEPS = ("。", "；", "，", "\n")
+
+
 def _group_for(text: str, start: int) -> Optional[str]:
-    """数值前 _KEYWORD_WINDOW 个字符内最靠近的指标关键词所属分组。"""
-    window = text[max(0, start - _KEYWORD_WINDOW):start]
+    """数值前 _KEYWORD_WINDOW 个字符内最靠近的指标关键词所属分组。
+
+    窗口按**句内**截断：只取从最近一个句子分隔符（。；，换行）到数字前的片段，
+    避免把上一句的指标关键词（如「占比 82.0%。影像 15,477 行」里的「占比」）
+    误归到当前数字上——那样会把合法的行列号、像元数误判成编造。
+    """
+    window_start = max(0, start - _KEYWORD_WINDOW)
+    window = text[window_start:start]
+    for sep in _SENTENCE_SEPS:
+        pos = window.rfind(sep)
+        if pos >= 0:
+            window = window[pos + 1:]
+            break
     best_group, best_pos = None, -1
     for group, keywords in METRIC_KEYWORDS.items():
         for kw in keywords:
@@ -217,7 +207,12 @@ def check_numbers(text: str, allowed: Dict[str, List[float]]) -> List[str]:
         digits = _decimals(raw)
         tolerance = 0.5 * (10 ** -digits) + 1e-9
         if not any(abs(value - c) <= tolerance for c in candidates):
-            problems.append(f"文本里的{group_label(group)} {raw} 与结果文件不一致")
+            # 附上数字前文片段（最近几个字），方便 LLM 重写时精确定位到出错的那处
+            start = max(0, match.start() - 12)
+            context = text[start:match.start()].strip()
+            context = context[-10:] if len(context) > 10 else context
+            problems.append(f"文本里的{group_label(group)} {raw}"
+                            f"（…{context}）与结果文件不一致")
     return problems
 
 
@@ -227,7 +222,7 @@ def group_label(group: str) -> str:
 
 
 # 显式否定词：禁用表述出现在否定语境里是允许的。
-# 技术方案 7.4 要求正文必须写「不是 10 米精度，也不代表能量守恒」，
+# 要求正文必须写「不是 10 米精度，也不代表能量守恒」，
 # 若把这些词一律硬禁，必需的口径说明反而写不出来。
 NEGATION_WORDS = ("不是", "不代表", "并非", "而非", "不等于", "不能说", "无法保证",
                   "不宣称", "不意味")
@@ -557,8 +552,34 @@ def repair_grade(text: str, expected: str) -> str:
     return body
 
 
+# E-R4 确定性修复：把「以极值差为依据的负面结论」句替换为领域约定 E03 的标准表述。
+# 触发条件与 check_extreme_negativity 一致（闭合正常 + 同句出现极值词与负面词）。
+# 替换目标是**整句**：负面句里的数字/措辞本身是违规的一部分，保句不保措辞，
+# 避免「越修越错」。E03 表述不含负面判断词，替换后可通过 E-R4 复查。
+_EXTREME_NEGATIVE_REPLACEMENT = (
+    "十米产品的最小值更低、最大值更高，是分辨率提升的预期表现"
+    "（混合像元分解与尺度效应），不是产品质量问题"
+)
+
+
+def repair_extreme_negativity(text: str, closure_ok: bool) -> str:
+    """E-R4 兜底：把极值差负面结论句替换为 E03 的中性标准表述。"""
+    if not closure_ok or not text:
+        return text or ""
+    parts = re.split(r"(?<=[。；\n])", text)
+    out: List[str] = []
+    for sentence in parts:
+        if any(word in sentence for word in EXTREME_WORDS) and \
+                any(word in sentence for word in NEGATIVE_WORDS):
+            out.append(_EXTREME_NEGATIVE_REPLACEMENT + "。")
+        else:
+            out.append(sentence)
+    return "".join(out)
+
+
 def repair_draft(text: str, bundle: Optional[dict] = None) -> str:
-    """确定性修复：数字对齐 → 禁用词替换 → 闭合口径修复 → 结构补齐 → 评级对齐。
+    """确定性修复：数字对齐 → 禁用词替换 → 极值负面句中性化 → 闭合口径修复 →
+    结构补齐 → 评级对齐。
 
     修复后通常直接通过全部规则；仅当仍不过（如编造了远离真实值的数字）
     才进入重写/降级流程。
@@ -571,6 +592,7 @@ def repair_draft(text: str, bundle: Optional[dict] = None) -> str:
     closure_ok = closure_is_normal(closure.get("metrics"))
     text = repair_numbers(text, allowed)
     text = repair_disallowed(text, closure_ok)
+    text = repair_extreme_negativity(text, closure_ok)
     text = repair_closure_wording(text)
     text = repair_structure(text)
     text = repair_grade(text, grade((bundle.get("test_metrics") or {}).get("R2")))

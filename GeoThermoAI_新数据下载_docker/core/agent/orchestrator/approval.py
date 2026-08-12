@@ -1,5 +1,5 @@
 """
-审批节点定义、暂停载荷构造、恢复结果解析（技术方案 3.2 / 3.3）
+审批节点定义、暂停载荷构造、恢复结果解析
 
 设计要点：
 - 现有 `select_pair` 载荷保持不变（前端 PairSelectCard 继续可用），只在每个 pair 上
@@ -12,6 +12,7 @@
 from typing import Any, Dict, List, Optional, Tuple
 
 from .exec_mode import ExecMode, is_auto
+from .. import presentation
 
 # ── 审批节点 id ────────────────────────────────────────────────────
 
@@ -56,7 +57,7 @@ class Option:
     MONTHLY_MODE = "monthly_mode" # 影像获取：月度合成模式（该月影像合成一张）
 
 
-# AUTO（完全执行）模式下各节点的默认策略（技术方案 3.2 最后一列）。
+# AUTO（完全执行）模式下各节点的默认策略。
 # 值为 None 表示该节点在 AUTO 模式下**根本不暂停**（由规则自动决定）。
 AUTO_DEFAULT_STRATEGY: Dict[str, Optional[str]] = {
     Node.PLAN_CONFIRM: Option.START,
@@ -81,7 +82,7 @@ def should_pause(node: str, exec_mode: str) -> bool:
     """该节点在当前模式下是否需要真的暂停询问用户。
 
     由我批准模式下所有节点都要停（含 tuning_decision / tuning_round，
-    无论精度好坏都要询问并报告结果——技术方案 3.2 的用户明确要求）。
+    无论精度好坏都要询问并报告结果——用户明确要求）。
     """
     if not is_auto(exec_mode):
         return True
@@ -109,24 +110,47 @@ def option(option_id: str, label: str, recommended: bool = False,
 
 def build(node: str, title: str, summary: str, options: List[dict],
           default_option: str = "") -> dict:
-    """组装通用审批载荷。default_option 缺省时取第一个 recommended，否则第一项。"""
+    """组装通用审批载荷。default_option 缺省时取第一个 recommended，否则第一项。
+
+    弹窗文案统一数字两侧空格（与气泡同一规则），保证「第 2 轮」「最多再训练 5 轮」
+    这类写法在弹窗与气泡里一致。
+    """
     if not options:
         raise ValueError("审批载荷至少需要一个选项")
     if not default_option:
         recommended = [o["id"] for o in options if o.get("recommended")]
         default_option = recommended[0] if recommended else options[0]["id"]
+    _norm = presentation.normalize_number_spacing
+    normalized_options: List[dict] = []
+    for o in options:
+        item = dict(o)
+        if item.get("label"):
+            item["label"] = _norm(item["label"])
+        if item.get("hint"):
+            item["hint"] = _norm(item["hint"])
+        if item.get("fields"):
+            fields = []
+            for f in item["fields"]:
+                field = dict(f)
+                if field.get("label"):
+                    field["label"] = _norm(field["label"])
+                if field.get("description"):
+                    field["description"] = _norm(field["description"])
+                fields.append(field)
+            item["fields"] = fields
+        normalized_options.append(item)
     return {
         "type": "approval",
         "node": node,
-        "title": title,
-        "summary": summary,
-        "options": options,
+        "title": _norm(title),
+        "summary": _norm(summary),
+        "options": normalized_options,
         "default_option": default_option,
     }
 
 
 def hyperparameter_fields(skill: Any) -> List[dict]:
-    """从 Skill 的 hyperparameters 动态生成表单字段（技术方案 3.3）。"""
+    """从 Skill 的 hyperparameters 动态生成表单字段。"""
     fields: List[dict] = []
     for hp in getattr(skill, "hyperparameters", []) or []:
         name = getattr(hp, "name", "")
@@ -185,11 +209,11 @@ def build_no_pair(summary: str, exclude_reselect: bool = False) -> dict:
 def build_data_quality(summary: str, exclude_reselect: bool = False) -> dict:
     options = []
     if not exclude_reselect:
-        # 升级点 12：所有影像对都已尝试过时，不再推荐"重新选择影像组合"
+        # 所有影像对都已尝试过时，不再推荐"重新选择影像组合"
         options.append(option(Option.RESELECT_PAIR, "重新选择影像组合", recommended=True,
                               hint="回到影像组合选择，换一组云量更低的重跑"))
     options.append(option(Option.REPLAN, "换时间或地区，重新规划"))
-    # v1.2 新增：检查规则本身也可能有误判，用户比系统更清楚这批数据能不能用
+    # 检查规则本身也可能有误判，用户比系统更清楚这批数据能不能用
     options.append(option(Option.ACCEPT, "我接受现状，继续执行",
                           hint="忽略本次检查未通过的提示，直接进入模型训练"))
     options.append(option(Option.STOP, "先停下来"))
@@ -212,7 +236,7 @@ def build_tuning_decision(summary: str, fields: Optional[List[dict]] = None,
         option(Option.ACCEPT, "接受当前结果，继续下一步"),
     ]
     if not exclude_reselect:
-        # 升级点 12：所有影像对都已尝试过时，不再提示"重新选择影像组合"
+        # 所有影像对都已尝试过时，不再提示"重新选择影像组合"
         options.append(option(Option.RESELECT_PAIR, "重新选择影像组合"))
     options.append(option(Option.REPLAN, "换时间或地区，重新规划"))
     return build(
@@ -223,8 +247,12 @@ def build_tuning_decision(summary: str, fields: Optional[List[dict]] = None,
     )
 
 
-def build_tuning_round(summary: str, is_last_round: bool = False) -> dict:
+def build_tuning_round(summary: str, is_last_round: bool = False,
+                       fields: Optional[List[dict]] = None) -> dict:
     options = [option(Option.ACCEPT, "接受本轮结果", recommended=is_last_round)]
+    # 每一轮调优都允许用户手动设置参数（AI 连续轮数上限只约束 AI 调优，
+    # 手动调参不占 AI 额度；选择后按用户参数重训一轮）
+    options.append(option(Option.MANUAL_TUNE, "我自己设置参数", fields=fields or []))
     if not is_last_round:
         options.append(option(Option.NEXT_ROUND, "继续下一轮", recommended=True,
                               hint="按规则给出的方向再调一次参数并重训"))
@@ -250,7 +278,7 @@ def build_postprocess(summary: str) -> dict:
     """结果后处理（可选）提问：是否对 10m LST 做空洞填补。
 
     云像元在预处理阶段被扣除，10m 地表温度产品存在空洞；填洞只估计空洞
-    像元、不改变无云区数值，输出带空洞掩膜的完整产品（升级点：结果后处理）。
+    像元、不改变无云区数值，输出带空洞掩膜的完整产品（结果后处理）。
     """
     return build(
         Node.POSTPROCESS,

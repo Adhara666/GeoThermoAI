@@ -1,12 +1,12 @@
 """
-可复用工作流经验（技术方案 8.3）
+可复用工作流经验
 
 `memory/projects/{project_id}/workflows.json`：一条记录 = 一次「靠谱」的完整流程。
 规划 Agent 处理新任务时若检索到同区域的可复用工作流，会沿用其最终参数与云量阈值。
 
 写入条件（三个都满足才写，这是「靠谱」的定义）：
 1. 整体状态为 success；
-2. 评估轻反思全部通过（没有降级为模板报告）；
+2. 评估通过（报告由系统组装 + LLM 定性短句，始终完整，视为通过）；
 3. 测试集 R² ≥ WORKFLOW_MIN_R2（0.75，K24 的合格下限）。
 """
 
@@ -31,7 +31,7 @@ WORKFLOW_MIN_R2 = 0.75
 
 
 def should_write(*, status: str, eval_passed: bool, test_r2: Any) -> bool:
-    """三个写入条件的唯一判据（技术方案 8.3）。"""
+    """三个写入条件的唯一判据。"""
     if status != "success" or not eval_passed:
         return False
     try:
@@ -52,7 +52,7 @@ def build_record(*, project_id: str, experiment_id: str, conv_id: str, region: s
                  metrics: Optional[dict] = None,
                  approval_choices: Optional[dict] = None,
                  verdict: str = "good") -> Dict[str, Any]:
-    """组装一条工作流记录（形状见技术方案 8.3）。"""
+    """组装一条工作流记录（形状）。"""
     trace = list(tuning_trace or [])
     return {
         "schema_version": WORKFLOW_SCHEMA_VERSION,

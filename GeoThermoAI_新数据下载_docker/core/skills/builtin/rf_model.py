@@ -3,13 +3,10 @@
 
     - 训练参数采用"默认值 + 白名单覆盖"：仅使用白名单内的超参数（含
       random_state/max_features），n_jobs 按容器 CPU 配额解析；
-    - 测试集推理完成后，调用 evaluate_independent_prediction() 写出固定
-      independent_prediction.json（独立预测协议）。Agent 的 7 阶段固定工作流
-      没有单独的"独立预测评估"步骤，因此该产物作为 rf_model 阶段的附加产物
-      一并写出，不新增 Agent 工作流步骤名。
+    - 测试集推理完成后给出测试集评估指标（R²/RMSE/MAE/MB），
+      与训练阶段同为 rf_model 阶段产物。
 """
 
-import json
 import os
 from typing import Any, Dict, List
 
@@ -20,7 +17,7 @@ from ...stage_rebuild import ensure_stage_inputs
 
 
 class RFModelSkill(BaseSkill):
-    """随机森林回归模型训练与测试集预测 + 独立预测评估"""
+    """随机森林回归模型训练与测试集预测"""
 
     @property
     def name(self) -> str:
@@ -32,14 +29,14 @@ class RFModelSkill(BaseSkill):
 
     @property
     def description(self) -> str:
-        return "融合多光谱、遥感指数、地形因子等多特征进行LST降尺度模型训练与预测，输出模型文件、评估指标（R²/RMSE/MAE/MB）、特征重要性排序和独立预测协议JSON。"
+        return "融合多光谱、遥感指数、地形因子等多特征进行LST降尺度模型训练与预测，输出模型文件、评估指标（R²/RMSE/MAE/MB）和特征重要性排序。"
 
     @property
     def parameters(self) -> List[SkillParameter]:
         return [
-            SkillParameter(name="train_csv", type="file_path", description="训练集CSV路径（需包含TTRI列）", required=True),
-            SkillParameter(name="val_csv", type="file_path", description="验证集CSV路径（需包含TTRI列）", required=True),
-            SkillParameter(name="test_csv", type="file_path", description="测试集CSV路径（需包含TTRI列）", required=True),
+            SkillParameter(name="train_csv", type="file_path", description="训练集Parquet路径（需包含TTRI列）", required=True),
+            SkillParameter(name="val_csv", type="file_path", description="验证集Parquet路径（需包含TTRI列）", required=True),
+            SkillParameter(name="test_csv", type="file_path", description="测试集Parquet路径（需包含TTRI列）", required=True),
             SkillParameter(name="output_dir", type="file_path", description="输出目录路径", required=True),
             SkillParameter(name="n_estimators", type="number", description="决策树数量", required=False, default=200),
             SkillParameter(name="max_depth", type="number", description="最大深度", required=False, default=25),
@@ -69,9 +66,9 @@ class RFModelSkill(BaseSkill):
     @property
     def input_schema(self) -> Dict[str, str]:
         return {
-            "train_csv": "训练集CSV路径",
-            "val_csv": "验证集CSV路径",
-            "test_csv": "测试集CSV路径",
+            "train_csv": "训练集Parquet路径",
+            "val_csv": "验证集Parquet路径",
+            "test_csv": "测试集Parquet路径",
             "output_dir": "输出目录",
         }
 
@@ -83,7 +80,6 @@ class RFModelSkill(BaseSkill):
             "test_metrics": "测试集评估指标（含MB）",
             "metrics_path": "指标JSON路径",
             "feature_importance": "特征重要性列表",
-            "independent_prediction_path": "独立预测协议JSON路径",
         }
 
     def execute(
@@ -92,7 +88,7 @@ class RFModelSkill(BaseSkill):
         progress_callback=None,
         log_callback=None,
     ) -> SkillResult:
-        """执行随机森林训练、测试集预测和独立预测评估。"""
+        """执行随机森林训练和测试集预测。"""
         train_csv = params.get("train_csv", "")
         val_csv = params.get("val_csv", "")
         test_csv = params.get("test_csv", "")
@@ -115,7 +111,6 @@ class RFModelSkill(BaseSkill):
 
         try:
             from ...rf_model import train_random_forest, predict_test_set
-            from ...evaluation import evaluate_independent_prediction
         except ImportError:
             return SkillResult(success=False, message="无法导入RF模型/评估模块")
 
@@ -171,26 +166,6 @@ class RFModelSkill(BaseSkill):
         except Exception as e:
             return SkillResult(success=False, message=f"测试集预测失败: {e}")
 
-        # ── 步骤3: 独立预测评估 ──────────────────────────────────────
-        # Agent 固定 7 阶段工作流未单列该步骤，作为 rf_model 阶段的附加产物写出。
-        split_info = None
-        _split_info_path = os.path.join(os.path.dirname(train_csv), "split_info.json")
-        if os.path.isfile(_split_info_path):
-            try:
-                with open(_split_info_path, "r", encoding="utf-8") as f:
-                    split_info = json.load(f)
-            except Exception:
-                pass
-
-        try:
-            independent_result = evaluate_independent_prediction(
-                test_csv=test_csv, model_path=model_path,
-                output_dir=output_dir, split_info=split_info,
-                progress_callback=progress_callback,
-            )
-        except Exception as e:
-            return SkillResult(success=False, message=f"独立预测评估失败: {e}")
-
         result_data = {
             "model_path": model_path,
             "train_metrics": train_result.get("metrics", {}),
@@ -200,15 +175,10 @@ class RFModelSkill(BaseSkill):
             "features": train_result.get("features", []),
             "params": train_result.get("params", {}),
             "train_time_seconds": train_result.get("train_time_seconds", 0),
-            "independent_prediction_path": independent_result.get("output_path", ""),
-            "independent_prediction": {
-                k: v for k, v in independent_result.items()
-                if k not in ("output_path",)
-            },
         }
 
         artifacts = [model_path, train_result.get("metrics_path", ""),
-                    test_result.get("output_path", ""), independent_result.get("output_path", "")]
+                    test_result.get("output_path", "")]
         artifacts = [a for a in artifacts if a]
 
         project_root = run_manifest.project_root_from_stage_output_dir(output_dir)
@@ -218,7 +188,6 @@ class RFModelSkill(BaseSkill):
                 artifacts={
                     "model_path": model_path, "metrics_path": train_result.get("metrics_path", ""),
                     "test_metrics_path": test_result.get("output_path", ""),
-                    "independent_prediction_path": independent_result.get("output_path", ""),
                 },
                 stats={
                     "train_metrics": train_result.get("metrics", {}),
@@ -226,7 +195,7 @@ class RFModelSkill(BaseSkill):
                     "params": train_result.get("params", {}),
                 },
             )
-            # 训练+测试预测+独立评估完成后，train/val/test 划分 CSV 已无下游消费方，立即清理。
+            # 训练+测试集预测完成后，train/val/test 划分 Parquet 已无下游消费方，立即清理。
             # defer_cleanup=True 时跳过清理（多轮调优期间由训练 Agent 在接受最终结果后
             # 显式清理一次），避免每轮都触发昂贵的 ensure_stage_inputs 重建。
             # 未传该参数时行为与改造前完全一致。
@@ -237,7 +206,7 @@ class RFModelSkill(BaseSkill):
         test_m = test_result.get("metrics", {})
 
         if progress_callback:
-            progress_callback("rf_model", 1.0, "训练+预测+独立评估完成")
+            progress_callback("rf_model", 1.0, "训练+预测完成")
 
         return SkillResult(
             success=True,

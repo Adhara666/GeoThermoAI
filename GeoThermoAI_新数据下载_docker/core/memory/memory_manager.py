@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 _FALLBACK_KNOWLEDGE_IDS = ["K01", "K02", "K03", "K04", "K06", "K07", "K10", "K11", "K12",
                            "K13", "K20", "K21", "K22", "K23", "K24"]
 
-# 按角色定制的检索范围（技术方案 8.4c）。
+# 按角色定制的检索范围。
 # 过滤键用 `domain` / `kid` 这类**标量**字段：tags 在 metadata 里存成逗号拼接串，
 # `$in` 对它做不了包含匹配。
 ROLE_RETRIEVAL: Dict[str, Dict[str, Any]] = {
@@ -69,7 +69,7 @@ class MemoryManager:
         return ExperimentLog(str(self.project_memory_dir(project_id) / "experiments.json"))
 
     def load_used_pairs(self, project_id: str) -> set:
-        """该项目历史使用过的影像对 key 集合（升级点 1/12）。
+        """该项目历史使用过的影像对 key 集合。
 
         从 experiments.json 提取每次实验的 pair（landsat_date + sentinel2_date），
         用于「已尝试过的影像对不再作为推荐 / 不再提示换对」。key 形如
@@ -95,12 +95,12 @@ class MemoryManager:
         return Preferences(str(self.project_memory_dir(project_id) / "preferences.json"))
 
     def session_state(self, conv_id: str, project_id: str = "") -> SessionState:
-        """对话级槽位状态（技术方案 8.2）。"""
+        """对话级槽位状态。"""
         return SessionState(str(self._sessions_dir / f"{conv_id}.json"),
                             conv_id=conv_id, project_id=project_id)
 
     def workflows(self, project_id: str) -> WorkflowExperience:
-        """可复用工作流经验（技术方案 8.3）。"""
+        """可复用工作流经验。"""
         return WorkflowExperience(str(self.project_memory_dir(project_id) / "workflows.json"))
 
     # ── 播种：全局领域知识（按 id 增量） ─────────────────────────
@@ -108,7 +108,7 @@ class MemoryManager:
     def ensure_seeded(self) -> None:
         """播种 global_knowledge；knowledge_seed.json 落盘供审计。
 
-        技术方案 8.4a 的两处修复：
+        两处修复：
         1. 种子文件的落盘条件从「文件不存在」改为「文件不存在 或 schema_version 不一致」，
            升级后老环境的审计文件也会刷新；
         2. `save_knowledge` 改为按 id 增量 upsert，新增条目（E 系列）在老环境也能灌入。
@@ -194,9 +194,6 @@ class MemoryManager:
         params = record.get("params", {}) or {}
         if params:
             parts.append(f"生效参数 {json.dumps(params, ensure_ascii=False)}")
-        indep = record.get("independent_prediction", {}) or {}
-        if indep:
-            parts.append(f"独立预测 n={indep.get('n_samples', '?')} R²={indep.get('R2')}")
         closure = record.get("closure", {}) or {}
         if closure:
             cm = closure.get("metrics", {}) or {}
@@ -315,7 +312,7 @@ class MemoryManager:
     # ── 读取：按角色定制的注入（enrich_prompt 保持原样不动） ──────
 
     def enrich_for_role(self, project_id: str, role: str, query: str) -> str:
-        """按角色定制的记忆注入（技术方案 8.4c）；role 未知时退化为 enrich_prompt。"""
+        """按角色定制的记忆注入；role 未知时退化为 enrich_prompt。"""
         config = ROLE_RETRIEVAL.get(role)
         if config is None:
             return self.enrich_prompt(project_id, query)
@@ -382,7 +379,7 @@ class MemoryManager:
                          f"测试集 R²={metrics.get('test_r2')}")
         return "## 该项目可复用的成功流程\n" + "\n".join(lines)
 
-    # ── 写入：可复用工作流经验（技术方案 8.3） ───────────────────
+    # ── 写入：可复用工作流经验 ───────────────────
 
     def save_workflow(self, project_id: str, record: Dict[str, Any]) -> None:
         """双写 workflows.json + ChromaDB 段落（metadata 带 kind="workflow"）。"""
@@ -432,7 +429,7 @@ class MemoryManager:
 
     def delete_conversation(self, project_id: str, conv_id: str) -> None:
         """删除对话：experiments.json 与 workflows.json 删该 conv 记录
-        + ChromaDB 删该 conv 条目 + 删该对话的会话槽位状态（技术方案 8.2/8.3 级联约定）。"""
+        + ChromaDB 删该 conv 条目 + 删该对话的会话槽位状态（级联约定）。"""
         try:
             self.experiment_log(project_id).delete_by_conv(conv_id)
         except Exception as e:

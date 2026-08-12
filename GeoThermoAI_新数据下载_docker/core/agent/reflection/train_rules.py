@@ -1,5 +1,5 @@
 """
-训练主反思：七条规则兜底（技术方案 6.2）
+训练主反思：七条规则兜底
 
 决策顺序：LLM 先给 `{action, reason, new_params}`，再按 R1→R7 逐条修正，
 **规则永远覆盖 LLM**；每次覆盖都记进 `rule_hits`，供气泡与报告标注「[规则] R3」。
@@ -59,7 +59,7 @@ class Decision:
 
 
 def resolve_max_rounds(configured: Optional[Any] = None) -> int:
-    """生效上限 = clamp(配置值 或 默认 5, 1, MAX_TUNING_ROUNDS)（拍板结论 4）。"""
+    """生效上限 = clamp(配置值 或 默认 5, 1, MAX_TUNING_ROUNDS)。"""
     try:
         value = int(configured) if configured is not None else DEFAULT_TUNING_ROUNDS
     except (TypeError, ValueError):
@@ -228,16 +228,29 @@ def rule_safeguard(llm_decision: Optional[Dict[str, Any]],
     context 需含：
       rounds        已完成各轮的指标列表 [{round, params, train_r2, test_r2, rmse}]
       current       本轮指标 {train_r2, test_r2, rmse, params}
-      max_rounds    生效轮数上限
+      max_rounds    生效轮数上限（AI 连续调优轮数，不含初始训练轮）
+      ai_rounds     连续 AI 调优轮数（手动调优轮不占额度且会重置）；缺省时回退旧语义
     """
     rounds = list(context.get("rounds") or [])
     current = dict(context.get("current") or {})
     max_rounds = resolve_max_rounds(context.get("max_rounds"))
 
+    # 轮数上限是否已命中：按连续 AI 调优轮数判定（手动轮不占额度、会重置计数）；
+    # 未传 ai_rounds 的旧调用方回退「已完成轮数 + 即将进行的一轮 达到上限」的原语义。
+    ai_raw = context.get("ai_rounds")
+    if ai_raw is None:
+        _limit_hit = len(rounds) + 1 >= max_rounds
+    else:
+        try:
+            _limit_hit = int(ai_raw) >= max_rounds
+        except (TypeError, ValueError):
+            _limit_hit = len(rounds) + 1 >= max_rounds
+
     decision = dict(llm_decision or {})
     action = decision.get("action")
     if action not in Decision.ALL:
-        action = Decision.ADJUST if len(rounds) < max_rounds else Decision.STOP
+        # LLM 不可用/未给出动作时默认继续调优，是否停止统一交给 R1–R7 判定
+        action = Decision.ADJUST
     reason = str(decision.get("reason") or "")
     new_params = dict(decision.get("new_params") or {})
     rule_hits: List[str] = []
@@ -302,11 +315,12 @@ def rule_safeguard(llm_decision: Optional[Dict[str, Any]],
         action = Decision.STOP
         rule_hits.extend(stop_rules)
 
-    # R7：轮数达到生效上限
-    if action == Decision.ADJUST and len(rounds) + 1 >= max_rounds:
+    # R7：AI 连续调优轮数达到生效上限 → 强制停止（_limit_hit 已在函数开头计算，
+    # 语义：上限只统计连续 AI 调优轮，初始训练轮不算，手动调优轮不占额度且会重置）
+    if action == Decision.ADJUST and _limit_hit:
         action = Decision.STOP
         rule_hits.append("R7")
-        notes.append(f"调优轮数已达上限 {max_rounds} 轮，取误差最小的一轮作为最终结果")
+        notes.append(f"AI 调优轮数已达上限 {max_rounds} 轮，取误差最小的一轮作为最终结果")
 
     if action == Decision.ADJUST and not new_params:
         # LLM 没给新参数又要继续 → 视为无从调整，按接受处理，避免空转
@@ -322,11 +336,11 @@ def rule_safeguard(llm_decision: Optional[Dict[str, Any]],
     }
 
 
-# ── 主反思的额外检查项（技术方案 6.3，只影响上下文与报告） ─────────
+# ── 主反思的额外检查项（只影响上下文与报告） ─────────
 
 def advisory_notes(data_features: Optional[dict],
                    rf_data: Optional[dict]) -> List[str]:
-    """样本量/地形/温度变异/植被/特征重要性/独立预测一致性的提示。"""
+    """样本量/地形/温度变异/植被/特征重要性的提示。"""
     features = data_features or {}
     rf = rf_data or {}
     notes: List[str] = []
@@ -359,11 +373,5 @@ def advisory_notes(data_features: Optional[dict],
     ttri = importance.get("TTRI")
     if isinstance(ttri, (int, float)) and ttri < 0.01:
         notes.append("地形热响应指数贡献极低，需检查 DEM 数据是否正常")
-
-    indep = (rf.get("independent_prediction") or {}).get("R2")
-    test_r2 = (rf.get("test_metrics") or {}).get("R2")
-    if isinstance(indep, (int, float)) and isinstance(test_r2, (int, float)):
-        if abs(float(test_r2) - float(indep)) > 0.10:
-            notes.append("独立预测精度与测试集精度差距较大，空间泛化不够稳定")
 
     return notes

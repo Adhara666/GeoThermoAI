@@ -29,6 +29,8 @@ async function boot() {
   // 自动加载第一个对话的消息
   if (project.currentProject && project.currentConv) {
     await chat.loadMessages(project.currentProject, project.currentConv)
+    // 刷新后若该对话仍有正在运行的流：恢复最新气泡/日志并重新订阅 SSE，保持连续性
+    await chat.resumeIfStreaming(project.currentConv)
     await chat.refreshWorkflow(project.currentConv)
   }
   loggedIn.value = true

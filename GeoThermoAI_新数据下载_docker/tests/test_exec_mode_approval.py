@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-执行模式与审批协议合成测试（技术方案 11.2）
+执行模式与审批协议合成测试
 
 运行：python tests/test_exec_mode_approval.py
 覆盖：
@@ -63,7 +63,7 @@ def test_pause_policy():
 
 
 def test_auto_strategy():
-    print("[3] AUTO 模式各节点默认策略（技术方案 3.2）")
+    print("[3] AUTO 模式各节点默认策略")
     expected = {
         Node.PLAN_CONFIRM: Option.START,
         Node.PAIR_SELECTION: None,
@@ -210,7 +210,7 @@ def test_agent_config():
     cfg = agent_config.resolve(None)
     _assert(cfg["roles_enabled"] is agent_config.AGENT_DEFAULTS["roles_enabled"],
             "缺配置时取代码默认（特性开关）")
-    _assert(cfg["tuning_max_rounds"] == 5, "调优轮数默认 5（拍板结论 4）")
+    _assert(cfg["tuning_max_rounds"] == 5, "调优轮数默认 5")
     _assert(agent_config.MAX_TUNING_ROUNDS == 8, "调优轮数硬上限 8")
 
     cfg = agent_config.resolve({"agent": {"tuning_max_rounds": 100}})
@@ -298,7 +298,7 @@ def test_chat_resume_protocols():
 
 
 def test_pause_timeout_suspends():
-    print("[10] 超时挂起而非静默选第一组（拍板结论 1）")
+    print("[10] 超时挂起而非静默选第一组")
     import server
 
     # 用极短超时验证语义：角色路径超时 → paused=True；旧路径超时 → 静默选 pairs[0]

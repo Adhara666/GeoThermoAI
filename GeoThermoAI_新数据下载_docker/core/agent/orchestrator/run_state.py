@@ -1,5 +1,5 @@
 """
-流程状态机 RunState（技术方案 2.2 / 3.5）
+流程状态机 RunState
 
 记录：当前阶段、replan 计数、暂停点、断点（阶段内回退用）、审批选择轨迹、调优轮次。
 只有总调度写它，子 Agent 只读。
@@ -75,7 +75,7 @@ class RunState:
     # ── replan ─────────────────────────────────────────────────────
 
     def can_replan(self) -> bool:
-        """是否还允许自动 replan（技术方案 2.4 规则 4 / 规则 P6）。"""
+        """是否还允许自动 replan（规则 4 / 规则 P6）。"""
         return self.replan_count < self.replan_max
 
     def note_replan(self, reason: str) -> int:

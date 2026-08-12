@@ -1,5 +1,5 @@
 """
-数据下载与预处理 Agent（技术方案第 5 章）
+数据下载与预处理 Agent
 
 覆盖 `data_acquisition` + `data_pipeline` + `ttri_compute` 三个 Skill。
 
@@ -16,7 +16,7 @@ from ..reflection.result import Action, ReflectionResult
 from .base_role import RoleAgent
 from .prompts import data as data_prompts
 
-# 配对质量评分权重（技术方案 5.2）
+# 配对质量评分权重
 PAIR_WEIGHTS = {"cloud": 0.45, "coverage": 0.30, "time_diff": 0.15, "scene_count": 0.10}
 
 # 配对规则上限就是 2 天（领域知识 K13）
@@ -88,7 +88,7 @@ def score_pair(pair: dict) -> Tuple[float, List[str]]:
 
 
 def pair_key(pair: dict) -> str:
-    """配对唯一标识：Landsat 日期_Sentinel 日期（YYYYMMDD_YYYYMMDD，升级点 1/12）。"""
+    """配对唯一标识：Landsat 日期_Sentinel 日期（YYYYMMDD_YYYYMMDD）。"""
     if not isinstance(pair, dict):
         return ""
     l = str(pair.get("landsat_date") or "").replace("-", "")[:8]
@@ -103,7 +103,7 @@ def rank_pairs(pairs: List[dict], used_pairs=None) -> List[dict]:
     只加 `quality_score` / `quality_reasons` / `recommended` / `recommend_reason`
     四个字段，其余字段原样保留，前端旧组件继续可用。
 
-    升级点 1/12：`used_pairs` 为该项目历史已尝试过的配对 key 集合；
+    `used_pairs` 为该项目历史已尝试过的配对 key 集合；
     已尝试的对打 `tried=True` 且**不再参与推荐**（推荐标记只落在未尝试的最高分上）；
     若全部已尝试，则不给任何推荐标记（Agent 不应再提示换对）。
     """
@@ -134,7 +134,7 @@ def rank_pairs(pairs: List[dict], used_pairs=None) -> List[dict]:
             item["recommended"] = False
         out.append(item)
 
-    # 全部已尝试（升级点 12）：不再推荐任何一组
+    # 全部已尝试：不再推荐任何一组
     if out and not recommended_assigned:
         for item in out:
             item["recommended"] = False
@@ -168,14 +168,22 @@ class DataAgent(RoleAgent):
 
     @staticmethod
     def auto_select_note(pair: dict, index: int) -> str:
-        """自动选择时的气泡说明（中文、含理由）。"""
+        """自动选择时的气泡说明（中文、含理由 + 实际卫星与日期）。"""
+        from .. import presentation
+
         reason = pair.get("recommend_reason") or "综合质量最好"
+        l_date = pair.get("landsat_date")
+        s_date = pair.get("sentinel2_date")
+        if l_date and s_date:
+            sat = presentation.satellite_label(pair.get("landsat_satellite"))
+            return (f"已自动选择第 {index} 组：{sat} {l_date} 与 "
+                    f"Sentinel-2 {s_date}（{reason}）")
         return f"已自动选择第 {index} 组：{reason}"
 
     # ── 无合格配对 ─────────────────────────────────────────────────
 
     def no_pair_summary(self, detail: dict) -> str:
-        """说清「搜到了什么、为什么都不合格」（技术方案 5.2）。"""
+        """说清「搜到了什么、为什么都不合格」。"""
         from .. import presentation
 
         return presentation.no_pair_reason(detail).strip()
@@ -212,7 +220,7 @@ class DataAgent(RoleAgent):
         candidates = "\n".join(f"- {s}" for s in result.suggestions) or "- 无"
         parsed = self.call_json(
             data_prompts.reflect_prompt(findings, candidates),
-            # 实现期修订 v1.2：retry_once=False 只有一次机会，预算给足避免被截断
+            # retry_once=False 只有一次机会，预算给足避免被截断
             "请给出原因与建议。", temperature=0.0, max_tokens=1024, retry_once=False,
         )
         if not isinstance(parsed, dict):
@@ -225,14 +233,14 @@ class DataAgent(RoleAgent):
     # ── 记忆联动（读） ─────────────────────────────────────────────
 
     def region_history(self, region: str) -> str:
-        """读同区域历史用过哪组影像、失败过什么（技术方案 5.4）。"""
+        """读同区域历史用过哪组影像、失败过什么。"""
         return self.memory_block(f"{region} 影像配对 云量 数据源 失败原因")
 
     # ── 写入实验记录草稿（不单独落库） ─────────────────────────────
 
     @staticmethod
     def pair_candidates_digest(ranked: List[dict], limit: int = 5) -> List[dict]:
-        """候选配对与得分的精简记录，供总调度并入实验记录（技术方案 5.4）。"""
+        """候选配对与得分的精简记录，供总调度并入实验记录。"""
         digest = []
         for pair in (ranked or [])[:limit]:
             digest.append({

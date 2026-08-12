@@ -25,7 +25,7 @@ const ICON_META = {
   completed: { path: '<circle cx="12" cy="12" r="10"/><polyline points="9 12 11 14 15 9"/>', color: '#16a34a' },
   running: { path: '<polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>', color: 'var(--primary)' },
   failed: { path: '<circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/>', color: '#dc2626' },
-  // 上游失败导致本步骤未执行（A-08）：与"失败"区分显示，明确不是"失败后仍继续完成"
+  // 上游失败导致本步骤未执行：与"失败"区分显示，明确不是"失败后仍继续完成"
   skipped_upstream: { path: '<circle cx="12" cy="12" r="10"/><line x1="8" y1="12" x2="16" y2="12"/>', color: '#9ca3af' },
   // 可选步骤未执行（结果后处理）：沿用时钟图标，与"等待"视觉一致，明确"未做"
   skipped: { path: '<circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>', color: '#9ca3af' },
@@ -45,7 +45,7 @@ onMounted(() => {
   if (project.currentConv) chat.refreshWorkflow(project.currentConv)
 })
 
-// 升级点 7：切换对话/项目时工作面板进度与当前对话保持一致
+// 切换对话/项目时工作面板进度与当前对话保持一致
 watch(() => project.currentConv, (cid) => {
   if (cid) chat.refreshWorkflow(cid)
 })

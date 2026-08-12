@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-训练主反思七规则 R1–R7 合成测试（技术方案 11.2）
+训练主反思七规则 R1–R7 合成测试
 
 运行：python tests/test_train_tuning_rules.py
 覆盖：
@@ -42,7 +42,7 @@ def _guard(llm, current, rounds=None, max_rounds=5):
 def test_rounds_config():
     print("[1] 轮数默认值与硬上限")
     _assert(train_rules.MAX_TUNING_ROUNDS == 8, "硬上限为 8")
-    _assert(train_rules.DEFAULT_TUNING_ROUNDS == 5, "默认值为 5（拍板结论 4）")
+    _assert(train_rules.DEFAULT_TUNING_ROUNDS == 5, "默认值为 5")
     _assert(train_rules.resolve_max_rounds(None) == 5, "未配置时取 5")
     _assert(train_rules.resolve_max_rounds(3) == 3, "配置 3 生效")
     _assert(train_rules.resolve_max_rounds(100) == 8, "配置 100 截断为 8")
@@ -288,15 +288,13 @@ def test_advisory_notes():
     notes = train_rules.advisory_notes(
         {"train_samples": 80000, "dem_std": 150.0, "lst_std": 6.0, "ndvi_mean": 0.6},
         {"feature_importance": [{"feature": "TTRI", "importance": 0.005}],
-         "test_metrics": {"R2": 0.87},
-         "independent_prediction": {"R2": 0.70}})
+         "test_metrics": {"R2": 0.87}})
     joined = "；".join(notes)
     _assert("K20" in joined, "样本量与模型容量匹配（K20）")
     _assert("K21" in joined, "地形复杂度与深度匹配（K21）")
     _assert("K22" in joined, "温度变异与叶节点匹配（K22）")
     _assert("K23" in joined, "植被覆盖与特征比例匹配（K23）")
     _assert("地形热响应指数贡献极低" in joined, "特征重要性异常被提示")
-    _assert("空间泛化不够稳定" in joined, "独立预测一致性差被提示")
 
     notes = train_rules.advisory_notes({"train_samples": 5000, "dem_std": 10.0}, {})
     joined = "；".join(notes)

@@ -1,5 +1,5 @@
 """
-数据集划分模块（B-01 重写 / 用户确认第8条）
+数据集划分模块（重写）
 
 删除像元级随机划分作为主路径：默认且唯一对外暴露的入口改为
 **空间块 + guard buffer**（train/test 之间设缓冲带，缓冲依据写入固定
@@ -14,18 +14,21 @@ guard buffer 通过检查像元在其 block 内是否邻近"分配到不同数�
 来判定，纯局部计算，天然可流式处理。
 """
 
-import csv
 import hashlib
 import math
 import os
 import random
 from typing import Dict, Optional, Tuple
 
+import numpy as np
+import pyarrow as pa
+import pyarrow.parquet as pq
+
 from .atomic_io import atomic_write_json
 
 # 默认值均可通过参数覆盖，并非"先验硬写不可更改"；实际取值与依据写入 split_info.json
-# 实现期修订 v1.3：块边长 10→30（实测鄂州 2024-07 数据：100m 缓冲下排除率 73.6%→27.3%，
-# 进入样本 ×2.75，实际比例 83/8/8→67/16/17，更接近配置 60/20/20；100m 缓冲依据不变）
+# 块边长取 30：实测鄂州 2024-07 数据在 100m 缓冲下排除率 73.6%→27.3%、进入样本 ×2.75、
+# 实际比例 83/8/8→67/16/17，更接近配置 60/20/20
 DEFAULT_BLOCK_SIZE_PX = 30
 # ≈ Landsat Collection 2 ST_B10 (TIRS) 原生约100m热像元支持尺度（USGS Landsat 8/9
 # 波段说明），作为默认缓冲带宽度的物理依据，而不是随意拍脑袋的数字；可用 guard_buffer_m 覆盖。
@@ -73,17 +76,17 @@ def split_dataset(
     min_samples_per_split: int = DEFAULT_MIN_SAMPLES_PER_SPLIT,
     progress_callback=None,
 ) -> Dict:
-    """空间块 + guard buffer 划分（对外唯一入口；固定输出文件名 train.csv/validate.csv/test.csv 不变）。
+    """空间块 + guard buffer 划分（对外唯一入口；固定输出文件名 train.parquet/validate.parquet/test.parquet 不变）。
 
     Args:
-        input_csv:            输入CSV文件路径（须含 row, col 列）
+        input_csv:            输入Parquet文件路径（须含 row, col 列）
         output_dir:           输出目录路径
         train_ratio/val_ratio/test_ratio: 划分比例，须为 [0,1] 内有限数且和为1
         seed:                 随机种子（仅用于派生稳定哈希，不修改任何全局状态）
         block_size_px:        空间块边长（像元数）
         guard_buffer_m:       train/test 缓冲带宽度（米）；默认值见 DEFAULT_GUARD_BUFFER_M
                               的物理依据说明，可自由覆盖
-        pixel_size_m:         输入CSV的像元分辨率（米），用于把 guard_buffer_m 换算为像元数
+        pixel_size_m:         输入Parquet的像元分辨率（米），用于把 guard_buffer_m 换算为像元数
         min_samples_per_split: 三个数据集的最小样本数下限，划分后不达标则拒绝产出
 
     Returns:
@@ -149,9 +152,9 @@ def split_dataset(
         return own
 
     output_paths = {
-        "train": os.path.join(output_dir, "train.csv"),
-        "validate": os.path.join(output_dir, "validate.csv"),
-        "test": os.path.join(output_dir, "test.csv"),
+        "train": os.path.join(output_dir, "train.parquet"),
+        "validate": os.path.join(output_dir, "validate.parquet"),
+        "test": os.path.join(output_dir, "test.parquet"),
     }
     counters = {"train": 0, "validate": 0, "test": 0, "buffer_excluded": 0}
     total_lines = 0
@@ -162,64 +165,60 @@ def split_dataset(
 
     partial_paths = {k: p + ".partial" for k, p in output_paths.items()}
     try:
-        with open(input_csv, "r", encoding="utf-8", newline="") as infile:
-            reader = csv.reader(infile)
-            try:
-                header = next(reader)
-            except StopIteration:
-                raise ValueError("CSV文件为空，缺少表头")
-            try:
-                row_pos = header.index("row")
-                col_pos = header.index("col")
-            except ValueError:
-                raise ValueError("输入 CSV 缺少 row/col 列，无法进行空间块划分")
+        pf = pq.ParquetFile(input_csv)
+        schema = pf.schema_arrow
+        if "row" not in schema.names or "col" not in schema.names:
+            raise ValueError("输入 Parquet 缺少 row/col 列，无法进行空间块划分")
 
-            files = {}
-            try:
-                for key, path in partial_paths.items():
-                    f = open(path, "w", encoding="utf-8", newline="")
-                    writer = csv.writer(f)
-                    writer.writerow(header)
-                    files[key] = {"file": f, "writer": writer}
+        files = {key: pq.ParquetWriter(path, schema, compression="zstd")
+                 for key, path in partial_paths.items()}
+        try:
+            for batch in pf.iter_batches(batch_size=200000):
+                n = batch.num_rows
+                if n == 0:
+                    continue
+                rows = batch.column("row").to_numpy(zero_copy_only=False)
+                cols = batch.column("col").to_numpy(zero_copy_only=False)
+                total_lines += n
+                r_min, r_max = int(rows.min()), int(rows.max())
+                c_min, c_max = int(cols.min()), int(cols.max())
+                if row_bounds["min_row"] is None or r_min < row_bounds["min_row"]:
+                    row_bounds["min_row"] = r_min
+                if row_bounds["max_row"] is None or r_max > row_bounds["max_row"]:
+                    row_bounds["max_row"] = r_max
+                if row_bounds["min_col"] is None or c_min < row_bounds["min_col"]:
+                    row_bounds["min_col"] = c_min
+                if row_bounds["max_col"] is None or c_max > row_bounds["max_col"]:
+                    row_bounds["max_col"] = c_max
 
-                for row_vals in reader:
-                    total_lines += 1
-                    r = int(row_vals[row_pos])
-                    c = int(row_vals[col_pos])
-                    if row_bounds["min_row"] is None or r < row_bounds["min_row"]:
-                        row_bounds["min_row"] = r
-                    if row_bounds["max_row"] is None or r > row_bounds["max_row"]:
-                        row_bounds["max_row"] = r
-                    if row_bounds["min_col"] is None or c < row_bounds["min_col"]:
-                        row_bounds["min_col"] = c
-                    if row_bounds["max_col"] is None or c > row_bounds["max_col"]:
-                        row_bounds["max_col"] = c
+                labels = [resolve_label(int(rows[i]), int(cols[i])) for i in range(n)]
+                batch_counts = {"train": 0, "validate": 0, "test": 0}
+                for key in ("train", "validate", "test"):
+                    idx = [i for i, lab in enumerate(labels) if lab == key]
+                    if idx:
+                        files[key].write_table(pa.Table.from_batches([batch.take(idx)]))
+                        batch_counts[key] = len(idx)
+                        counters[key] += len(idx)
+                counters["buffer_excluded"] += n - sum(batch_counts.values())
 
-                    label = resolve_label(r, c)
-                    if label is None:
-                        counters["buffer_excluded"] += 1
-                        continue
-                    files[label]["writer"].writerow(row_vals)
-                    counters[label] += 1
-
-                    if total_lines % 500000 == 0 and progress_callback:
-                        progress_callback(
-                            "split_dataset", min(total_lines / 10000000, 0.95),
-                            f"已处理 {total_lines:,} 行...",
-                        )
-            finally:
-                for fobj in files.values():
-                    fobj["file"].close()
+                if total_lines % 500000 == 0 and progress_callback:
+                    progress_callback(
+                        "split_dataset", min(total_lines / 10000000, 0.95),
+                        f"已处理 {total_lines:,} 行...",
+                    )
+        finally:
+            for w in files.values():
+                w.close()
     except PermissionError:
         for p in partial_paths.values():
             if os.path.exists(p):
                 os.remove(p)
         raise PermissionError(f"无权限写入输出目录: {output_dir}")
-    except UnicodeDecodeError:
+    except ValueError:
         for p in partial_paths.values():
             if os.path.exists(p):
                 os.remove(p)
-        raise ValueError("文件编码错误，请检查输入文件编码")
+        raise
     except Exception:
         for p in partial_paths.values():
             if os.path.exists(p):
@@ -286,7 +285,7 @@ def _split_dataset_pixel_random_legacy(
     progress_callback=None,
 ) -> Dict:
     """保留原有像元级随机划分实现，仅供内部调试/脚本直接调用，不通过 Skill 参数或
-    前端暴露（B-01 / 用户确认第8条："页面不再提供随机 split 选项"）。
+    前端暴露（"页面不再提供随机 split 选项"）。
 
     与旧实现的唯一差异：改用局部 ``random.Random(seed)`` 实例而非全局
     ``random.seed()``，避免并发任务之间通过进程级随机状态互相影响。
@@ -302,9 +301,9 @@ def _split_dataset_pixel_random_legacy(
     rng = random.Random(seed)
 
     output_paths = {
-        "train": os.path.join(output_dir, "train.csv"),
-        "validate": os.path.join(output_dir, "validate.csv"),
-        "test": os.path.join(output_dir, "test.csv"),
+        "train": os.path.join(output_dir, "train.parquet"),
+        "validate": os.path.join(output_dir, "validate.parquet"),
+        "test": os.path.join(output_dir, "test.parquet"),
     }
     counters = {"train": 0, "validate": 0, "test": 0}
     total_lines = 0
@@ -312,36 +311,28 @@ def _split_dataset_pixel_random_legacy(
     if progress_callback:
         progress_callback("split_dataset", 0, "开始数据划分（快速随机，仅调试用途）...")
 
-    with open(input_csv, "r", encoding="utf-8", newline="") as infile:
-        reader = csv.reader(infile)
-        try:
-            header = next(reader)
-        except StopIteration:
-            raise ValueError("CSV文件为空，缺少表头")
-
-        files = {}
-        try:
-            for key, path in output_paths.items():
-                f = open(path, "w", encoding="utf-8", newline="")
-                writer = csv.writer(f)
-                writer.writerow(header)
-                files[key] = {"file": f, "writer": writer}
-
-            for row in reader:
-                total_lines += 1
-                rand_val = rng.random()
-                if rand_val < train_ratio:
-                    files["train"]["writer"].writerow(row)
-                    counters["train"] += 1
-                elif rand_val < train_ratio + val_ratio:
-                    files["validate"]["writer"].writerow(row)
-                    counters["validate"] += 1
-                else:
-                    files["test"]["writer"].writerow(row)
-                    counters["test"] += 1
-        finally:
-            for fobj in files.values():
-                fobj["file"].close()
+    pf = pq.ParquetFile(input_csv)
+    files = {key: pq.ParquetWriter(path, pf.schema_arrow, compression="zstd")
+             for key, path in output_paths.items()}
+    try:
+        for batch in pf.iter_batches(batch_size=200000):
+            n = batch.num_rows
+            if n == 0:
+                continue
+            total_lines += n
+            rand_vals = np.array([rng.random() for _ in range(n)])
+            for key, mask in (
+                ("train", rand_vals < train_ratio),
+                ("validate", (rand_vals >= train_ratio) & (rand_vals < train_ratio + val_ratio)),
+                ("test", rand_vals >= train_ratio + val_ratio),
+            ):
+                idx = np.flatnonzero(mask)
+                if idx.size:
+                    files[key].write_table(pa.Table.from_batches([batch.take(idx)]))
+                    counters[key] += int(idx.size)
+    finally:
+        for fobj in files.values():
+            fobj.close()
 
     actual_total = sum(counters.values())
     stats = {}

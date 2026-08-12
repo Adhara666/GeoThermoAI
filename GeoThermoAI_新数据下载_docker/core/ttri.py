@@ -3,14 +3,14 @@ TTRI（地形热响应指数）计算模块
 
 TTRI = a * DEM + b * Slope + c * cos(Aspect)
 
-系数 a, b, c（及截距）**只用固定 train split 拟合一次**（审查文档 A-04 / 用户确认第1条），
+系数 a, b, c（及截距）**只用固定 train split 拟合一次**（用户确认的规则），
 固定保存为 ``ttri_coefficients.json``；validate/test/完整30m约束层/10m预测格网
 全部无标签地复用同一组系数变换，禁止各自用自身 LST 重新拟合。
 
-10m 预测数据的空间化插值，改为基于"完整30m约束层"（A-05 新增的
-``30m_constraint_grid.csv``，覆盖全部有效30m像元，而不是 step=2 抽样点）构建稠密
+10m 预测数据的空间化插值，改为基于"完整30m约束层"（
+``30m_constraint_grid.parquet``，覆盖全部有效30m像元，而不是 step=2 抽样点）构建稠密
 TTRI 栅格，再通过 core.grid_mapping 的统一仿射映射双线性插值到10m网格
-（A-06：不再使用 row/3.0, col/3.0 的隐式假设）。
+（不再使用 row/3.0, col/3.0 的隐式假设）。
 """
 
 import os
@@ -23,6 +23,10 @@ from scipy.interpolate import RegularGridInterpolator
 
 from . import grid_mapping
 from .atomic_io import atomic_write_json, write_verified
+from .table_io import TableWriter, iter_chunks, read_table, sample_rows, write_empty
+
+import pyarrow as pa
+import pyarrow.parquet as pq
 
 # ── 常量 ──────────────────────────────────────────────────────────────
 FEATURE_COLS = ["DEM", "Slope", "cos(Aspect)"]
@@ -30,7 +34,7 @@ TARGET_COL = "LST"
 TTRI_COL = "TTRI"
 SPECTRAL_COLS = ["R", "G", "B", "NIR", "SWIR1", "NDVI", "NDWI", "NDBI"]
 
-# 固定文件名（用户确认第7条：新增固定名允许，禁止模型自由起名/动态文件名）
+# 固定文件名（新增固定名允许，禁止模型自由起名/动态文件名）
 COEFFICIENTS_FILENAME = "ttri_coefficients.json"
 
 
@@ -50,14 +54,14 @@ def _is_valid_row(df_slice: pd.DataFrame, spectral_cols: Optional[List[str]] = N
 
 
 # ======================================================================
-#  仅 train 拟合一次（A-04）
+#  仅 train 拟合一次
 # ======================================================================
 
 
 def _fit_regression_diagnostics(
     df: pd.DataFrame, feature_cols: list, target_col: str
 ) -> Dict:
-    """拟合多元线性回归（含截距项），使用 np.linalg.lstsq，并保留 B-04 要求的
+    """拟合多元线性回归（含截距项），使用 np.linalg.lstsq，并保留 
     秩/条件数/样本数诊断，而不是只使用系数。
 
     模型: LST = intercept + a * DEM + b * Slope + c * cos(Aspect)
@@ -109,10 +113,10 @@ def fit_ttri_train(
 ) -> Dict:
     """只用固定 train split 拟合一次 TTRI 回归系数，固定保存 ``ttri_coefficients.json``。
 
-    对应 B-04：秩不足或病态（条件数 > 1e8）时明确失败，而不是静默输出不稳定系数。
+    秩不足或病态（条件数 > 1e8）时明确失败，而不是静默输出不稳定系数。
 
     Args:
-        train_csv:   训练集CSV路径（只读，不覆盖）
+        train_csv:   训练集Parquet路径（只读，不覆盖）
         output_dir:  ttri_coefficients.json 的保存目录
         min_samples: 最小允许样本数，过少的 AOI 不应计算出"看似有效"的系数
 
@@ -122,7 +126,7 @@ def fit_ttri_train(
     if progress_callback:
         progress_callback("ttri_train", 0.0, "读取训练集，拟合 TTRI 回归系数（仅 train，一次）...")
 
-    df = pd.read_csv(train_csv)
+    df = read_table(train_csv)
     _validate_columns(df, FEATURE_COLS + [TARGET_COL], "训练集")
 
     if len(df) < min_samples:
@@ -185,10 +189,11 @@ def apply_ttri_column(
     *,
     feature_cols: Optional[List[str]] = None,
 ) -> Dict:
-    """用给定（已拟合好的、不再重新拟合的）系数为某 30m CSV 原地新增/覆盖 TTRI 列。
+    """用给定（已拟合好的、不再重新拟合的）系数为某 30m Parquet 原地新增/覆盖 TTRI 列。
 
-    用于 validate.csv / test.csv：不使用它们自身的 LST 重新拟合，只做无标签变换。
-    写入采用 ``.partial`` + 原子替换，最终文件名保持固定不变（A-04 / A-08）。
+    用于 validate.parquet / test.parquet：不使用它们自身的 LST 重新拟合，只做无标签变换。
+    写入采用 ``.partial`` + 原子替换，最终文件名保持固定不变。
+    分块读取 + TableWriter 分块写，内存占用 O(块大小)，不再整表读入内存。
 
     Returns:
         dict: {rows, ttri_valid, ttri_invalid, coefficients_hash}
@@ -197,35 +202,58 @@ def apply_ttri_column(
     cols = feature_cols or coef_dict.get("feature_cols") or FEATURE_COLS
     coef_arr = np.asarray(coef_dict["coefficients"], dtype=np.float64)
 
-    df = pd.read_csv(csv_path)
-    _validate_columns(df, cols, os.path.basename(csv_path))
+    # 先校验首块列（避免校验失败时留下半成品 .partial）
+    _it_probe = iter_chunks(csv_path)
+    first_chunk = next(_it_probe, None)
+    if first_chunk is not None:
+        _validate_columns(first_chunk, cols, os.path.basename(csv_path))
+    del _it_probe, first_chunk
 
-    X = df[cols].values.astype(np.float64)
-    ttri = X @ coef_arr
-
-    if TTRI_COL in df.columns:
-        df.drop(columns=[TTRI_COL], inplace=True)
-    if TARGET_COL in df.columns:
-        target_idx = list(df.columns).index(TARGET_COL)
-        df.insert(target_idx, TTRI_COL, ttri)
-    else:
-        df[TTRI_COL] = ttri
+    rows = 0
+    ttri_valid = 0
+    ttri_invalid = 0
+    writer = None
 
     def _build(tmp_path: str) -> None:
-        df.to_csv(tmp_path, index=False, encoding="utf-8-sig")
+        nonlocal rows, ttri_valid, ttri_invalid, writer
+        for chunk in iter_chunks(csv_path):
+            X = chunk[cols].values.astype(np.float64)
+            ttri = X @ coef_arr
+
+            if TTRI_COL in chunk.columns:
+                chunk.drop(columns=[TTRI_COL], inplace=True)
+            if TARGET_COL in chunk.columns:
+                target_idx = list(chunk.columns).index(TARGET_COL)
+                chunk.insert(target_idx, TTRI_COL, ttri)
+            else:
+                chunk[TTRI_COL] = ttri
+
+            if writer is None:
+                writer = TableWriter(tmp_path)
+            writer.write(chunk)
+            rows += len(chunk)
+            ttri_valid += int(np.isfinite(ttri).sum())
+            ttri_invalid += int((~np.isfinite(ttri)).sum())
+        if writer is not None:
+            writer.close()
+        else:
+            # 空输入：写出带原始 schema + TTRI 列的空 Parquet
+            pf = pq.ParquetFile(csv_path)
+            schema = pa.schema(list(pf.schema_arrow) + [pa.field(TTRI_COL, pa.float64(), nullable=True)])
+            write_empty(tmp_path, schema)
 
     def _validator(tmp_path: str) -> Tuple[bool, str]:
-        check = pd.read_csv(tmp_path, nrows=5)
+        check = sample_rows(tmp_path, n=5)
         if TTRI_COL not in check.columns:
-            return False, "写出的 CSV 缺少 TTRI 列"
+            return False, "写出的 Parquet 缺少 TTRI 列"
         return True, ""
 
     write_verified(_build, csv_path, _validator)
 
     return {
-        "rows": int(len(df)),
-        "ttri_valid": int(np.isfinite(ttri).sum()),
-        "ttri_invalid": int((~np.isfinite(ttri)).sum()),
+        "rows": int(rows),
+        "ttri_valid": int(ttri_valid),
+        "ttri_invalid": int(ttri_invalid),
         "coefficients_source": coef_dict.get("coefficients_path", "<inline>"),
     }
 
@@ -237,7 +265,7 @@ def compute_ttri_for_splits(
     output_dir: str,
     progress_callback=None,
 ) -> Dict:
-    """A-04 顶层入口：仅用 train_csv 拟合一次系数并固定保存 ``ttri_coefficients.json``，
+    """仅用 train_csv 拟合一次系数并固定保存 ``ttri_coefficients.json``，
     然后用同一组系数为 train/validate/test 三个固定文件原地新增 TTRI 列
     （train 自身的 TTRI 也是"应用同一组系数"，数值上等于拟合时的样本内变换，
     但代码路径与 validate/test 完全一致，杜绝"各自重新拟合"的实现分叉）。
@@ -290,7 +318,7 @@ def compute_ttri_for_splits(
 
 
 # ======================================================================
-#  完整30m约束层上的 TTRI（A-05 双流；不需要插值，本就在30m自身网格上）
+#  完整30m约束层上的 TTRI（双流；不需要插值，本就在30m自身网格上）
 # ======================================================================
 
 
@@ -299,8 +327,9 @@ def compute_ttri_for_constraint_grid(
     coefficients: "str | Dict",
     output_path: Optional[str] = None,
 ) -> Dict:
-    """在完整30m约束层（``30m_constraint_grid.csv``，覆盖全部有效30m像元）上，
+    """在完整30m约束层（``30m_constraint_grid.parquet``，覆盖全部有效30m像元）上，
     用同一组 train 系数直接计算 TTRI（本身就在30m网格上，不需要插值）。
+    分块读取 + TableWriter 分块写，内存占用 O(块大小)，不再整表读入内存。
 
     Returns:
         dict: {output_path, rows, ttri_valid}
@@ -309,27 +338,47 @@ def compute_ttri_for_constraint_grid(
     cols = coef_dict.get("feature_cols") or FEATURE_COLS
     coef_arr = np.asarray(coef_dict["coefficients"], dtype=np.float64)
 
-    df = pd.read_csv(constraint_csv)
-    _validate_columns(df, cols, "完整30m约束层")
-    X = df[cols].values.astype(np.float64)
-    ttri = X @ coef_arr
-    df[TTRI_COL] = ttri
+    # 先校验首块列（避免校验失败时留下半成品 .partial）
+    _it_probe = iter_chunks(constraint_csv)
+    first_chunk = next(_it_probe, None)
+    if first_chunk is not None:
+        _validate_columns(first_chunk, cols, "完整30m约束层")
+    del _it_probe, first_chunk
 
     target_path = output_path or constraint_csv
+    rows = 0
+    ttri_valid = 0
+    writer = None
 
     def _build(tmp_path: str) -> None:
-        df.to_csv(tmp_path, index=False, encoding="utf-8-sig")
+        nonlocal rows, ttri_valid, writer
+        for chunk in iter_chunks(constraint_csv):
+            X = chunk[cols].values.astype(np.float64)
+            ttri = X @ coef_arr
+            chunk[TTRI_COL] = ttri
+            if writer is None:
+                writer = TableWriter(tmp_path)
+            writer.write(chunk)
+            rows += len(chunk)
+            ttri_valid += int(np.isfinite(ttri).sum())
+        if writer is not None:
+            writer.close()
+        else:
+            # 空输入：写出带原始 schema + TTRI 列的空 Parquet
+            pf = pq.ParquetFile(constraint_csv)
+            schema = pa.schema(list(pf.schema_arrow) + [pa.field(TTRI_COL, pa.float64(), nullable=True)])
+            write_empty(tmp_path, schema)
 
     def _validator(tmp_path: str) -> Tuple[bool, str]:
-        check = pd.read_csv(tmp_path, nrows=5)
+        check = sample_rows(tmp_path, n=5)
         return (TTRI_COL in check.columns, "缺少 TTRI 列")
 
     write_verified(_build, target_path, _validator)
 
     return {
         "output_path": target_path,
-        "rows": int(len(df)),
-        "ttri_valid": int(np.isfinite(ttri).sum()),
+        "rows": int(rows),
+        "ttri_valid": int(ttri_valid),
     }
 
 
@@ -341,8 +390,8 @@ def build_dense_ttri_grid(
 ) -> Tuple[np.ndarray, RegularGridInterpolator, Dict]:
     """从完整30m约束层构建稠密 (height, width) TTRI 栅格数组 + 双线性插值器。
 
-    与旧版 ``build_30m_ttri_grid`` 的关键差异（A-05 + A-06）：
-        - 输入是覆盖全部有效30m像元的完整约束层，而不是 step=2 抽样 CSV；
+    与旧版 ``build_30m_ttri_grid`` 的关键差异：
+        - 输入是覆盖全部有效30m像元的完整约束层，而不是 step=2 抽样 Parquet；
         - 网格按 [0, height) x [0, width) 的**绝对像元索引**稠密建立（未出现的行列
           仍是 NaN，但网格坐标轴不再是"样本中出现过的 unique row/col"这种稀疏轴，
           从而与 core.grid_mapping 的仿射插值约定完全对应）。
@@ -354,13 +403,13 @@ def build_dense_ttri_grid(
     cols = coef_dict.get("feature_cols") or FEATURE_COLS
     coef_arr = np.asarray(coef_dict["coefficients"], dtype=np.float64)
 
-    df = pd.read_csv(constraint_csv, usecols=["row", "col"] + cols)
+    df = read_table(constraint_csv, columns=["row", "col"] + cols)
     _validate_columns(df, cols, "完整30m约束层")
 
     X = df[cols].values.astype(np.float64)
     ttri_values = X @ coef_arr
 
-    grid = np.full((height, width), np.nan, dtype=np.float64)
+    grid = np.full((height, width), np.nan, dtype=np.float32)
     rows = df["row"].values.astype(np.int64)
     colsi = df["col"].values.astype(np.int64)
     in_range = (rows >= 0) & (rows < height) & (colsi >= 0) & (colsi < width)
@@ -388,7 +437,7 @@ def interpolate_grid_to_fine(
 ) -> np.ndarray:
     """统一仿射映射（core.grid_mapping）+ 双线性插值：把 30m 稠密栅格插值到给定的
     细格 (row, col) 位置。用于 10m TTRI 预测；TCR smooth_recentered 模式复用同一
-    底层实现 grid_mapping.interpolate_dense_grid_to_fine（A-06）。
+    底层实现 grid_mapping.interpolate_dense_grid_to_fine。
 
     grid/nearest_index 给定时，约束层覆盖范围外的细像元用最近有效值回退，
     保证每个预测样本都有 TTRI（口径统一：预测数据只按 S2 去云，不再额外扣点）。
@@ -415,12 +464,12 @@ def compute_ttri_predict(
     也不再使用 row/3.0, col/3.0 假设；改用 core.grid_mapping 基于真实仿射变换的映射。
 
     Args:
-        constraint_csv:        完整30m约束层CSV路径（30m_constraint_grid.csv）
+        constraint_csv:        完整30m约束层Parquet路径（30m_constraint_grid.parquet）
         constraint_meta_json:  完整30m约束层元数据（含 height/width/transform/crs）
-        predict_10m_csv:       10m预测数据CSV路径
+        predict_10m_csv:       10m预测数据Parquet路径
         predict_10m_meta_json: 10m元数据JSON路径（含 transform/crs）
         coefficients:          ttri_coefficients.json 路径或 dict（仅 train 拟合的系数）
-        output_path:           输出CSV路径
+        output_path:           输出Parquet路径
         batch_size:            批处理大小
         progress_callback:     进度回调
 
@@ -456,7 +505,7 @@ def compute_ttri_predict(
     # 约束层覆盖范围外的预测点用最近有效 TTRI 回退（口径统一：每个预测样本都有 TTRI）
     nearest_index = grid_mapping.nearest_valid_index(grid)
 
-    output_written = False
+    writer = None
     total_valid = 0
     total_invalid = 0
     out_of_grid = 0
@@ -465,7 +514,7 @@ def compute_ttri_predict(
     if progress_callback:
         progress_callback("ttri_predict", 0.3, "开始逐批插值10m数据...")
 
-    for chunk in pd.read_csv(predict_10m_csv, chunksize=batch_size):
+    for chunk in iter_chunks(predict_10m_csv, batch_size=batch_size):
         valid_mask = _is_valid_row(chunk)
         n_valid = int(valid_mask.sum())
         n_invalid = int((~valid_mask).sum())
@@ -486,15 +535,9 @@ def compute_ttri_predict(
             out_of_grid += int(np.isnan(interpolated).sum())
 
         chunk[TTRI_COL] = ttri_values
-        chunk.to_csv(
-            output_path,
-            mode="w" if not output_written else "a",
-            header=not output_written,
-            index=False,
-            encoding="utf-8-sig",
-            na_rep="",
-        )
-        output_written = True
+        if writer is None:
+            writer = TableWriter(output_path)
+        writer.write(chunk)
         batch_count += 1
 
         if progress_callback and (batch_count % 20 == 0 or batch_count <= 5):
@@ -503,11 +546,13 @@ def compute_ttri_predict(
                 f"批次 {batch_count}: 有效 {n_valid:,}",
             )
 
-    if not output_written:
-        # 10m 预测数据为空文件时也要写出表头一致的空文件，避免下游读取报错
-        pd.read_csv(predict_10m_csv, nrows=0).assign(**{TTRI_COL: []}).to_csv(
-            output_path, index=False, encoding="utf-8-sig"
-        )
+    if writer is not None:
+        writer.close()
+    else:
+        # 10m 预测数据为空文件时也要写出带 schema 的空 Parquet，避免下游读取报错
+        pf = pq.ParquetFile(predict_10m_csv)
+        schema = pa.schema(list(pf.schema_arrow) + [pa.field(TTRI_COL, pa.float64(), nullable=True)])
+        write_empty(output_path, schema)
 
     elapsed = time.time() - t_start
     if progress_callback:

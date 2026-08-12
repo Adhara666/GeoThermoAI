@@ -37,7 +37,7 @@ function setBase(id) {
   if (!def) return
   baseLayer = L.tileLayer(def.url, { maxZoom: def.maxZoom, attribution: def.attr, subdomains: def.subdomains || 'abc' })
   baseLayer.addTo(map)
-  // 升级点 18：底图置于最底层，避免切换底图时盖住已勾选的数据图层
+  // 底图置于最底层，避免切换底图时盖住已勾选的数据图层
   baseLayer.bringToBack()
 }
 
@@ -90,7 +90,7 @@ async function refresh() {
     // 瓦片金字塔渲染：按原生分辨率加载，bounds 限定图层地理范围
     const overlay = L.tileLayer(tileUrl(l.id, ts), {
       opacity: l.opacity,
-      zIndex: 500, // 升级点 18：数据图层始终高于底图，切换底图不被覆盖
+      zIndex: 500, // 数据图层始终高于底图，切换底图不被覆盖
       bounds: [
         [l.bounds[0][0], l.bounds[0][1]],
         [l.bounds[1][0], l.bounds[1][1]],
@@ -421,7 +421,7 @@ const groups = computed(() => {
   flex: 1; min-width: 0; font-size: 13px; font-weight: 500; color: var(--text);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-/* 升级点 21：标签悬停或聚焦时完整展示图层名称（title 提示 + 悬停换行） */
+/* 标签悬停或聚焦时完整展示图层名称（title 提示 + 悬停换行） */
 .layer-row__label:hover { white-space: normal; word-break: break-all; }
 .layer-row__opacity { flex: 0 0 56px; height: 14px; accent-color: var(--primary); }
 .layer-row__pct { font-size: 11px; color: var(--text-muted); width: 30px; text-align: right; flex-shrink: 0; }

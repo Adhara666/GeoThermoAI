@@ -337,7 +337,33 @@ input, select, textarea { font-family: inherit; }
 .msg--user .msg__bubble :not(pre) > code { background: rgba(255, 255, 255, 0.25); }
 .msg__bubble table { border-collapse: collapse; margin: 8px 0; }
 .msg__bubble th, .msg__bubble td { border: 1px solid var(--border-strong); padding: 4px 8px; font-size: 13px; }
-.msg__bubble blockquote { border-left: 3px solid var(--primary); margin: 6px 0; padding-left: 10px; color: var(--text-secondary); }
+.msg__bubble blockquote { border-left: 3px solid var(--primary); margin: 10px 0 6px; padding-left: 10px; color: var(--text-secondary); }
+
+/* 气泡内 markdown 标题（阶段头/最终结果说明）：左侧主色竖线 + 适度字号，形成清晰层级 */
+.msg__bubble h2 {
+  font-size: 15px; font-weight: 600; color: var(--text);
+  border-left: 3px solid var(--primary); padding-left: 8px;
+  margin: 16px 0 8px; line-height: 1.4;
+}
+.msg__bubble h2:first-child { margin-top: 0; }
+/* 结果说明内的三级标题：不再带主色竖线，用字号/字重区分层级（见结果说明排版需求） */
+.msg__bubble h3 {
+  font-size: 14px; font-weight: 600; color: var(--text);
+  margin: 14px 0 6px; line-height: 1.4;
+}
+.msg__bubble h3:first-child { margin-top: 0; }
+.msg__bubble ul { margin: 4px 0 8px; padding-left: 26px; }
+.msg__bubble ul:last-child { margin-bottom: 0; }
+.msg__bubble ul ul { margin: 2px 0; padding-left: 20px; }
+.msg__bubble li { margin: 2px 0; }
+/* 步骤之间不再画分割线，改用比段落略大的垂直留白（见 step_gap） */
+.msg__bubble .step-gap { height: 14px; }
+/* 步骤内部分隔线（如调优各轮之间）：比气泡宽度略短 + 上下留白 */
+.msg__bubble hr {
+  border: none; border-top: 1px solid var(--border-strong);
+  width: 60%; margin: 14px auto;
+}
+.msg__bubble hr:last-child { display: none; }
 
 .chat-empty {
   height: 100%; display: flex; flex-direction: column; align-items: center; justify-content: center;
@@ -436,7 +462,7 @@ input, select, textarea { font-family: inherit; }
 .exec-mode__item-title { font-size: 13px; color: var(--text); font-weight: 500; }
 .exec-mode__item-hint { font-size: 12px; color: var(--text-muted); }
 
-/* Chat / Work 双模式切换（升级点 17）：位于对话名称左侧，面板向下弹出 */
+/* Chat / Work 双模式切换：位于对话名称左侧，面板向下弹出 */
 .chat-mode { position: relative; flex-shrink: 0; }
 .chat-mode__btn {
   display: inline-flex; align-items: center; gap: 4px; height: 30px; padding: 0 10px;
@@ -471,7 +497,7 @@ input, select, textarea { font-family: inherit; }
 .approval-card__title { font-weight: 600; margin-bottom: 6px; font-size: 14px; }
 .approval-card__summary {
   margin: 0 0 10px; font-size: 13px; line-height: 1.7; color: var(--text-secondary);
-  white-space: pre-line; /* 升级点 27：保留后端 \n 换行 */
+  white-space: pre-line; /* 保留后端 \n 换行 */
 }
 .approval-options { display: flex; flex-direction: column; gap: 8px; max-height: 340px; overflow-y: auto; }
 .approval-option {
@@ -499,7 +525,7 @@ input, select, textarea { font-family: inherit; }
 .approval-field__range { color: var(--text-muted); }
 .approval-card__actions { display: flex; justify-content: flex-end; margin-top: 10px; }
 
-/* 魔搭嵌入顶栏偏移量人工校准控件（附录 C，仅嵌入环境出现，默认收起） */
+/* 魔搭嵌入顶栏偏移量人工校准控件（仅嵌入环境出现，默认收起） */
 .embed-calibrate { position: fixed; right: 10px; bottom: 10px; z-index: 500; }
 .embed-calibrate__fab {
   width: 26px; height: 26px; border-radius: 50%; border: 1px solid var(--border-strong);

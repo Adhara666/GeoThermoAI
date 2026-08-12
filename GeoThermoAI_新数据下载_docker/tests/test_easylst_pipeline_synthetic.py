@@ -1,4 +1,4 @@
-"""Test core.pipeline.EasyLSTPipeline end-to-end with synthetic rasters (A-08 rewrite)."""
+"""Test core.pipeline.EasyLSTPipeline end-to-end with synthetic rasters (rewrite)."""
 import json
 import os
 import shutil
@@ -94,11 +94,11 @@ assert not failed_steps, f"pipeline had failing steps: {failed_steps}"
 
 expected_steps = [
     "preprocessing", "split_dataset", "ttri_train", "train_rf", "predict_test",
-    "evaluate_independent", "ttri_predict", "tcr", "lst_final", "export_geotiff", "evaluate_closure",
+    "ttri_predict", "tcr", "lst_final", "export_geotiff", "evaluate_closure",
 ]
 for step in expected_steps:
     assert step in results, f"expected step {step} did not run"
-print("OK: all 11 EasyLSTPipeline steps completed successfully (fail-fast, no silent skip)")
+print("OK: all 10 EasyLSTPipeline steps completed successfully (fail-fast, no silent skip)")
 
 # Verify run_manifest.json was written at output_dir root and covers all steps
 from core import manifest as run_manifest
@@ -114,11 +114,11 @@ for key in ["train_split", "val_split", "test_split", "ttri_coefficients", "cons
     assert os.path.isfile(paths[key]), f"expected fixed output missing: {key} -> {paths[key]}"
 print("OK: all fixed-name output files exist on disk")
 
-# Verify NO *_with_TTRI.csv files were created (A-08 fix: old broken path names should not exist)
-for bad_name in ["train_with_TTRI.csv", "validate_with_TTRI.csv", "test_with_TTRI.csv"]:
+# Verify NO *_with_TTRI.parquet files were created (fix: old broken path names should not exist)
+for bad_name in ["train_with_TTRI.parquet", "validate_with_TTRI.parquet", "test_with_TTRI.parquet"]:
     bad_path = os.path.join(os.path.dirname(paths["train_split"]), bad_name)
     assert not os.path.exists(bad_path), f"stale broken filename should not exist: {bad_path}"
-print("OK: no stale *_with_TTRI.csv broken filenames created")
+print("OK: no stale *_with_TTRI.parquet broken filenames created")
 
 # ---- Test fail-fast: intentionally break preprocessing input, verify downstream is skipped ----
 pipeline2 = EasyLSTPipeline()

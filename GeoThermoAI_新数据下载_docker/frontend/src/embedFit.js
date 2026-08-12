@@ -12,7 +12,7 @@
  *   so the shell fits the visible slice of the oversized iframe.
  * - Allow ?embedChrome=N to override; ?embedChrome=0 disables the offset.
  *
- * KNOWN LIMITATION (technical doc appendix C, v1.2): DEFAULT_MODELSCOPE_CHROME_PX
+ * KNOWN LIMITATION: DEFAULT_MODELSCOPE_CHROME_PX
  * is an unverified guess, not a value measured on the real page. Guessing too
  * large leaves a gray strip of unfilled <body> background at the bottom of the
  * chat area (the reported symptom); guessing too small clips the chat input

@@ -139,6 +139,19 @@ def _record_manifest_success(output_dir: str, output_paths: Dict[str, str]):
         pass
 
 
+def _link_or_copy(src: str, dst: str) -> None:
+    """优先硬链接（同文件系统共享 inode，不占额外空间），失败回退复制。
+
+    用于「共享缓存 ↔ 对话工作区」之间的影像落地：同一 volume 内硬链接让
+    多份路径共享一份磁盘占用；跨文件系统/权限受限时回退复制保证功能不破。
+    注意：硬链接文件之后不得原地覆盖写（会波及所有链接），raw 影像只读使用，安全。
+    """
+    try:
+        os.link(src, dst)
+    except OSError:
+        shutil.copy2(src, dst)
+
+
 class BandAcquisitionError(RuntimeError):
     """必需波段下载/拼接失败的结构化异常（禁止用全零占位代替）。"""
 
@@ -327,25 +340,8 @@ class DataAcquisitionSkill(BaseSkill):
         # ── 判断模式 ────────────────────────────────────────────────
         selected_pair = params.get("selected_pair", None)
 
-        # ── 搜索影像（搜索模式和下载模式都需要）─────────────────
-        if progress_callback:
-            progress_callback("data_acquisition", 0.05, "搜索 Landsat 8/9 L2 影像...")
-
-        landsat_items = _search_items(
-            catalog, log_callback, "Landsat",
-            collections=["landsat-c2-l2"],
-            bbox=bbox,
-            datetime=f"{start_date}/{end_date}",
-            query={"eo:cloud_cover": {"lt": cloud_threshold}},
-            max_items=100,
-        )
-        if log_callback and not selected_pair:
-            log_callback("INFO", f"找到 {len(landsat_items)} 景 Landsat 影像")
-
-        if progress_callback:
-            progress_callback("data_acquisition", 0.10, "搜索 Sentinel-2 L2A 影像...")
-
-        # Sentinel-2 优先使用 Copernicus Data Space（国内更快），失败/未配置则回退 Planetary Computer
+        # Sentinel-2 数据源配置（token 有缓存；下载模式复用无额外开销，
+        # 两次执行间隔较久时重新取 token，也避免下载中途过期）
         ds_cfg = self._load_dataspace_config()
         ds_token = ""          # 用于 STAC 搜索（账号密码 或 OAuth2 Client 均可）
         s3_creds = None        # 用于 eodata 下载（S3 密钥，优先）
@@ -363,65 +359,93 @@ class DataAcquisitionSkill(BaseSkill):
             if log_callback and not selected_pair:
                 log_callback("INFO", "Sentinel-2 下载方式: eodata S3 签名（SigV4）")
 
-        sentinel2_items = []
-        ds_catalog = None
-        if ds_token:
-            try:
-                # timeout=90：避免网关挂起时请求无期等待；搜索失败另有 3 次退避重试
-                ds_catalog = Client.open(
-                    _DS_STAC_URL,
-                    headers={"Authorization": f"Bearer {ds_token}"},
-                    timeout=90,
-                )
-                sentinel2_items = self._search_ds_items(
-                    ds_catalog, [_DS_SENTINEL2_COLLECTION], bbox,
-                    f"{start_date}/{end_date}",
-                    {"eo:cloud_cover": {"lt": cloud_threshold}}, 100,
-                    log_callback, label="Sentinel-2",
-                )
-                if log_callback and not selected_pair and sentinel2_items:
-                    from collections import Counter
-                    s2_dates = Counter(i.properties.get("datetime", "")[:10] for i in sentinel2_items)
-                    for dt, cnt in sorted(s2_dates.items()):
-                        log_callback("INFO", f"  {dt}: {cnt} 景")
-            except Exception as e:
-                sentinel2_items = []
-                if log_callback:
-                    log_callback("WARN", f"Data Space 初始化失败: {e}，Sentinel-2 回退 Planetary Computer")
+        # 下载模式（第二次执行）复用第一次搜索的目录结果，避免重复 STAC 查询：
+        # 两次执行共用同一份 landsat/sentinel items（第一次返回配对、第二次下载）。
+        # cached_search 由执行引擎注入（executor 把第一次 result.data 的 items 带回）。
+        cached_search = params.get("cached_search") or None
+        if cached_search:
+            import pystac
+            landsat_items = [pystac.Item.from_dict(d) for d in cached_search.get("landsat", [])]
+            sentinel2_items = [pystac.Item.from_dict(d) for d in cached_search.get("sentinel", [])]
+        else:
+            # ── 搜索影像（搜索模式和下载模式都需要）─────────────────
+            if progress_callback:
+                progress_callback("data_acquisition", 0.05, "搜索 Landsat 8/9 L2 影像...")
 
-        if not sentinel2_items:
-            sentinel2_items = _search_items(
-                catalog, log_callback, "Sentinel-2",
-                collections=["sentinel-2-l2a"],
+            landsat_items = _search_items(
+                catalog, log_callback, "Landsat",
+                collections=["landsat-c2-l2"],
                 bbox=bbox,
                 datetime=f"{start_date}/{end_date}",
                 query={"eo:cloud_cover": {"lt": cloud_threshold}},
                 max_items=100,
             )
             if log_callback and not selected_pair:
-                log_callback("INFO", f"[Planetary Computer] 找到 {len(sentinel2_items)} 景 Sentinel-2 影像")
-                from collections import Counter
-                s2_dates = Counter(i.properties.get("datetime", "")[:10] for i in sentinel2_items)
-                for dt, cnt in sorted(s2_dates.items()):
-                    log_callback("INFO", f"  {dt}: {cnt} 景")
+                log_callback("INFO", f"找到 {len(landsat_items)} 景 Landsat 影像")
 
-        # ── 月度合成模式：覆盖度不足时放宽云量门槛自适应补搜（根治缺角）──
-        # 研究区某角区若被"整景云量略高于阈值"的影像覆盖，初始搜索会把它整体
-        # 滤掉，合成结果在该角区为空洞。这里求"研究区 − 已找到影像并集"的缺口
-        # bbox，仅在该角区放宽云量门槛补搜，把下载量限制在缺口范围内。
-        if str(params.get("composite") or "") == "monthly":
-            landsat_items = self._expand_monthly_coverage(
-                landsat_items, label="Landsat", catalog=catalog, ds_catalog=None,
-                collections=["landsat-c2-l2"], bbox=bbox,
-                start_date=start_date, end_date=end_date, cloud_override=90,
-                study_area_geojson=study_area_geojson, ds_token="",
-                log_callback=log_callback)
-            sentinel2_items = self._expand_monthly_coverage(
-                sentinel2_items, label="Sentinel-2", catalog=catalog,
-                ds_catalog=ds_catalog, collections=["sentinel-2-l2a"], bbox=bbox,
-                start_date=start_date, end_date=end_date, cloud_override=90,
-                study_area_geojson=study_area_geojson, ds_token=ds_token,
-                log_callback=log_callback)
+            if progress_callback:
+                progress_callback("data_acquisition", 0.10, "搜索 Sentinel-2 L2A 影像...")
+
+            # Sentinel-2 优先使用 Copernicus Data Space（国内更快），失败/未配置则回退 Planetary Computer
+            sentinel2_items = []
+            ds_catalog = None
+            if ds_token:
+                try:
+                    # timeout=90：避免网关挂起时请求无期等待；搜索失败另有 3 次退避重试
+                    ds_catalog = Client.open(
+                        _DS_STAC_URL,
+                        headers={"Authorization": f"Bearer {ds_token}"},
+                        timeout=90,
+                    )
+                    sentinel2_items = self._search_ds_items(
+                        ds_catalog, [_DS_SENTINEL2_COLLECTION], bbox,
+                        f"{start_date}/{end_date}",
+                        {"eo:cloud_cover": {"lt": cloud_threshold}}, 100,
+                        log_callback, label="Sentinel-2",
+                    )
+                    if log_callback and not selected_pair and sentinel2_items:
+                        from collections import Counter
+                        s2_dates = Counter(i.properties.get("datetime", "")[:10] for i in sentinel2_items)
+                        for dt, cnt in sorted(s2_dates.items()):
+                            log_callback("INFO", f"  {dt}: {cnt} 景")
+                except Exception as e:
+                    sentinel2_items = []
+                    if log_callback:
+                        log_callback("WARN", f"Data Space 初始化失败: {e}，Sentinel-2 回退 Planetary Computer")
+
+            if not sentinel2_items:
+                sentinel2_items = _search_items(
+                    catalog, log_callback, "Sentinel-2",
+                    collections=["sentinel-2-l2a"],
+                    bbox=bbox,
+                    datetime=f"{start_date}/{end_date}",
+                    query={"eo:cloud_cover": {"lt": cloud_threshold}},
+                    max_items=100,
+                )
+                if log_callback and not selected_pair:
+                    log_callback("INFO", f"[Planetary Computer] 找到 {len(sentinel2_items)} 景 Sentinel-2 影像")
+                    from collections import Counter
+                    s2_dates = Counter(i.properties.get("datetime", "")[:10] for i in sentinel2_items)
+                    for dt, cnt in sorted(s2_dates.items()):
+                        log_callback("INFO", f"  {dt}: {cnt} 景")
+
+            # ── 月度合成模式：覆盖度不足时放宽云量门槛自适应补搜（根治缺角）──
+            # 研究区某角区若被"整景云量略高于阈值"的影像覆盖，初始搜索会把它整体
+            # 滤掉，合成结果在该角区为空洞。这里求"研究区 − 已找到影像并集"的缺口
+            # bbox，仅在该角区放宽云量门槛补搜，把下载量限制在缺口范围内。
+            if str(params.get("composite") or "") == "monthly":
+                landsat_items = self._expand_monthly_coverage(
+                    landsat_items, label="Landsat", catalog=catalog, ds_catalog=None,
+                    collections=["landsat-c2-l2"], bbox=bbox,
+                    start_date=start_date, end_date=end_date, cloud_override=90,
+                    study_area_geojson=study_area_geojson, ds_token="",
+                    log_callback=log_callback)
+                sentinel2_items = self._expand_monthly_coverage(
+                    sentinel2_items, label="Sentinel-2", catalog=catalog,
+                    ds_catalog=ds_catalog, collections=["sentinel-2-l2a"], bbox=bbox,
+                    start_date=start_date, end_date=end_date, cloud_override=90,
+                    study_area_geojson=study_area_geojson, ds_token=ds_token,
+                    log_callback=log_callback)
 
         # CDSE 下载请求头（Sentinel-2 下载时使用；失败回退时行星计算机不需要）
         ds_headers = {"Authorization": f"Bearer {ds_token}"} if ds_token else None
@@ -464,6 +488,10 @@ class DataAcquisitionSkill(BaseSkill):
                 message=message,
                 data={
                     "image_pairs": image_pairs,
+                    # 序列化目录结果，供执行引擎在下载模式注入 cached_search 复用，
+                    # 避免下载前重复 STAC 查询（STAC item 完整包含下载资产）
+                    "landsat_items": [i.to_dict() for i in landsat_items],
+                    "sentinel2_items": [i.to_dict() for i in sentinel2_items],
                     "landsat_count": len(landsat_items),
                     "sentinel_count": len(sentinel2_items),
                     "region": region,
@@ -490,12 +518,12 @@ class DataAcquisitionSkill(BaseSkill):
         selected_landsat_date = selected_pair.get("landsat_date", "")
         selected_sentinel_date = selected_pair.get("sentinel2_date", "")
         selected_satellite = selected_pair.get("landsat_satellite", "")
-        # 升级点 4：本地 LST / Sentinel-2 文件名带 YYYYMMDD 日期；DEM 不带日期
+        # 本地 LST / Sentinel-2 文件名带 YYYYMMDD 日期；DEM 不带日期
         _ldate = str(selected_landsat_date).replace("-", "")
         _sdate = str(selected_sentinel_date).replace("-", "")
-        # 升级点 3：项目根目录（由执行引擎注入），用于已下载对跳过 / 重复影像复制 / DEM 复用
+        # 项目根目录（由执行引擎注入），用于已下载对跳过 / 重复影像复制 / DEM 复用
         _project_dir = str(params.get("project_dir") or "").strip()
-        # 方案 A：对话级独立工作目录。对话 project_dir = {项目根}/convs/{对话id}，
+        # 对话级独立工作目录。对话 project_dir = {项目根}/convs/{对话id}，
         # 已下载影像/DEM 缓存在项目根共享目录，跨对话复用不重复下载。
         # 若路径不以 /convs/ 结尾（旧对话或兜底），则视为项目根本身。
         _shared_root = _project_dir
@@ -577,7 +605,11 @@ class DataAcquisitionSkill(BaseSkill):
             return f"{name}_{_sdate}.tif" if _sdate else f"{name}.tif"
 
         def _cache_to_shared(filename: str, path: str) -> None:
-            """下载完成后把影像缓存到项目级共享目录（方案 A），供其他对话复用。"""
+            """下载完成后把影像缓存到项目级共享目录，供其他对话复用。
+
+            用硬链接落地（同 volume 内不占额外空间）；共享缓存文件只写一次，
+            后续一律复用，不会原地覆盖写，硬链接两端安全。
+            """
             if not _shared_root or _shared_root == _project_dir:
                 return
             if not (os.path.isfile(path) and os.path.getsize(path) > 0):
@@ -588,12 +620,12 @@ class DataAcquisitionSkill(BaseSkill):
                 os.makedirs(cache_dir, exist_ok=True)
                 target = os.path.join(cache_dir, filename)
                 if not (os.path.isfile(target) and os.path.getsize(target) > 0):
-                    shutil.copy2(path, target)
+                    _link_or_copy(path, target)
             except OSError:
                 pass
 
         def _reuse_local(path: str, desc: str) -> bool:
-            """目标已存在且非空 → 跳过下载，直接复用本地文件（升级点 3）。"""
+            """目标已存在且非空 → 跳过下载，直接复用本地文件。"""
             if os.path.isfile(path) and os.path.getsize(path) > 0:
                 if log_callback:
                     log_callback("INFO", f"{desc} 已存在（{os.path.basename(path)}），跳过下载")
@@ -601,9 +633,9 @@ class DataAcquisitionSkill(BaseSkill):
             return False
 
         def _copy_from_other_pair(filename: str, path: str, desc: str) -> bool:
-            """其他配对/共享缓存中已有同名影像 → 直接复制，无需重复下载（升级点 3）。
+            """其他配对/共享缓存中已有同名影像 → 直接复制，无需重复下载。
 
-            方案 A：扫描项目级共享缓存（{项目根}/pairs/...）与当前对话目录的配对，
+            扫描项目级共享缓存（{项目根}/pairs/...）与当前对话目录的配对，
             跨对话复用已下载的原始影像。
             """
             if os.path.isfile(path):
@@ -627,7 +659,8 @@ class DataAcquisitionSkill(BaseSkill):
                         cand = os.path.join(_rr, _d, "raw", filename)
                         if os.path.isfile(cand) and os.path.getsize(cand) > 0:
                             os.makedirs(os.path.dirname(path), exist_ok=True)
-                            shutil.copy2(cand, path)
+                            # 硬链接落地：跨对话复用不占双份空间（同 volume）
+                            _link_or_copy(cand, path)
                             if log_callback:
                                 log_callback("INFO", f"{desc} 复用已下载影像（{filename}）")
                             return True
@@ -746,7 +779,7 @@ class DataAcquisitionSkill(BaseSkill):
 
         dem_path = os.path.join(output_dir, "dem.tif")
         dem_collection = "cop-dem-glo-30"
-        # 升级点 3 + 方案 A：DEM 项目级共享缓存（{项目根}/dem_{研究区}.tif），
+        # DEM 项目级共享缓存（{项目根}/dem_{研究区}.tif），
         # 各对话独立目录均从共享缓存复制，全项目只下载一次；缓存按研究区隔离，
         # 避免换研究区复用上一个研究区已裁剪的 DEM
         _project_dem = os.path.join(_shared_root, f"dem_{_region_key}.tif") if _shared_root else ""
@@ -1260,7 +1293,7 @@ class DataAcquisitionSkill(BaseSkill):
         driver = gdal.GetDriverByName("GTiff")
         out_ds = driver.Create(
             dst_path, width, height, 1, gdal.GDT_Float32,
-            options=["COMPRESS=LZW", "TILED=YES", "BIGTIFF=YES"],
+            options=["COMPRESS=DEFLATE", "PREDICTOR=3", "TILED=YES", "BIGTIFF=YES"],
         )
         if out_ds is None:
             raise BandAcquisitionError(f"无法创建定标输出文件: {dst_path}")
@@ -1316,7 +1349,7 @@ class DataAcquisitionSkill(BaseSkill):
             resampleAlg=resample,
             srcNodata=src_nodata,
             dstNodata=dst_nodata,
-            creationOptions=["COMPRESS=LZW", "TILED=YES", "BIGTIFF=YES"],
+            creationOptions=["COMPRESS=DEFLATE", "PREDICTOR=2", "TILED=YES", "BIGTIFF=YES"],
             multithread=True,
         )
         if study_area_geojson and os.path.isfile(study_area_geojson):
@@ -1597,7 +1630,7 @@ class DataAcquisitionSkill(BaseSkill):
                     resampleAlg=resample,
                     srcNodata=_src_nodata,
                     dstNodata=_dst_nodata,
-                    creationOptions=["COMPRESS=LZW", "TILED=YES", "BIGTIFF=YES"],
+                    creationOptions=["COMPRESS=DEFLATE", "PREDICTOR=2", "TILED=YES", "BIGTIFF=YES"],
                     multithread=True,
                 )
 
@@ -1644,7 +1677,7 @@ class DataAcquisitionSkill(BaseSkill):
                 translate_ds = gdal.Translate(
                     final_tmp, vrt_path,
                     format="GTiff",
-                    creationOptions=["COMPRESS=LZW", "TILED=YES", "BIGTIFF=YES",
+                    creationOptions=["COMPRESS=DEFLATE", "PREDICTOR=2", "TILED=YES", "BIGTIFF=YES",
                                     "BLOCKXSIZE=256", "BLOCKYSIZE=256"],
                 )
                 if translate_ds is None:
@@ -1990,7 +2023,7 @@ class DataAcquisitionSkill(BaseSkill):
                 src = None
                 ds = gdal.GetDriverByName("GTiff").Create(
                     mask_path, w, h, 1, gdal.GDT_Byte,
-                    options=["COMPRESS=LZW", "TILED=YES"])
+                    options=["COMPRESS=DEFLATE", "PREDICTOR=2", "TILED=YES"])
                 if ds is None:
                     return False
                 ds.SetGeoTransform(gt)
@@ -2214,7 +2247,7 @@ class DataAcquisitionSkill(BaseSkill):
                 trans_ds = gdal.Translate(
                     s2_bands_path, vrt_path,
                     format="GTiff",
-                    creationOptions=["COMPRESS=LZW", "TILED=YES", "BIGTIFF=YES",
+                    creationOptions=["COMPRESS=DEFLATE", "PREDICTOR=2", "TILED=YES", "BIGTIFF=YES",
                                     "BLOCKXSIZE=256", "BLOCKYSIZE=256"],
                 )
                 if trans_ds is None:

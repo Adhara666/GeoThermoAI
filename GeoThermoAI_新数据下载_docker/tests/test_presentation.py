@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-气泡文案渲染层合成测试（技术方案 11.2 / 9.4 五条红线）
+气泡文案渲染层合成测试（五条红线）
 
 运行：python tests/test_presentation.py
 覆盖：
@@ -36,14 +36,14 @@ SKILL_CASES = {
         {"train_rows": 45678, "constraint_rows": 5000, "predict_valid_pixels": 400000,
          "split_stats": {"train": {"count": 27406}, "validate": {"count": 9136},
                          "test": {"count": 9136}},
-         "train_csv": "/app/x/processed/train.csv"},
+         "train_csv": "/app/x/processed/train.parquet"},
         ("数据准备完成", "27,406", "9,136"),
     ),
     "ttri_compute": (
         "TTRI计算完成（仅train拟合一次）: R²=0.62, 系数 a(DEM)=0.001234；"
         "10m有效 4,231,905 行，约束层覆盖范围外 68 行",
         {"coefficients": {"r2": 0.62}, "total_valid": 4231905,
-         "train_with_ttri": "/app/x/processed/train.csv"},
+         "train_with_ttri": "/app/x/processed/train.parquet"},
         ("地形热响应指数计算完成", "0.62", "4,231,905"),
     ),
     "rf_model": (
@@ -51,13 +51,13 @@ SKILL_CASES = {
         {"train_metrics": {"train": {"R2": 0.90}},
          "test_metrics": {"R2": 0.87, "RMSE": 1.23, "MB": 0.12},
          "model_path": "/app/x/results/train/rf_ttri_model.pkl"},
-        ("模型训练完成", "测试集决定系数 0.87", "均方根误差 1.23 K"),
+        ("模型训练（第1轮）完成", "测试集决定系数 0.87", "均方根误差 1.23 K"),
     ),
     "tcr_compute": (
         "TCR计算完成（block_constant）: mean=0.0210K, std=0.4500K, 有效格=373,240, "
         "耗时 42.1s；不代表辐射或能量守恒",
         {"tcr_statistics": {"mean": 0.021, "std": 0.45, "n_valid_blocks": 373240},
-         "predict_with_tcr": "/app/x/results/tcr_result.csv"},
+         "predict_with_tcr": "/app/x/results/tcr_result.parquet"},
         ("热约束残差计算完成", "373,240"),
     ),
     "lst_export": (
@@ -120,12 +120,12 @@ def test_summarize_failures_and_fallback():
     print("[2] 失败与缺数据时的摘要")
     for skill in SKILL_CASES:
         text = presentation.summarize(
-            skill, SkillResult(False, "重建输入失败: /app/x/processed/train.csv 不存在"))
+            skill, SkillResult(False, "重建输入失败: /app/x/processed/train.parquet 不存在"))
         _check_redlines(text, f"{presentation.stage_label(skill)} 失败摘要")
         _assert("未通过" in text, f"{presentation.stage_label(skill)} 失败时用中文「未通过」")
 
     # data 为空时不崩，也不泄露原始 message 里的路径
-    text = presentation.summarize("data_pipeline", SkillResult(True, "预处理完成: /a/b/c.csv"))
+    text = presentation.summarize("data_pipeline", SkillResult(True, "预处理完成: /a/b/c.parquet"))
     _check_redlines(text, "缺数据时的摘要")
 
     text = presentation.summarize("未知技能", SkillResult(True, "完成"))
@@ -169,7 +169,7 @@ def test_other_bubbles():
     for label, text in cases.items():
         _check_redlines(text, label)
     _assert(presentation.study_area_loaded("九江镇.geojson").strip()
-            == "已载入研究区：九江镇", "研究区名去掉扩展名")
+            == "> 已载入研究区：九江镇", "研究区名去掉扩展名，引用块样式置于顶部总览")
     _assert("共 7 步" in cases["方案就绪"], "方案就绪给出步骤数")
     _assert("Landsat 8/9 4 景" in cases["无配对"] and "Sentinel-2 6 景" in cases["无配对"],
             "无配对说清搜到了什么")
@@ -243,7 +243,7 @@ def test_status_words():
     expected = {"running": "开始", "completed": "完成", "failed": "未通过",
                 "paused": "已暂停", "aborted": "已停止"}
     _assert(presentation.STATUS_WORDS == expected,
-            "状态词表与技术方案 9.4 红线 2 一致")
+            "状态词表红线 2 一致")
     for word in expected.values():
         _check_redlines(word, f"状态词「{word}」")
 
@@ -270,6 +270,80 @@ def test_backend_sources_have_no_emoji_bubbles():
     _assert("💭" not in content, "思考链标签不再使用表情符号")
 
 
+def test_layout_helpers():
+    print("[10] 排版辅助：步间留白与无点缩进")
+    _assert(presentation.step_gap() == '<div class="step-gap"></div>\n\n',
+            "步间用 HTML 留白块（不画分割线），末尾带空行：marked 的 HTML block 解析"
+            "会吞掉 <div> 后到空行前的所有行，若 <div> 后紧跟 '## 第 N 步' 标题会被"
+            "当原文输出（气泡显示字面 ##）")
+    _assert(presentation.indent("数据检查通过").startswith("\u3000\u3000"),
+            "无点缩进用全角空格撑起视觉缩进")
+    _assert("\n" not in presentation.indent("x"), "缩进辅助不引入换行")
+
+
+def test_normalize_number_spacing():
+    print("[11] 数字与相邻文字的空格统一")
+    norm = presentation.normalize_number_spacing
+
+    def _case(src, dst, label):
+        got = norm(src)
+        _assert(got == dst, f"{label}：{src!r} → {got!r}")
+
+    # 数字与中文之间补空格
+    _case("第1轮", "第 1 轮", "数字前后补空格")
+    _case("总第2轮，调优第1轮", "总第 2 轮，调优第 1 轮", "括号内多组数字")
+    _case("共7步", "共 7 步", "中文后接数字")
+    _case("模型训练（第1轮）完成：测试集决定系数 0.81，均方根误差 2.32 K",
+          "模型训练（第 1 轮）完成：测试集决定系数 0.81，均方根误差 2.32 K",
+          "既有空格保持、标点与数字直接相邻")
+    # 数字+m 单位内部紧凑，与中文之间补空格
+    _case("10m结果回聚合到30m产品格网", "10m 结果回聚合到 30m 产品格网",
+          "10m/30m 单位与中文之间补空格")
+    _case("10m 有效格点", "10m 有效格点", "已带空格保持不变")
+    # 特殊写法保持不变
+    _case("下载 Landsat 8/9、Sentinel-2 与 DEM 影像",
+          "下载 Landsat 8/9、Sentinel-2 与 DEM 影像", "传感器名保持紧凑")
+    _case("影像 2100 行 × 1800 列", "影像 2100 行 × 1800 列", "千分位与尺寸写法不变")
+    _case("有效像元占比 92.4%", "有效像元占比 92.4%", "百分比符号不拆开")
+    _case("第 1 步／共 7 步：数据获取", "第 1 步／共 7 步：数据获取",
+          "已规范文本原样保留")
+    # 幂等性 + 空串安全
+    _case(norm("第1轮，共7步"), norm("第 1 轮，共 7 步"), "二次调用结果一致")
+    _assert(norm("") == "" and norm(None) is None, "空串/None 安全")
+
+
+def test_acquisition_dates_and_satellites():
+    print("[12] 数据获取摘要写明卫星与日期；Landsat 不写 8/9 泛指")
+    result = SkillResult(True, "ok", data={"landsat_path": "/x/landsat_lst.tif"})
+    # 配对模式：写明实际卫星与日期
+    pair = {"landsat_date": "2024-07-17", "landsat_satellite": "L8",
+            "sentinel2_date": "2024-07-22"}
+    text = presentation.summarize("data_acquisition", result, pair=pair)
+    _assert("影像下载完成" in text and "Landsat 8 2024-07-17" in text
+            and "Sentinel-2 2024-07-22" in text, "配对模式写明卫星与日期")
+    # 卫星是 9 → 写 Landsat 9，不写 8/9
+    text9 = presentation.summarize("data_acquisition", result,
+                                   pair={**pair, "landsat_satellite": "L9"})
+    _assert("Landsat 9 2024-07-17" in text9 and "Landsat 8" not in text9,
+            "L9 写成 Landsat 9")
+    # 月度合成模式：写月份
+    monthly = {"landsat_date": "2024-07-31", "sentinel2_date": "2024-07-31",
+               "composite": "monthly"}
+    tm = presentation.summarize("data_acquisition", result, pair=monthly)
+    _assert("影像合成完成" in tm and "2024 年 7 月" in tm, "月度合成写月份")
+    # 无配对信息 → 回退原摘要
+    _assert("影像下载完成" in presentation.summarize("data_acquisition", result),
+            "无配对时回退原摘要")
+    # 月度合成开始提示带月份；卫星/月份辅助函数
+    ms = presentation.monthly_composite_started(3, 4, month="2024 年 7 月")
+    _assert("月度合成模式（2024 年 7 月）" in ms, "月度提示标题带月份")
+    _assert(presentation.satellite_label("L8") == "Landsat 8"
+            and presentation.satellite_label("L9") == "Landsat 9"
+            and presentation.satellite_label("?") == "Landsat", "卫星代号转写法")
+    _assert(presentation.month_label("2024-07-31") == "2024 年 7 月"
+            and presentation.month_label("") == "", "日期转月份")
+
+
 if __name__ == "__main__":
     test_summarize_all_skills()
     test_summarize_failures_and_fallback()
@@ -280,4 +354,7 @@ if __name__ == "__main__":
     test_single_source_labels()
     test_status_words()
     test_backend_sources_have_no_emoji_bubbles()
+    test_layout_helpers()
+    test_normalize_number_spacing()
+    test_acquisition_dates_and_satellites()
     print("\n✅ 气泡文案渲染层测试全部通过")

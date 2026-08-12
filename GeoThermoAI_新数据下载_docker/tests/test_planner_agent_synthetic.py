@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-规划 Agent 合成测试（技术方案 11.2）
+规划 Agent 合成测试
 
 用 FakeAssistant 返回预设 JSON，零网络依赖。
 覆盖：
@@ -13,8 +13,8 @@
 ⑦ LLM 不可用时退回关键词兜底，且绝不出现「默认武汉」
 ⑧ 角色提示词四段结构齐全
 ⑨ SessionState 读写与级联删除
-⑩ 异常年份（如「125年」）反问年份本身，不盲目复述反问月份（v1.2）
-⑪ extract_json 对尾随逗号与推理前言夹带花括号的兜底（v1.2）
+⑩ 异常年份（如「125年」）反问年份本身，不盲目复述反问月份
+⑪ extract_json 对尾随逗号与推理前言夹带花括号的兜底
 """
 
 import datetime
@@ -174,7 +174,7 @@ def test_region_not_matched_asks():
 
 
 def test_no_study_area_uploaded():
-    print("[4] 未上传研究区 → 对话方式引导（拍板结论 3）")
+    print("[4] 未上传研究区 → 对话方式引导")
     tmp = tempfile.mkdtemp(prefix="planner_agent_")
     try:
         d = os.path.join(tmp, "empty_study")
@@ -206,7 +206,7 @@ def test_single_study_area_compat():
 
 
 def test_jiujiang_four_turns():
-    print("[6] 九江镇四轮场景（技术方案 4.7 验收用例）")
+    print("[6] 九江镇四轮场景（验收用例）")
     tmp = tempfile.mkdtemp(prefix="planner_agent_")
     try:
         d = _study_dir(tmp, ("九江镇.geojson", "南海区.geojson"))
@@ -271,7 +271,7 @@ def test_jiujiang_four_turns():
 
 
 def test_implausible_year_asks_about_year_not_month():
-    print("[6.1] 「125年」等异常年份：反问年份本身，不盲目复述反问月份（v1.2 修复）")
+    print("[6.1] 「125年」等异常年份：反问年份本身，不盲目复述反问月份")
     tmp = tempfile.mkdtemp(prefix="planner_agent_")
     try:
         planner = PlannerAgent(
@@ -328,7 +328,7 @@ def test_llm_unavailable_fallback():
 
 
 def test_prompt_sections():
-    print("[9] 角色提示词四段结构齐全（附录 A 检查清单）")
+    print("[9] 角色提示词四段结构齐全（检查清单）")
     identity = planner_prompts.PLANNER_IDENTITY
     for section in REQUIRED_PROMPT_SECTIONS:
         _assert(section in identity, f"规划角色提示词包含「{section}」段")
@@ -411,7 +411,7 @@ def test_extract_json_single_source():
     _assert(extract_json("[1,2]") is None, "数组不算合法计划对象")
     _assert(extract_json("") is None, "空串返回 None")
 
-    # v1.2 新增两级兜底：应对模型输出的「近似 JSON」（实现期修订，见修订记录 v1.2 第 ⑮ 条）
+    # 应对模型输出的「近似 JSON」（两级兜底）
     _assert(extract_json('{"a": 1,}') == {"a": 1}, "尾随逗号被去除后可解析")
     _assert(extract_json('```json\n{"a": [1, 2,], "b": 3,}\n```') == {"a": [1, 2], "b": 3},
             "代码块内的尾随逗号也被去除")

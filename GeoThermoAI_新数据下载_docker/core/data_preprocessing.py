@@ -2,22 +2,22 @@
 数据预处理模块
 
 整合 Landsat LST、QA、Sentinel-2多光谱、SCL和DEM数据，
-生成30m训练特征CSV（step=2抽样）、完整30m约束层CSV 和 10m预测特征CSV。
+生成30m训练特征Parquet（step=2抽样）、完整30m约束层Parquet 和 10m预测特征Parquet。
 
 处理流程:
     1. 加载所有栅格数据
     2. 将S2/SCL/DEM对齐到Landsat 30m网格
     3. 生成联合掩膜（Landsat QA + Sentinel SCL 4/5/6 + 热红外有效值）
     4. 计算光谱指数（NDVI, NDWI, NDBI）和地形特征（Slope, Aspect, cos(Aspect)）
-    5. 输出30m step2 CSV（训练抽样，继续保留）+ 完整30m约束层CSV（A-05 新增，
+    5. 输出30m step2 Parquet（训练抽样，继续保留）+ 完整30m约束层Parquet（
        覆盖全部有效30m像元，供 TTRI 空间化 / TCR / 闭合评价使用，不再把 step2
-       抽样 CSV 兼任"完整30m格网"）
-    6. 将SCL对齐到Sentinel原生10m网格，输出10m全网格CSV和元数据JSON
+       抽样 Parquet 兼任"完整30m格网"）
+    6. 将SCL对齐到Sentinel原生10m网格，输出10m全网格Parquet和元数据JSON
 
-A-05 双流设计（用户确认第2条）：
+双流设计：
     完整30m输入栅格
-      ├─ A. 固定 30m_features_step2.csv → split → TTRI拟合 → RF训练/独立评价
-      └─ B. 完整有效30m约束层 30m_constraint_grid.csv → TTRI空间化/TCR/闭合评价
+      ├─ A. 固定 30m_features_step2.parquet → split → TTRI拟合 → RF训练/独立评价
+      └─ B. 完整有效30m约束层 30m_constraint_grid.parquet → TTRI空间化/TCR/闭合评价
     两条流共享同一份 joint_mask、DEM/Slope/Aspect 计算，互不冲突；A 流的采样策略
     与列结构均未改变。
 """
@@ -35,6 +35,7 @@ from rasterio.warp import calculate_default_transform, reproject
 
 from .atomic_io import write_verified
 from .geo_mask import rasterize_region as _rasterize_region
+from .table_io import TableWriter, sample_rows
 
 # ── 物理常量 ──────────────────────────────────────────────────────────
 S2_SR_SCALE = 10000.0          # Sentinel-2地表反射率缩放因子 (DN / 10000)
@@ -67,8 +68,8 @@ PREDICT_COLUMNS = [
 # 完整30m约束层：紧凑列（不复制全部15列特征，只保留 TCR/TTRI 空间化所需的最小集合）
 _BASE_CONSTRAINT_COLUMNS = ["row", "col", "LST", "DEM", "Slope", "cos(Aspect)"]
 
-# 固定文件名（A-05 新增；工程写死，不允许模型自由起名）
-CONSTRAINT_CSV_NAME = "30m_constraint_grid.csv"
+# 固定文件名（工程写死，不允许模型自由起名；升级：中间产物表统一 Parquet）
+CONSTRAINT_CSV_NAME = "30m_constraint_grid.parquet"
 CONSTRAINT_META_NAME = "30m_constraint_grid_meta.json"
 
 # ── Sentinel-2 L2A SCL 有效地物类别 ──────────────────────────────────
@@ -345,7 +346,7 @@ def _terrain_features(
     """
     从DEM计算坡度和坡向，使用numpy.gradient。
 
-    对应 C-06：像元间距从实际仿射变换的 dx/dy 读取，不再对所有输入写死 30.0，
+    像元间距从实际仿射变换的 dx/dy 读取，不再对所有输入写死 30.0，
     避免非 30m/非方形像元的 DEM 得到错误坡度量纲。要求 DEM 已是米制、北向、无旋转
     网格（标准 Landsat 参考格网满足该假设）。
 
@@ -402,7 +403,7 @@ def process_preprocessing(
     study_area_geojson: str = "",
 ) -> Dict:
     """
-    数据预处理：生成30m训练特征CSV（采样）、完整30m约束层CSV 和 10m预测特征CSV。
+    数据预处理：生成30m训练特征Parquet（采样）、完整30m约束层Parquet 和 10m预测特征Parquet。
 
     Args:
         landsat_path:   Landsat L2 ST_B10栅格路径
@@ -420,11 +421,11 @@ def process_preprocessing(
 
     Returns:
         dict: 包含输出文件路径和元数据
-            - train_csv:        30m训练集CSV路径（step2，继续保留）
+            - train_csv:        30m训练集Parquet路径（step2，继续保留）
             - train_meta:       30m训练集元数据JSON路径
-            - constraint_csv:   完整30m约束层CSV路径（A-05 新增）
+            - constraint_csv:   完整30m约束层Parquet路径
             - constraint_meta:  完整30m约束层元数据JSON路径
-            - predict_csv:      10m预测集CSV路径
+            - predict_csv:      10m预测集Parquet路径
             - predict_meta:     10m元数据JSON路径
             - aligned_s2/aligned_scl/aligned_dem: 对齐到30m的中间产物路径
     """
@@ -450,12 +451,12 @@ def process_preprocessing(
     aligned_dem = os.path.join(processed_dir, "Aligned_DEM_30m.tif")
     scl_10m_aligned = os.path.join(processed_dir, "Aligned_SCL_to_S2_10m.tif")
 
-    # 输出路径（固定命名）
-    train_csv = os.path.join(output_dir, "30m_features_step2.csv")
+    # 输出路径（固定命名；升级：中间产物表统一 Parquet）
+    train_csv = os.path.join(output_dir, "30m_features_step2.parquet")
     train_meta = os.path.join(output_dir, "30m_features_step2_meta.json")
     constraint_csv = os.path.join(output_dir, CONSTRAINT_CSV_NAME)
     constraint_meta = os.path.join(output_dir, CONSTRAINT_META_NAME)
-    predict_csv = os.path.join(output_dir, "10m_predict_features.csv")
+    predict_csv = os.path.join(output_dir, "10m_predict_features.parquet")
     predict_meta = os.path.join(output_dir, "10m_predict_features_meta.json")
 
     try:
@@ -489,7 +490,7 @@ def process_preprocessing(
             landsat_transform = _ds.transform
             landsat_crs = str(_ds.crs) if _ds.crs else None
 
-        # B-11 预飞行校验：所有对齐后栅格必须与参考格网严格同尺寸，
+        # 预飞行校验：所有对齐后栅格必须与参考格网严格同尺寸，
         # 否则后续按窗口读取会静默错位/越界（此前该检查被整段注释掉）。
         for _label, _path in (("QA", qa_path), ("对齐DEM", aligned_dem),
                                ("对齐S2", aligned_s2), ("对齐SCL", aligned_scl)):
@@ -497,7 +498,7 @@ def process_preprocessing(
                 if (_chk.height, _chk.width) != (height_30m, width_30m):
                     raise ValueError(
                         f"{_label} 栅格尺寸 {(_chk.height, _chk.width)} 与 Landsat 参考格网 "
-                        f"{(height_30m, width_30m)} 不一致，拒绝继续（B-11 预飞行校验）"
+                        f"{(height_30m, width_30m)} 不一致，拒绝继续（预飞行校验）"
                     )
 
         # 预分配数组
@@ -588,7 +589,7 @@ def process_preprocessing(
         region_pixels30 = int(region30.sum()) if region30 is not None else 0
 
         # ==================================================================
-        #  步骤4: 生成30m训练CSV（采样）
+        #  步骤4: 生成30m训练Parquet（采样）
         #  有效样本充足（默认 ≥750,000）时 step=2 等间隔抽样，节省算力与存储；
         #  不足时不采样（step=1 全像元直接进入划分），保住训练样本量。
         # ==================================================================
@@ -597,7 +598,7 @@ def process_preprocessing(
         if progress_callback:
             progress_callback(
                 "preprocessing", 0.35,
-                f"生成30m训练特征CSV (step={step}采样，有效像元 {valid_count:,} 个"
+                f"生成30m训练特征Parquet (step={step}采样，有效像元 {valid_count:,} 个"
                 f"{'' if step == 1 else '，每4取1'})..."
             )
 
@@ -631,7 +632,7 @@ def process_preprocessing(
         df_train = df_train.replace([np.inf, -np.inf], np.nan).dropna(
             subset=train_columns()
         )
-        df_train.to_csv(train_csv, index=False)
+        df_train.to_parquet(train_csv, index=False, compression="zstd")
 
         with rasterio.open(landsat_path) as ds:
             train_meta_dict = {
@@ -646,7 +647,7 @@ def process_preprocessing(
                 "columns": train_columns(),
                 "sentinel2_sr_scale": (
                     f"exported reflectance = corrected DN / {S2_SR_SCALE:g}；"
-                    f"corrected DN 已在数据获取阶段按各景 BOA_ADD_OFFSET 定标（见 A-03 / "
+                    f"corrected DN 已在数据获取阶段按各景 BOA_ADD_OFFSET 定标（"
                     f"sentinel2_provenance.json），此处不再对所有影像盲减固定值"
                 ),
                 "target": "LST = Landsat ST_B10 DN * 0.00341802 + 149.0",
@@ -663,12 +664,12 @@ def process_preprocessing(
             )
 
         # ==================================================================
-        #  步骤4.5: 生成完整30m约束层（A-05 新增，用户确认第2条）
+        #  步骤4.5: 生成完整30m约束层
         #  覆盖全部 joint_mask 有效像元（step=1），供 TTRI 空间化 / TCR / 闭合评价使用，
-        #  不再把 step2 抽样 CSV 兼任"完整30m格网"。
+        #  不再把 step2 抽样 Parquet 兼任"完整30m格网"。
         # ==================================================================
         if progress_callback:
-            progress_callback("preprocessing", 0.45, "生成完整30m约束层 (30m_constraint_grid.csv)...")
+            progress_callback("preprocessing", 0.45, "生成完整30m约束层 (30m_constraint_grid.parquet)...")
 
         full_rr, full_cc = np.nonzero(joint_mask)
         constraint_data = {
@@ -685,10 +686,10 @@ def process_preprocessing(
         )
 
         def _build_constraint(tmp_path: str) -> None:
-            df_constraint.to_csv(tmp_path, index=False)
+            df_constraint.to_parquet(tmp_path, index=False, compression="zstd")
 
         def _validate_constraint(tmp_path: str) -> Tuple[bool, str]:
-            check = pd.read_csv(tmp_path, nrows=5)
+            check = sample_rows(tmp_path, n=5)
             missing = [c for c in constraint_columns() if c not in check.columns]
             if missing:
                 return False, f"完整30m约束层缺少列: {missing}"
@@ -721,7 +722,7 @@ def process_preprocessing(
             "description": (
                 "覆盖全部有效30m像元（joint_mask，即 Landsat QA + Sentinel SCL 4/5/6 + "
                 "热红外有效值），用于 TTRI 空间化插值网格 / TCR 聚合与回写 / 粗尺度闭合评价的"
-                "统一参考；与 30m_features_step2.csv（训练抽样）互为独立数据流（A-05）。"
+                "统一参考；与 30m_features_step2.parquet（训练抽样）互为独立数据流。"
                 "region_* 字段为研究区多边形口径的占比统计"
             ),
             "output_csv": constraint_csv,
@@ -735,12 +736,12 @@ def process_preprocessing(
                 f"完整30m约束层: {len(df_constraint):,} / {height_30m * width_30m:,} 像素有效",
             )
 
-        # 30m 阶段大数组用后即释放（7.2 节内存优化：核心 CSV/meta 已落盘后不再需要）
+        # 30m 阶段大数组用后即释放（内存优化：核心表/meta 已落盘后不再需要）
         del lst, qa, dem, blue, green, red, nir, swir1, scl
         del joint_mask, clear_mask, lst_k_full, slope, aspect, cos_aspect
 
         # ==================================================================
-        #  步骤5: 生成10m预测CSV
+        #  步骤5: 生成10m预测Parquet
         # ==================================================================
         if progress_callback:
             progress_callback("preprocessing", 0.55, "对齐SCL到Sentinel2 10m网格...")
@@ -749,10 +750,9 @@ def process_preprocessing(
         _resample_and_align(sentinel2_path, scl_path, scl_10m_aligned, is_categorical=True)
 
         if progress_callback:
-            progress_callback("preprocessing", 0.58, "生成10m预测特征CSV（全网格）...")
+            progress_callback("preprocessing", 0.58, "生成10m预测特征Parquet（全网格）...")
 
         block_rows = 512
-        first = True
         valid_pixels = 0
         scl_valid_pixels = 0
         black_zero_pixels = 0  # 仅诊断计数，不再用于剔除有效像元（见下方说明）
@@ -760,6 +760,9 @@ def process_preprocessing(
         region10 = _rasterize_region(study_area_geojson, sentinel2_path)
         region_pixels10 = int(region10.sum()) if region10 is not None else 0
         region_valid_pixels = 0
+
+        # Parquet 分块追加写（等价旧 to_csv(mode="a")，逐 block 一个 row group，内存可控）
+        _predict_writer = None
 
         with rasterio.open(sentinel2_path) as s2_ds, rasterio.open(scl_10m_aligned) as scl_ds:
             profile = s2_ds.profile.copy()
@@ -769,7 +772,7 @@ def process_preprocessing(
             if (scl_ds.height, scl_ds.width) != (height, width):
                 raise ValueError(
                     f"SCL栅格尺寸 {(scl_ds.height, scl_ds.width)} 与 Sentinel-2 10m 参考格网 "
-                    f"{(height, width)} 不一致（B-11 预飞行校验）"
+                    f"{(height, width)} 不一致（预飞行校验）"
                 )
 
             total_blocks = (height + block_rows - 1) // block_rows
@@ -788,7 +791,7 @@ def process_preprocessing(
                     for arr in (b_arr, g_arr, r_arr, n_arr, s_arr):
                         arr[arr == nodata] = np.nan
 
-                # 转换为地表反射率（数据获取阶段已按景应用 BOA_ADD_OFFSET 定标，见 A-03）
+                # 转换为地表反射率（数据获取阶段已按景应用 BOA_ADD_OFFSET 定标）
                 for arr in (b_arr, g_arr, r_arr, n_arr, s_arr):
                     arr /= S2_SR_SCALE
 
@@ -837,8 +840,9 @@ def process_preprocessing(
                     "NDBI": ndbi_arr.ravel(order="C"),
                 }, columns=PREDICT_COLUMNS).replace([np.inf, -np.inf], np.nan)
 
-                df_predict.to_csv(predict_csv, mode="w" if first else "a", header=first, index=False)
-                first = False
+                if _predict_writer is None:
+                    _predict_writer = TableWriter(predict_csv)
+                _predict_writer.write(df_predict)
 
                 if progress_callback:
                     progress_callback(
@@ -846,6 +850,9 @@ def process_preprocessing(
                         0.58 + 0.35 * (block_idx + 1) / total_blocks,
                         f"10m预测数据: block {block_idx + 1}/{total_blocks} (rows {start}-{stop - 1})",
                     )
+
+        if _predict_writer is not None:
+            _predict_writer.close()
 
         # 生成10m元数据
         predict_meta_dict = {
@@ -855,10 +862,10 @@ def process_preprocessing(
             "crs": str(profile.get("crs")) if profile.get("crs") else None,
             "transform": _transform_to_list(profile["transform"]),
             "ravel_order": "C",
-            "description": "CSV data row index = row * width + col; row/col columns are preserved",
+            "description": "Parquet data row index = row * width + col; row/col columns are preserved",
             "columns": PREDICT_COLUMNS,
             "sentinel2_sr_scale": (
-                f"exported reflectance = corrected DN / {S2_SR_SCALE:g}（数据获取阶段已按景定标，见 A-03）"
+                f"exported reflectance = corrected DN / {S2_SR_SCALE:g}（数据获取阶段已按景定标）"
             ),
             "valid_pixels": int(valid_pixels),
             "scl_valid_pixels": int(scl_valid_pixels),
@@ -909,7 +916,7 @@ def process_preprocessing(
             "elapsed_seconds": round(elapsed, 1),
         }
     finally:
-        # aligned_* 中间产物按 7.3 节策略保留供 debug，仅清理明确无核心价值的合并临时文件
+        # aligned_* 中间产物按既定策略保留供 debug，仅清理明确无核心价值的合并临时文件
         merged_tmp_candidates = set()
         for _p in (landsat_path, sentinel2_path, qa_path, scl_path, dem_path):
             _d = os.path.dirname(_p)

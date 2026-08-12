@@ -10,6 +10,8 @@ from typing import Dict
 
 import pandas as pd
 
+from .table_io import copy_table, iter_chunks, read_row_count
+
 
 def compute_lst_final(
     input_csv: str,
@@ -21,8 +23,8 @@ def compute_lst_final(
     LST_final 已在 TCR 计算阶段完成，此函数仅做文件验证。
 
     Args:
-        input_csv:    TCR阶段输出的CSV路径（已含LST_final列）
-        output_path:  输出CSV路径（直接复制input_csv或验证其存在）
+        input_csv:    TCR阶段输出的Parquet路径（已含LST_final列）
+        output_path:  输出Parquet路径（直接复制input_csv或验证其存在）
         chunk_size:   兼容参数
         progress_callback: 进度回调
 
@@ -35,22 +37,17 @@ def compute_lst_final(
     if not os.path.isfile(input_csv):
         raise FileNotFoundError(f"TCR输出文件不存在: {input_csv}")
 
-    # 快速统计行数
+    # 快速统计行数（只读单列，避免全量解压）
     total_rows = 0
     total_valid = 0
-    for chunk in pd.read_csv(input_csv, chunksize=chunk_size, usecols=["LST_final"]):
+    for chunk in iter_chunks(input_csv, columns=["LST_final"], batch_size=chunk_size):
         total_rows += len(chunk)
         total_valid += chunk["LST_final"].notna().sum()
 
-    # 如果输出路径与输入不同，复制文件
+    # 如果输出路径与输入不同，复制文件（Parquet 整文件复制）
     if output_path != input_csv:
         os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else ".", exist_ok=True)
-        pd.read_csv(input_csv, chunksize=chunk_size)
-        first = True
-        for chunk in pd.read_csv(input_csv, chunksize=chunk_size):
-            chunk.to_csv(output_path, mode="w" if first else "a",
-                         header=first, index=False, encoding="utf-8-sig")
-            first = False
+        copy_table(input_csv, output_path)
 
     if progress_callback:
         progress_callback("lst_final", 1.0,

@@ -8,7 +8,7 @@ downloads since data_acquisition.py was already validated separately with
 REAL Planetary Computer data):
     - data_pipeline (preprocessing + spatial-block split)
     - ttri_compute  (single-fit TTRI + unified affine interpolation)
-    - rf_model      (param-merged RF + independent_prediction.json)
+    - rf_model      (param-merged RF + test metrics)
     - tcr_compute   (block_constant TCR via unified affine mapping)
     - lst_export    (row/col-correct GeoTIFF export)
     - accuracy_eval (coarse_constraint_closure.json, no 5K fields)
@@ -124,11 +124,11 @@ result = skill.execute({
 print("STAGE 1 data_pipeline success=", result.success, "|", result.message)
 assert result.success, result.message
 assert os.path.isfile(result.data["constraint_csv"])
-assert os.path.isfile(os.path.join(PROCESSED_DIR, "train.csv"))
+assert os.path.isfile(os.path.join(PROCESSED_DIR, "train.parquet"))
 assert os.path.isfile(os.path.join(PROCESSED_DIR, "split_info.json"))
 
 import pandas as pd
-train_df = pd.read_csv(os.path.join(PROCESSED_DIR, "train.csv"))
+train_df = pd.read_parquet(os.path.join(PROCESSED_DIR, "train.parquet"))
 print(f"  train rows={len(train_df)}, constraint rows={result.data['constraint_rows']}")
 
 # ======================================================================
@@ -139,12 +139,12 @@ from core.skills.builtin.ttri_compute import TTRIComputeSkill
 
 skill = TTRIComputeSkill()
 result = skill.execute({
-    "train_csv": os.path.join(PROCESSED_DIR, "train.csv"),
-    "val_csv": os.path.join(PROCESSED_DIR, "validate.csv"),
-    "test_csv": os.path.join(PROCESSED_DIR, "test.csv"),
+    "train_csv": os.path.join(PROCESSED_DIR, "train.parquet"),
+    "val_csv": os.path.join(PROCESSED_DIR, "validate.parquet"),
+    "test_csv": os.path.join(PROCESSED_DIR, "test.parquet"),
     "output_dir": PROCESSED_DIR,  # Agent injects this; constraint_csv/meta must be auto-derived
-    "data_30m_csv": os.path.join(PROCESSED_DIR, "30m_features_step2.csv"),  # legacy param Agent injects, unused now
-    "predict_10m_csv": os.path.join(PROCESSED_DIR, "10m_predict_features.csv"),
+    "data_30m_csv": os.path.join(PROCESSED_DIR, "30m_features_step2.parquet"),  # legacy param Agent injects, unused now
+    "predict_10m_csv": os.path.join(PROCESSED_DIR, "10m_predict_features.parquet"),
 }, progress_callback=pcb, log_callback=lcb)
 print("STAGE 2 ttri_compute success=", result.success, "|", result.message)
 assert result.success, result.message
@@ -157,21 +157,21 @@ print("  TTRI coefficients:", coef_json["coefficients"], "r2=", coef_json["r2"])
 # ground truth was temp = 305 - 0.01*DEM -> a(DEM) should be close to -0.01
 assert abs(coef_json["coefficients"][0] - (-0.01)) < 0.01, f"unexpected TTRI DEM coefficient: {coef_json['coefficients']}"
 
-predict_df = pd.read_csv(os.path.join(PROCESSED_DIR, "10m_predict_features.csv"))
+predict_df = pd.read_parquet(os.path.join(PROCESSED_DIR, "10m_predict_features.parquet"))
 assert "TTRI" in predict_df.columns
 print(f"  10m predict rows={len(predict_df)}, TTRI valid={predict_df['TTRI'].notna().sum()}")
 assert predict_df["TTRI"].notna().sum() > 0
 
 # ======================================================================
-#  Stage 3: rf_model  (produces model + independent_prediction.json)
+#  Stage 3: rf_model  (produces model + test metrics)
 # ======================================================================
 from core.skills.builtin.rf_model import RFModelSkill
 
 skill = RFModelSkill()
 result = skill.execute({
-    "train_csv": os.path.join(PROCESSED_DIR, "train.csv"),
-    "val_csv": os.path.join(PROCESSED_DIR, "validate.csv"),
-    "test_csv": os.path.join(PROCESSED_DIR, "test.csv"),
+    "train_csv": os.path.join(PROCESSED_DIR, "train.parquet"),
+    "val_csv": os.path.join(PROCESSED_DIR, "validate.parquet"),
+    "test_csv": os.path.join(PROCESSED_DIR, "test.parquet"),
     "output_dir": RESULTS_DIR,
     "n_estimators": 50,  # small/fast for test
     "max_depth": 10,
@@ -179,14 +179,7 @@ result = skill.execute({
 print("STAGE 3 rf_model success=", result.success, "|", result.message)
 assert result.success, result.message
 assert os.path.isfile(result.data["model_path"])
-assert os.path.isfile(result.data["independent_prediction_path"])
-with open(result.data["independent_prediction_path"], encoding="utf-8") as f:
-    indep = json.load(f)
-print("  independent_prediction protocol:", indep["protocol"], "metrics:", indep["metrics"])
-assert indep["protocol"] == "independent_prediction"
-assert "MB_K" in indep["metrics"]
-assert indep["split_method"] == "spatial_block_guard_buffer"
-# random_state should have been correctly applied (not silently dropped, B-02)
+# random_state should have been correctly applied (not silently dropped)
 assert result.data["params"]["random_state"] == 42
 assert result.data["params"]["max_features"] == 0.5
 print("  RF effective params (random_state/max_features preserved):", result.data["params"])
@@ -199,12 +192,12 @@ model_path = result.data["model_path"]
 # ======================================================================
 from core.skills.builtin.tcr_compute import TCRComputeSkill
 
-tcr_output = os.path.join(RESULTS_DIR, "tcr_result.csv")
+tcr_output = os.path.join(RESULTS_DIR, "tcr_result.parquet")
 skill = TCRComputeSkill()
 result = skill.execute({
-    "data_30m_csv": os.path.join(PROCESSED_DIR, "30m_features_step2.csv"),  # legacy, Agent-injected
+    "data_30m_csv": os.path.join(PROCESSED_DIR, "30m_features_step2.parquet"),  # legacy, Agent-injected
     "meta_30m_json": os.path.join(PROCESSED_DIR, "30m_features_step2_meta.json"),  # legacy, Agent-injected
-    "predict_10m_csv": os.path.join(PROCESSED_DIR, "10m_predict_features.csv"),
+    "predict_10m_csv": os.path.join(PROCESSED_DIR, "10m_predict_features.parquet"),
     "meta_10m_json": os.path.join(PROCESSED_DIR, "10m_predict_features_meta.json"),
     "model_path": model_path,
     "output_path": tcr_output,
@@ -217,8 +210,8 @@ print("  TCR validity:", result.data["validity"])
 assert result.data["validity"]["out_of_grid"] >= 0
 
 # Verify block_constant closure property holds on THIS real pipeline run too
-tcr_df = pd.read_csv(tcr_output)
-constraint_df = pd.read_csv(os.path.join(PROCESSED_DIR, "30m_constraint_grid.csv"))
+tcr_df = pd.read_parquet(tcr_output)
+constraint_df = pd.read_parquet(os.path.join(PROCESSED_DIR, "30m_constraint_grid.parquet"))
 tcr_df["c_row"] = tcr_df["row"] // 3
 tcr_df["c_col"] = tcr_df["col"] // 3
 agg = tcr_df.groupby(["c_row", "c_col"])["LST_final"].mean().reset_index()
@@ -248,9 +241,9 @@ ds = gdal.Open(tif_path)
 print(f"  GeoTIFF: {ds.RasterXSize}x{ds.RasterYSize}, band desc={ds.GetRasterBand(1).GetDescription()}")
 assert ds.RasterXSize == W10 and ds.RasterYSize == H10
 band_arr = ds.GetRasterBand(1).ReadAsArray()
-# spot check a few known (row,col) positions against the CSV values directly (B-07 row/col correctness)
-# 注：lst_export 完成后 rf_10m_predict.csv 已被中间产物清理删除，此处改读输入源 tcr_result.csv（LST_final 同源）
-final_df = pd.read_csv(tcr_output)
+# spot check a few known (row,col) positions against the CSV values directly (row/col correctness)
+# 注：lst_export 完成后 rf_10m_predict.parquet 已被中间产物清理删除，此处改读输入源 tcr_result.parquet（LST_final 同源）
+final_df = pd.read_parquet(tcr_output)
 sample_rows = final_df.dropna(subset=["LST_final"]).sample(20, random_state=1)
 for _, r in sample_rows.iterrows():
     csv_val = r["LST_final"]
@@ -266,7 +259,7 @@ from core.skills.builtin.accuracy_eval import AccuracyEvalSkill
 
 skill = AccuracyEvalSkill()
 result = skill.execute({
-    "full_30m_csv": os.path.join(PROCESSED_DIR, "30m_features_step2.csv"),  # legacy, Agent-injected
+    "full_30m_csv": os.path.join(PROCESSED_DIR, "30m_features_step2.parquet"),  # legacy, Agent-injected
     "predict_csv": tcr_output,
     "output_dir": RESULTS_DIR,
     "meta_30m_json": os.path.join(PROCESSED_DIR, "30m_features_step2_meta.json"),  # legacy, Agent-injected

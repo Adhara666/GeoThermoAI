@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-数据轻反思 D1–D7 合成测试（技术方案 11.2）
+数据轻反思 D1–D7 合成测试
 
 运行：python tests/test_data_agent_reflection.py
 覆盖：
@@ -51,9 +51,9 @@ class _FakeLLM:
 
 
 GOOD_PIPELINE = {
-    # train_rows 是 30m_features_step2.csv 的 step=2 抽样行数，D3 用它检查样本量；
+    # train_rows 是 30m_features_step2.parquet 的 step=2 抽样行数，D3 用它检查样本量；
     # constraint_rows 是完整 30 米约束层（step=1）的有效像元数，D4 与 D7 用它检查
-    # 约束层是否有效、有效像元占比是否达标——两者抽样粒度不同，不能混用（v1.2 修复）。
+    # 约束层是否有效、有效像元占比是否达标——两者抽样粒度不同，不能混用。
     "train_rows": 45678,
     "constraint_rows": 45678,
     "predict_valid_pixels": 400000,
@@ -75,7 +75,9 @@ def _ok_meta(path):
 
 
 def _check(**overrides):
-    kwargs = dict(raw_dir="raw", processed_dir="processed", pipeline_data=GOOD_PIPELINE,
+    # raw_dir 留空：走探针注入分支（_check_d1 在 raw_dir 非空时会先 glob 真实文件，
+    # 合成测试目录里没有真实栅格，会让 mock 探针失效而误报「文件不存在」）
+    kwargs = dict(raw_dir="", processed_dir="processed", pipeline_data=GOOD_PIPELINE,
                   manifest={"stages": {s: {"status": "completed"}
                                        for s in data_rules.REQUIRED_STAGES}},
                   raster_probe=_ok_raster, csv_probe=_ok_csv, meta_probe=_ok_meta)
@@ -179,7 +181,7 @@ def test_d5_split_balance():
 def test_d6_ttri_column():
     print("[7] D6 地形热响应指数列")
     def no_ttri(path):
-        if path.endswith("test.csv"):
+        if path.endswith("test.parquet"):
             return {"exists": True, "has_ttri": False}
         return _ok_csv(path)
 
@@ -219,7 +221,7 @@ def test_d7_valid_ratio():
 
 
 def test_d7_uses_constraint_layer_not_step2_sample():
-    print("[8.1] D7 必须用完整约束层，不能用 step=2 抽样的训练行数（v1.2 回归测试）")
+    print("[8.1] D7 必须用完整约束层，不能用 step=2 抽样的训练行数")
     # train_rows 故意做得很小（模拟真实的 step=2 抽样：只有完整约束层的约四分之一），
     # 但 constraint_rows 完全达标——若 D7 误用 train_rows 当分子，会把这批合格的数据
     # 误判为不合格；用 constraint_rows 才是正确口径。
@@ -296,7 +298,8 @@ class _Ctx:
         self.emitted = []
         self.exp_state = {}
         self.project_dir = project_dir
-        self.raw_dir = "raw"
+        # 与 _check 一致：raw_dir 留空走探针注入分支，避免 glob 真实文件
+        self.raw_dir = ""
         self.processed_dir = "processed"
 
     def emit(self, text, to_log=False):
@@ -323,7 +326,7 @@ def test_executor_gets_blocking_decision():
     _assert(hooks.replan_request is not None, "replan 请求被记录")
     joined = "".join(ctx.emitted)
     _assert("数据检查未通过" in joined, "气泡说明数据检查未通过")
-    # 升级点 10：不再向前端展示「[规则] Dx 判定不合格」字眼，用自然语言说明判定结论
+    # 不再向前端展示「[规则] Dx 判定不合格」字眼，用自然语言说明判定结论
     _assert("判定本批数据不合格" in joined, "气泡用自然语言说明判定结论（不带 [规则] 编号）")
     _assert("[规则]" not in joined, "气泡不展示规则编号字眼")
 
@@ -351,9 +354,9 @@ def test_executor_gets_blocking_decision():
     _assert(decision.action == StepDecision.REPLAN, "重选影像组合走 replan 通道回到数据阶段")
     _assert(hooks.resume_point == Node.PAIR_SELECTION, "断点记为影像组合选择")
     _assert(hooks.replan_request["payload"].get("reselect_pair") is True,
-            "带上 reselect_pair 标记（v1.2：role_flow 据此跳过规划 Agent，不整单 replan）")
+            "带上 reselect_pair 标记（role_flow 据此跳过规划 Agent，不整单 replan）")
 
-    # 用户选「我接受现状，继续执行」→ 直接放行（v1.2 新增）
+    # 用户选「我接受现状，继续执行」→ 直接放行
     def pause_accept(payload):
         return {"paused": False, "data": {"option_id": Option.ACCEPT, "values": {}}}
 

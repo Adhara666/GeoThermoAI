@@ -1,5 +1,5 @@
 """
-执行模式（技术方案 3.1）
+执行模式
 
 默认值必须是 APPROVAL：现状代码在配对选择处一定会暂停问用户，
 默认「由我批准」才能保证不改变队友现有功能。
@@ -32,7 +32,7 @@ MODE_HINTS: Dict[str, str] = {
 
 
 def normalize(value: Optional[str], default: str = DEFAULT_EXEC_MODE) -> str:
-    """把任意输入收敛到合法模式；非法值回落到 default（技术方案 3.5）。"""
+    """把任意输入收敛到合法模式；非法值回落到 default。"""
     mode = str(value or "").strip().lower()
     return mode if mode in ALL_MODES else default
 

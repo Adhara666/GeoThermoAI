@@ -72,14 +72,14 @@ def composite_median(
 
     driver = gdal.GetDriverByName("GTiff")
     out_ds = driver.Create(output_path, width, height, 1, gdal.GDT_Float32,
-                           options=["COMPRESS=LZW", "TILED=YES", "BIGTIFF=YES"])
+                           options=["COMPRESS=DEFLATE", "PREDICTOR=3", "TILED=YES", "BIGTIFF=YES"])
     out_ds.SetGeoTransform(geotransform)
     out_ds.SetProjection(projection)
     out_band = out_ds.GetRasterBand(1)
     out_band.SetNoDataValue(nodata)
 
     cnt_ds = driver.Create(count_path, width, height, 1, gdal.GDT_UInt16,
-                           options=["COMPRESS=LZW", "TILED=YES"])
+                           options=["COMPRESS=DEFLATE", "PREDICTOR=2", "TILED=YES"])
     cnt_ds.SetGeoTransform(geotransform)
     cnt_ds.SetProjection(projection)
     cnt_band = cnt_ds.GetRasterBand(1)

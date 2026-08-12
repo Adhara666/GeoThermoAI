@@ -1,10 +1,10 @@
 """
-run_manifest.json 读写与产物血缘工具（对应审查文档 A-08 / C-03，用户确认第7条固定命名）
+run_manifest.json 读写与产物血缘工具（按用户确认固定命名）
 
 固定文件名 ``run_manifest.json`` 位于项目 output_dir 根目录，记录：
     - 各 stage 的完成状态（pending/running/completed/failed/skipped_upstream）
     - 每个 stage 产出的关键文件路径、行数/尺寸等统计、输入签名 hash
-    - 用于替代"按文件名排序/计数取最新"的不可靠推断（C-03）
+    - 用于替代"按文件名排序/计数取最新"的不可靠推断
 
 本模块只被各 Skill 包装器（core/skills/builtin/*.py）、core/pipeline.py 与
 server.py 状态查询调用，不涉及 Agent 的规划/对话/工具选择逻辑。
@@ -176,7 +176,7 @@ def get_stage_entry(output_dir: str, stage: str) -> Dict[str, Any]:
 
 def resolve_artifact(output_dir: str, stage: str, key: str) -> Optional[str]:
     """从 manifest 精确取某 stage 的产物路径；只有 status=completed 才返回，
-    避免用目录"最新文件名排序/计数+1"做不可靠推断（C-03）。"""
+    避免用目录"最新文件名排序/计数+1"做不可靠推断。"""
     entry = get_stage_entry(output_dir, stage)
     if entry.get("status") != STATUS_COMPLETED:
         return None

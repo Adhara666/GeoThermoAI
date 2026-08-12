@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-规划轻反思规则 P1–P7 合成测试（技术方案 11.2）
+规划轻反思规则 P1–P7 合成测试
 
 运行：python tests/test_planner_reflection.py
 覆盖：
@@ -43,7 +43,7 @@ class _FakeRegistry:
         return object() if name in self._names else None
 
 
-REGISTRY = _FakeRegistry(list(plan_schema.WORKFLOW_STEPS) + ["ai_assistant"])
+REGISTRY = _FakeRegistry(list(plan_schema.WORKFLOW_STEPS) + ["ai_assistant", "lst_gapfill"])
 
 
 def _tmp_study_area(tmp, name="九江镇.geojson"):
@@ -205,6 +205,14 @@ def test_p5_workflow_order():
             wants_full_workflow=False, **common)
         _assert(plan_schema.skill_names(plan) == ["accuracy_eval"],
                 "非全流程任务保持用户要求的单步")
+
+        # 「从头执行并包含结果后处理」：lst_gapfill 保留为完整流程最后一步
+        with_gapfill = [{"skill": s, "params": {}} for s in plan_schema.WORKFLOW_STEPS]
+        with_gapfill.append({"skill": "lst_gapfill", "params": {}})
+        plan, res = planner_rules.check(_plan(path, steps=with_gapfill), **common)
+        _assert(plan_schema.skill_names(plan)
+                == list(plan_schema.WORKFLOW_STEPS) + ["lst_gapfill"],
+                "包含结果后处理的完整流程 = 7 步 + lst_gapfill 在末尾（不被 P5 丢弃）")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 
@@ -326,7 +334,7 @@ def test_time_expression_parsing():
 
 
 def test_year_plausibility():
-    """v1.2 新增：「125年」这类明显不合理的年份必须能被识别出来（修订记录 v1.2 第 ⑯ 条）。"""
+    """「125年」这类明显不合理的年份必须能被识别出来。"""
     print("[8.1] 年份合理性校验")
     today = datetime.date(2026, 8, 7)
 

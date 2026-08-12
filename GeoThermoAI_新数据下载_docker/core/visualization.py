@@ -2,7 +2,7 @@
 GeoThermoAI 可视化模块
 
 基于 Folium / Leaflet 的多图层交互式地图，支持 GeoTIFF 渲染（UTM→WGS84 转换）。
-参考升级规划 v2 第 3.7 节 LayerVisualizer 设计。
+LayerVisualizer 设计参考。
 
 v3.2 变更：
 - 移除 NDVI / NDWI / NDBI 遥感指数图层（地图不再展示指数）
@@ -110,7 +110,7 @@ class LayerVisualizer:
         },
         {
             "id": "lst_10m_filled",
-            "label": "10m LST（填洞后）",
+            "label": "10m LST（无空洞）",
             "group": "结果",
             "file": "results/rf_10m_lst_final_filled.tif",
             "band": 1,
@@ -125,7 +125,7 @@ class LayerVisualizer:
 
     @staticmethod
     def _resolve_layer_path(project_dir: str, layer_def: dict) -> str:
-        """解析图层文件实际路径（升级点 2/4）。
+        """解析图层文件实际路径。
 
         优先取项目下最近修改的影像对目录（project_dir/pairs/L{date}_S{date}）中的文件；
         文件名带日期（如 landsat_lst_20240701.tif）时按前缀 glob 匹配最新的一个；
@@ -147,7 +147,7 @@ class LayerVisualizer:
         directory = os.path.dirname(fixed)
         if directory and os.path.isdir(directory):
             # 只匹配纯 8 位日期后缀（YYYYMMDD），避免 glob 的 * 误匹配
-            # 到 _cloud_mask 等派生产物（升级点：结果后处理填洞图层隔离）
+            # 到 _cloud_mask 等派生产物（结果后处理填洞图层隔离）
             pattern = re.compile(re.escape(name) + r"_[0-9]{8}" + re.escape(ext) + r"$")
             matches = [p for p in glob.glob(os.path.join(directory, f"{name}_[0-9]*{ext}"))
                        if pattern.match(os.path.basename(p))]
@@ -583,7 +583,7 @@ class LayerVisualizer:
 
     @staticmethod
     def _layer_label_with_date(layer_def: dict, file_path: str) -> str:
-        """图层标签附带影像日期（升级点 4：地图界面显示影像日期，DEM 除外）。
+        """图层标签附带影像日期（地图界面显示影像日期，DEM 除外）。
 
         从带日期的文件名（如 landsat_lst_20240701.tif）提取 YYYYMMDD：
         - 配对模式：格式化为 YYYY-MM-DD 追加到标签后；

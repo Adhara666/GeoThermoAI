@@ -1,5 +1,5 @@
 """
-规划轻反思：确定性规则 P1–P7（技术方案 4.6）
+规划轻反思：确定性规则 P1–P7
 
 先跑确定性规则，再跑 LLM 反思，**规则结论覆盖 LLM 结论**。
 本模块只包含确定性规则；LLM 反思在 `roles/planner_agent.py` 里调用，
@@ -116,7 +116,12 @@ def drop_unknown_skills(plan: Dict[str, Any], registry) -> Tuple[Dict[str, Any],
 
 def enforce_workflow_order(plan: Dict[str, Any],
                            wants_full_workflow: bool) -> Tuple[Dict[str, Any], List[str]]:
-    """P5：全流程任务的步骤必须是 7 步且顺序正确，缺失则补齐、乱序则重排。"""
+    """P5：全流程任务的步骤必须是 7 步且顺序正确，缺失则补齐、乱序则重排。
+
+    用户明确要求「从头执行并包含结果后处理」时，LLM 会在 steps 里带 lst_gapfill
+    步骤——把它保留并追加到 accuracy_eval 之后，成为完整流程的最后一步
+    （此前 reorder_to_workflow 只保留固定 7 步技能，会把该步骤丢弃）。
+    """
     if not wants_full_workflow:
         return plan, []
     if plan_schema.is_full_workflow(plan):
@@ -143,7 +148,14 @@ def enforce_workflow_order(plan: Dict[str, Any],
             }
         steps.append({"skill": name, "params": params,
                       "reason": _DEFAULT_REASONS.get(name, "")})
-    return plan_schema.reorder_to_workflow(plan_schema.with_steps(plan, steps)), ["P5"]
+    # 结果后处理步骤（LLM 因用户明确要求而输出）追加到完整流程末尾，
+    # 由执行引擎交给结果 Agent（EvalAgent）执行
+    extra = by_skill.get("lst_gapfill")
+    if extra is not None:
+        steps.append(dict(extra))
+    # 直接 with_steps：steps 已按 WORKFLOW_STEPS 顺序构建 + lst_gapfill 在末尾，
+    # 不再走 reorder_to_workflow（它只会保留固定 7 步技能，会丢掉 lst_gapfill）
+    return plan_schema.with_steps(plan, steps), ["P5"]
 
 
 _DEFAULT_REASONS = {

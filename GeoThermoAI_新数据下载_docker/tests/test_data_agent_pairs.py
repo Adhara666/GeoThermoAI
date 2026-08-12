@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-数据 Agent 的影像配对评分与选择合成测试（技术方案 11.2）
+数据 Agent 的影像配对评分与选择合成测试
 
 运行：python tests/test_data_agent_pairs.py
 覆盖：
@@ -66,7 +66,7 @@ PAIRS = [
 
 
 def test_weights():
-    print("[1] 评分权重与技术方案一致")
+    print("[1] 评分权重与规则一致")
     _assert(PAIR_WEIGHTS == {"cloud": 0.45, "coverage": 0.30,
                              "time_diff": 0.15, "scene_count": 0.10},
             "权重为 云 0.45 / 覆盖 0.30 / 时间差 0.15 / 景数 0.10")
@@ -233,7 +233,7 @@ def test_no_pair_never_hard_runs():
             and Option.STOP in options,
             "no_pair 节点给出放宽云量/扩大时间/停止等选项")
     _assert(Option.CHANGE_SOURCE not in options,
-            "提问时不出现「更换数据源」选项（升级点 11）")
+            "提问时不出现「更换数据源」选项")
 
     # 无 pause_callback（无法询问）→ 挂起，绝不硬跑
     hooks = RoleHooks(exec_mode=ExecMode.APPROVAL, run_state=RunState(replan_max=0),

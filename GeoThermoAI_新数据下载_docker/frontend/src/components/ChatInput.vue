@@ -50,7 +50,7 @@ async function submit() {
           :placeholder="chat.streaming ? '回复生成中…' : (chat.chatMode === 'chat' ? 'Chat 模式：只读对话，仅回答问题' : '输入指令…（Enter 发送，Shift+Enter 换行）')"
           @keydown="onKeydown"
         ></textarea>
-        <!-- 升级点 17：只有 Work 模式显示执行模式（由我批准/完全执行） -->
+        <!-- 只有 Work 模式显示执行模式（由我批准/完全执行） -->
         <ExecModeSelect v-if="chat.chatMode === 'work'" />
         <button class="chat-send" :disabled="chat.streaming || !project.currentConv" @click="submit" title="发送">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">

@@ -2,8 +2,8 @@
 数据预处理+数据集划分 Skill
 
 整合数据预处理和数据集划分两个步骤：
-    1. 调用 process_preprocessing() 生成30m训练特征CSV（step2）、完整30m约束层
-       和10m预测特征CSV
+    1. 调用 process_preprocessing() 生成30m训练特征Parquet（step2）、完整30m约束层
+       和10m预测特征Parquet
     2. 调用 split_dataset() 按空间块 + guard buffer 划分训练/验证/测试集
 """
 
@@ -16,7 +16,7 @@ from ...intermediate_cleanup import cleanup_stage
 
 
 class DataPipelineSkill(BaseSkill):
-    """数据预处理 + 数据集划分：对齐栅格、计算指数、生成CSV并划分数据集"""
+    """数据预处理 + 数据集划分：对齐栅格、计算指数、生成Parquet并划分数据集"""
 
     @property
     def name(self) -> str:
@@ -28,7 +28,7 @@ class DataPipelineSkill(BaseSkill):
 
     @property
     def description(self) -> str:
-        return "将 Landsat/Sentinel-2/DEM 栅格数据进行预处理（对齐、掩膜、光谱指数），生成30m训练CSV、完整30m约束层和10m预测CSV，并按空间块+guard buffer划分训练/验证/测试集。"
+        return "将 Landsat/Sentinel-2/DEM 栅格数据进行预处理（对齐、掩膜、光谱指数），生成30m训练Parquet、完整30m约束层和10m预测Parquet，并按空间块+guard buffer划分训练/验证/测试集。"
 
     @property
     def parameters(self) -> List[SkillParameter]:
@@ -62,10 +62,10 @@ class DataPipelineSkill(BaseSkill):
     @property
     def output_schema(self) -> Dict[str, str]:
         return {
-            "train_csv": "训练集CSV路径",
-            "val_csv": "验证集CSV路径",
-            "test_csv": "测试集CSV路径",
-            "constraint_csv": "完整30m约束层CSV路径",
+            "train_csv": "训练集Parquet路径",
+            "val_csv": "验证集Parquet路径",
+            "test_csv": "测试集Parquet路径",
+            "constraint_csv": "完整30m约束层Parquet路径",
             "constraint_meta": "完整30m约束层元数据JSON路径",
             "train_meta": "30m训练元数据JSON路径",
             "predict_meta": "10m预测元数据JSON路径",
@@ -146,7 +146,7 @@ class DataPipelineSkill(BaseSkill):
         constraint_meta = prep_result.get("constraint_meta", "")
 
         if log_callback:
-            log_callback("INFO", f"预处理完成: 训练CSV={train_csv}, 完整约束层={constraint_csv}, 预测CSV={predict_csv}")
+            log_callback("INFO", f"预处理完成: 训练Parquet={train_csv}, 完整约束层={constraint_csv}, 预测Parquet={predict_csv}")
 
         # ── 步骤2: 数据集划分（空间块 + guard buffer）──────────────────
         if log_callback:
@@ -172,9 +172,9 @@ class DataPipelineSkill(BaseSkill):
             return SkillResult(success=False, message=f"数据集划分失败: {e}")
 
         result_data = {
-            "train_csv": os.path.join(train_dir, "train.csv"),
-            "val_csv": os.path.join(train_dir, "validate.csv"),
-            "test_csv": os.path.join(train_dir, "test.csv"),
+            "train_csv": os.path.join(train_dir, "train.parquet"),
+            "val_csv": os.path.join(train_dir, "validate.parquet"),
+            "test_csv": os.path.join(train_dir, "test.parquet"),
             "train_meta": train_meta,
             "predict_meta": predict_meta,
             "predict_csv": predict_csv,
@@ -204,7 +204,7 @@ class DataPipelineSkill(BaseSkill):
                     "split_info": result_data["split_info"],
                 },
             )
-            # 划分完成后，对齐栅格中间产物与 step2 抽样 CSV 已无下游消费方，立即清理
+            # 划分完成后，对齐栅格中间产物与 step2 抽样 Parquet 已无下游消费方，立即清理
             cleanup_stage(project_root, "data_pipeline")
 
         if progress_callback:

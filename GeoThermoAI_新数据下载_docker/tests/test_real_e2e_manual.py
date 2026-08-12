@@ -88,12 +88,12 @@ assert result.data["train_rows"] > 0
 from core.skills.builtin.ttri_compute import TTRIComputeSkill
 
 result = TTRIComputeSkill().execute({
-    "train_csv": os.path.join(PROCESSED_DIR, "train.csv"),
-    "val_csv": os.path.join(PROCESSED_DIR, "validate.csv"),
-    "test_csv": os.path.join(PROCESSED_DIR, "test.csv"),
+    "train_csv": os.path.join(PROCESSED_DIR, "train.parquet"),
+    "val_csv": os.path.join(PROCESSED_DIR, "validate.parquet"),
+    "test_csv": os.path.join(PROCESSED_DIR, "test.parquet"),
     "output_dir": PROCESSED_DIR,
-    "data_30m_csv": os.path.join(PROCESSED_DIR, "30m_features_step2.csv"),
-    "predict_10m_csv": os.path.join(PROCESSED_DIR, "10m_predict_features.csv"),
+    "data_30m_csv": os.path.join(PROCESSED_DIR, "30m_features_step2.parquet"),
+    "predict_10m_csv": os.path.join(PROCESSED_DIR, "10m_predict_features.parquet"),
 }, progress_callback=pcb, log_callback=lcb)
 assert result.success, result.message
 print(f"[{time.time()-t0:.0f}s] STAGE ttri_compute OK:", result.message)
@@ -104,27 +104,25 @@ print(f"[{time.time()-t0:.0f}s] STAGE ttri_compute OK:", result.message)
 from core.skills.builtin.rf_model import RFModelSkill
 
 result = RFModelSkill().execute({
-    "train_csv": os.path.join(PROCESSED_DIR, "train.csv"),
-    "val_csv": os.path.join(PROCESSED_DIR, "validate.csv"),
-    "test_csv": os.path.join(PROCESSED_DIR, "test.csv"),
+    "train_csv": os.path.join(PROCESSED_DIR, "train.parquet"),
+    "val_csv": os.path.join(PROCESSED_DIR, "validate.parquet"),
+    "test_csv": os.path.join(PROCESSED_DIR, "test.parquet"),
     "output_dir": RESULTS_DIR,
 }, progress_callback=pcb, log_callback=lcb)
 assert result.success, result.message
 print(f"[{time.time()-t0:.0f}s] STAGE rf_model OK:", result.message)
 model_path = result.data["model_path"]
-with open(result.data["independent_prediction_path"], encoding="utf-8") as f:
-    print("  independent_prediction:", json.load(f)["metrics"])
 
 # ======================================================================
 #  Stage 4: tcr_compute
 # ======================================================================
 from core.skills.builtin.tcr_compute import TCRComputeSkill
 
-tcr_output = os.path.join(RESULTS_DIR, "tcr_result.csv")
+tcr_output = os.path.join(RESULTS_DIR, "tcr_result.parquet")
 result = TCRComputeSkill().execute({
-    "data_30m_csv": os.path.join(PROCESSED_DIR, "30m_features_step2.csv"),
+    "data_30m_csv": os.path.join(PROCESSED_DIR, "30m_features_step2.parquet"),
     "meta_30m_json": os.path.join(PROCESSED_DIR, "30m_features_step2_meta.json"),
-    "predict_10m_csv": os.path.join(PROCESSED_DIR, "10m_predict_features.csv"),
+    "predict_10m_csv": os.path.join(PROCESSED_DIR, "10m_predict_features.parquet"),
     "meta_10m_json": os.path.join(PROCESSED_DIR, "10m_predict_features_meta.json"),
     "model_path": model_path, "output_path": tcr_output,
 }, progress_callback=pcb, log_callback=lcb)
@@ -153,7 +151,7 @@ tif_path = result.data["tif_path"]
 from core.skills.builtin.accuracy_eval import AccuracyEvalSkill
 
 result = AccuracyEvalSkill().execute({
-    "full_30m_csv": os.path.join(PROCESSED_DIR, "30m_features_step2.csv"),
+    "full_30m_csv": os.path.join(PROCESSED_DIR, "30m_features_step2.parquet"),
     "predict_csv": tcr_output, "output_dir": RESULTS_DIR,
     "meta_30m_json": os.path.join(PROCESSED_DIR, "30m_features_step2_meta.json"),
     "meta_10m_json": os.path.join(PROCESSED_DIR, "10m_predict_features_meta.json"),

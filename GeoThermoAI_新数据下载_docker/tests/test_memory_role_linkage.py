@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-记忆系统角色联动合成测试（技术方案 11.2）
+记忆系统角色联动合成测试
 
 运行：python tests/test_memory_role_linkage.py
 覆盖：
-- E 系列在**已有 collection** 上能被增量播种（修复 1.5(6)①）
+- E 系列在**已有 collection** 上能被增量播种
 - 种子文件按 schema_version 刷新
-- where 过滤生效（修复 1.5(6)②），过滤异常时安全退回
+- where 过滤生效，过滤异常时安全退回
 - enrich_for_role 四个角色各自的检索范围
 - enrich_prompt 保持原样（现有测试断言的两个小节仍在）
 - WorkflowExperience 三个写入条件
@@ -52,7 +52,7 @@ def _mm(tmp):
 
 
 def test_incremental_seeding():
-    print("[1] E 系列在已有 collection 上增量播种（修复 1.5(6)①）")
+    print("[1] E 系列在已有 collection 上增量播种")
     tmp = tempfile.mkdtemp(prefix="mem_role_")
     try:
         mm = _mm(tmp)
@@ -97,7 +97,7 @@ def test_seed_file_schema_refresh():
         _assert(data["schema_version"] == seed_data.SEED_SCHEMA_VERSION,
                 f"旧版本种子文件被刷新到 v{seed_data.SEED_SCHEMA_VERSION}")
         _assert(len(data["items"]) == len(seed_data.SEED_ITEMS), "条目数与代码内一致")
-        _assert(seed_data.SEED_SCHEMA_VERSION == 2, "schema_version 已升到 2")
+        _assert(seed_data.SEED_SCHEMA_VERSION == 3, "schema_version 已升到 3")
 
         # 已是当前版本时不重复改写
         before = os.path.getmtime(seed_path)
@@ -108,7 +108,7 @@ def test_seed_file_schema_refresh():
 
 
 def test_where_filter():
-    print("[3] where 过滤生效（修复 1.5(6)②）")
+    print("[3] where 过滤生效")
     tmp = tempfile.mkdtemp(prefix="mem_role_")
     try:
         mm = _mm(tmp)

@@ -1,8 +1,8 @@
 """
-执行引擎扩展点协议（技术方案 2.5 / 10.2）
+执行引擎扩展点协议
 
 `StepDecision` 与 `StageHooks` 的**规范定义在本文件**，`core/agent/executor.py`
-从这里导入（技术方案 10.2 的代码片段以本文件为准）。
+从这里导入（代码片段以本文件为准）。
 
 依赖方向固定为 `executor → orchestrator.hooks`，本文件不导入 executor，
 避免循环依赖。

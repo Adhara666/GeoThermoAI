@@ -1,5 +1,5 @@
 """
-气泡文案渲染层（技术方案 9.4）
+气泡文案渲染层
 
 ## 实现红线（不得违反，`tests/test_presentation.py` 逐条断言）
 
@@ -14,13 +14,14 @@
    一行结果摘要。
 6. 任何长文本截断都必须落在句子边界上，禁止 `text[:N]` 硬切——气泡是后端拼好的完整
    字符串，不受模型输出预算限制，出现半截话会被误认为「回复被截断」。
-   需要限长时用 `eval_agent._cut_at_sentence` 那样按句号/分号切的方式。
+   需要限长时按句号/分号等句子边界切，保证不出现半截话。
 
 本模块是**阶段中文名的单一来源**：`server._WORKFLOW_LABELS` 与执行引擎的阶段说明
 都从这里取，避免同一阶段两处中文名不一致。
 """
 
 import re
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 # ── 阶段中文名与说明（单一来源） ────────────────────────────────────
@@ -49,13 +50,13 @@ WORKFLOW_LABELS: Dict[str, str] = {
     "postprocess": "结果后处理（可选）",
 }
 
-# 平移期（P0–P5）沿用的旧阶段说明，与改造前 `geo_thermo_agent._STEP_DESCRIPTIONS`
-# 逐字一致，保证 P0 是纯平移。P6 文案改写完成后由 STAGE_DESCRIPTIONS 取代。
+# 旧阶段说明（与改造前 `geo_thermo_agent._STEP_DESCRIPTIONS` 逐字一致，
+# 现由 STAGE_DESCRIPTIONS 取代，仅保留供历史路径兜底）。
 LEGACY_STEP_DESCRIPTIONS: Dict[str, str] = {
     "data_acquisition": "下载 Landsat 8/9、Sentinel-2 L2A 与 DEM 影像",
     "data_pipeline": "预处理并划分数据集：生成 30m 训练数据、完整约束层与 10m 预测数据",
     "ttri_compute": "拟合地形校正（TTRI）系数并空间化到 30m/10m 网格",
-    "rf_model": "训练随机森林降尺度模型并输出独立精度评价",
+    "rf_model": "训练随机森林降尺度模型并完成测试集精度评估",
     "tcr_compute": "计算地形校正残差（TCR）",
     "lst_export": "计算最终 10m 地表温度并导出 GeoTIFF",
     "accuracy_eval": "粗尺度闭合精度评估",
@@ -65,11 +66,11 @@ STAGE_DESCRIPTIONS: Dict[str, str] = {
     "data_acquisition": "搜索并下载 Landsat 8/9、Sentinel-2 与 DEM 数据",
     "data_pipeline": "预处理并划分数据集，生成训练数据、约束层与预测格网",
     "ttri_compute": "拟合地形热响应指数并空间化到粗细两套格网",
-    "rf_model": "训练降尺度模型并输出独立预测精度",
+    "rf_model": "训练降尺度模型并完成测试集精度评估",
     "tcr_compute": "计算热约束残差，修正跨尺度系统性偏差",
-    "lst_export": "计算最终十米地表温度并导出栅格产品",
+    "lst_export": "计算最终10m地表温度并导出栅格产品",
     "accuracy_eval": "粗尺度均值闭合校核",
-    "lst_gapfill": "填补十米地表温度产品中云像元造成的空洞",
+    "lst_gapfill": "填补10m地表温度产品中云像元造成的空洞",
     "ai_assistant": "根据当前结果做智能分析",
 }
 
@@ -101,8 +102,8 @@ _SKILL_NAME_RE = re.compile("|".join(sorted(STAGE_LABELS, key=len, reverse=True)
 
 # 形如 /a/b/c.tif、D:\a\b、./output/raw 的路径片段。
 # 分隔符前必须是「行首、空白或标点」，不能紧跟字母数字：否则 row/col、MB/MAE、
-# 训练/验证 这类正常写法会被当成路径吃掉（真实踩过的坑：诊断信息里的
-# 「row/col 越界」被替换成「row（详见日志） 越界」，读者完全看不懂）。
+# 训练/验证 这类正常写法会被当成路径吃掉（如诊断信息里的「row/col 越界」会被
+# 替换成「row（详见日志） 越界」，读者完全看不懂）。
 _PATH_RE = re.compile(
     r"(?<![A-Za-z0-9\u4e00-\u9fff])(?:[A-Za-z]:[\\/][^\s，。；：]*|\.{0,2}[\\/][^\s，。；：]{2,})"
 )
@@ -159,6 +160,55 @@ def fmt_percent(value: Any, digits: int = 1) -> str:
         return "未知"
 
 
+# ── 数字与相邻文字之间的空格统一 ─────────────────────────────────────
+# 用户要求：气泡里数字前后都需要空一格（如「第 1 步」「共 7 步」），
+# 但传感器名（Landsat 8/9、Sentinel-2）、数字+m 单位（10m/30m）这类
+# 既定紧凑写法保持不变；标点与数字直接相邻，不加空格。
+_CJK_STR = r"[\u4e00-\u9fff]"          # 常用汉字
+_NUM_STR = r"\d[\d,]*(?:\.\d+)?"      # 整数 / 千分位 / 小数
+_M_UNIT_STR = r"\d[\d,]*(?:\.\d+)?m"  # 10m / 30m 等数字+m 单位
+_NUM_AFTER_CJK = re.compile(rf"({_CJK_STR})({_NUM_STR})")
+_NUM_BEFORE_CJK = re.compile(rf"({_NUM_STR})({_CJK_STR})")
+_M_UNIT_AFTER_CJK = re.compile(rf"({_CJK_STR})({_M_UNIT_STR})")
+_M_UNIT_BEFORE_CJK = re.compile(rf"({_M_UNIT_STR})({_CJK_STR})")
+
+
+def normalize_number_spacing(text: str) -> str:
+    """统一数字与相邻文字的空格（幂等，可安全重复调用）。
+
+    - 数字与中文之间补空格：「第1轮」→「第 1 轮」、「总第2轮」→「总第 2 轮」；
+    - 数字+m 单位内部保持紧凑（10m/30m），但与其相邻中文之间补空格：
+      「10m结果」→「10m 结果」；
+    - Landsat 8/9、Sentinel-2 等传感器名自带的数字写法不受影响；
+    - 标点（，。；：、（））与数字直接相邻，不加空格。
+    """
+    if not text:
+        return text
+    out = str(text)
+    out = _M_UNIT_AFTER_CJK.sub(r"\1 \2", out)   # 中文后接 10m/30m
+    out = _M_UNIT_BEFORE_CJK.sub(r"\1 \2", out)  # 10m/30m 后接中文
+    out = _NUM_AFTER_CJK.sub(r"\1 \2", out)      # 中文后接数字
+    out = _NUM_BEFORE_CJK.sub(r"\1 \2", out)     # 数字后接中文
+    return out
+
+
+# ── 卫星与时间写法（用户要求：实际用了哪颗卫星就写哪颗，不写 8/9 泛指） ──
+
+def satellite_label(sat: str) -> str:
+    """配对里的卫星代号转气泡写法：L8→「Landsat 8」，L9→「Landsat 9」。"""
+    return {"L8": "Landsat 8", "L9": "Landsat 9"}.get(str(sat or ""), "Landsat")
+
+
+def month_label(date_str: Any) -> str:
+    """YYYY-MM-DD → 「2024 年 7 月」（月度合成模式写月份，不写具体日期）。"""
+    s = str(date_str or "")
+    try:
+        dt = datetime.strptime(s[:10], "%Y-%m-%d")
+    except (ValueError, TypeError):
+        return s
+    return f"{dt.year} 年 {dt.month} 月"
+
+
 def stage_label(skill_name: str) -> str:
     return STAGE_LABELS.get(skill_name, "处理步骤")
 
@@ -170,11 +220,16 @@ def stage_description(skill_name: str) -> str:
 def step_header(index: int, total: int, skill_name: str) -> str:
     """阶段开始的气泡头（红线 5：第一行 + 第二行说明）。
 
+    用 markdown 二级标题 + 引用块：标题让每个步骤在气泡里形成清晰的层级，
+    阶段说明用引用块（前端浅灰底 + 左侧竖线）与正文区分。
+    说明后只接单个换行：每步内部不再出现多余空行（空行只出现在步骤之间）。
     使用全角斜线「／」而非 ASCII 斜线，避免与文件路径分隔符混淆。
     """
-    head = f"**第 {index} 步／共 {total} 步：{stage_label(skill_name)}**"
+    head = f"## 第 {index} 步／共 {total} 步：{stage_label(skill_name)}"
     desc = stage_description(skill_name)
-    return head + ("\n" + desc + "\n" if desc else "\n")
+    if desc:
+        return f"{head}\n\n> {desc}\n"
+    return f"{head}\n"
 
 
 # ── 各 Skill 结果摘要（红线 3、5） ──────────────────────────────────
@@ -188,7 +243,21 @@ def _split_counts(data: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-def _summarize_data_acquisition(data: Dict[str, Any]) -> str:
+def _summarize_data_acquisition(data: Dict[str, Any],
+                                pair: Optional[dict] = None) -> str:
+    pair = pair or {}
+    # 配对模式：写明实际用到的 Landsat 卫星与日期、Sentinel-2 日期
+    if str(pair.get("composite") or "") == "monthly":
+        rep = pair.get("landsat_date") or pair.get("sentinel2_date") or ""
+        m = month_label(rep)
+        prefix = f"{m}的 " if m else ""
+        return (f"影像合成完成：{prefix}Landsat 与 Sentinel-2 "
+                f"月度合成影像及 DEM 数据均已就位")
+    l_date = pair.get("landsat_date")
+    s_date = pair.get("sentinel2_date")
+    if l_date and s_date:
+        return (f"影像下载完成：{satellite_label(pair.get('landsat_satellite'))} "
+                f"{l_date}、Sentinel-2 {s_date} 与 DEM 数据均已就位")
     pairs = data.get("image_pairs") or []
     if pairs:
         return f"影像检索完成：找到 {fmt_count(len(pairs))} 组可用的影像组合"
@@ -214,13 +283,13 @@ def _summarize_ttri(data: Dict[str, Any]) -> str:
     if r2 is not None:
         detail.append(f"地形拟合决定系数 {fmt_num(r2)}")
     if valid is not None:
-        detail.append(f"十米有效格点 {fmt_count(valid)} 个")
+        detail.append(f"10m 有效格点 {fmt_count(valid)} 个")
     return parts[0] + ("：" + "，".join(detail) if detail else "")
 
 
 def _summarize_rf_model(data: Dict[str, Any]) -> str:
     test = data.get("test_metrics") or {}
-    return (f"模型训练完成：测试集决定系数 {fmt_num(test.get('R2'))}，"
+    return (f"模型训练（第1轮）完成：测试集决定系数 {fmt_num(test.get('R2'))}，"
             f"均方根误差 {fmt_num(test.get('RMSE'))} K")
 
 
@@ -245,7 +314,7 @@ def _summarize_accuracy_eval(data: Dict[str, Any]) -> str:
     return (f"闭合校核完成：平均偏差 {fmt_num(metrics.get('MB_K'))} K，"
             f"平均绝对误差 {fmt_num(metrics.get('MAE_K'))} K，共比对 "
             f"{fmt_count(closure.get('n_matched_cells'))} 个格网"
-            f"（这是均值闭合校核，不是十米独立精度）")
+            f"（此为均值闭合校核，并非10m地表温度产品精度，闭合误差约为0表明闭合校核通过）")
 
 
 _SUMMARIZERS = {
@@ -260,10 +329,11 @@ _SUMMARIZERS = {
 }
 
 
-def summarize(skill_name: str, result: Any) -> str:
+def summarize(skill_name: str, result: Any, pair: Optional[dict] = None) -> str:
     """把 SkillResult 转写为一行中文结果摘要（红线 1、2、3）。
 
     优先读结构化 `result.data`；失败时退回对原始 message 做 `sanitize`。
+    pair 用于数据获取摘要：写明实际用到的 Landsat 卫星与日期、Sentinel-2 日期。
     """
     success = bool(getattr(result, "success", True))
     message = getattr(result, "message", "") or ""
@@ -277,6 +347,8 @@ def summarize(skill_name: str, result: Any) -> str:
     if fn is None:
         return f"{stage_label(skill_name)}完成"
     try:
+        if skill_name == "data_acquisition":
+            return _summarize_data_acquisition(data, pair)
         return fn(data)
     except Exception:
         return f"{stage_label(skill_name)}完成：{sanitize(message)}"
@@ -285,13 +357,13 @@ def summarize(skill_name: str, result: Any) -> str:
 # ── 其它气泡文案（执行引擎与角色 Agent 共用） ──────────────────────
 
 def study_area_loaded(name: str) -> str:
-    """已载入研究区（去掉扩展名，只给中文可读名）。"""
+    """已载入研究区（去掉扩展名，只给中文可读名；引用块样式置于顶部总览）。"""
     clean = str(name or "").rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
     for ext in (".geojson", ".json", ".shp", ".kml", ".gpkg"):
         if clean.lower().endswith(ext):
             clean = clean[: -len(ext)]
             break
-    return f"已载入研究区：{clean}\n"
+    return f"> 已载入研究区：{clean}\n"
 
 
 def planning_started() -> str:
@@ -307,7 +379,8 @@ def planning_fallback() -> str:
 
 
 def plan_ready(step_count: int) -> str:
-    return f"执行方案已确定，共 {step_count} 步\n"
+    # 末尾留一个空行：方案总览与第一步阶段头之间需要空行（见「气泡排版」需求）
+    return f"> 执行方案已确定，共 {step_count} 步\n\n"
 
 
 def plan_completed_by_safety_net() -> str:
@@ -319,20 +392,24 @@ def tuning_params_suggesting() -> str:
 
 
 def pairs_found(count: int) -> str:
-    return f"找到 {fmt_count(count)} 组可用的影像组合\n"
+    return f"- 找到 {fmt_count(count)} 组可用的影像组合\n"
 
 
 def pair_auto_selected(index: int, reason: str = "") -> str:
     tail = f"：{reason}" if reason else ""
-    return f"已自动选择第 {index} 组{tail}\n"
+    return f"- 已自动选择第 {index} 组{tail}\n"
 
 
 def download_started() -> str:
-    return "**开始下载所选影像**\n"
+    return "- 开始下载所选影像\n"
 
 
-def monthly_composite_started(landsat_count: int = 0, sentinel_count: int = 0) -> str:
-    """月度合成模式开始提示：说清当月两套合成影像分别由哪几景合成（不说"配对几景"）。"""
+def monthly_composite_started(landsat_count: int = 0, sentinel_count: int = 0,
+                              month: str = "") -> str:
+    """月度合成模式开始提示：说清当月两套合成影像分别由哪几景合成（不说"配对几景"）。
+
+    month 形如「2024 年 7 月」，给出时显示在标题里，让数据获取部分明确是哪个月。
+    """
     detail = ""
     if landsat_count and sentinel_count:
         detail = (f"当月 Landsat 合成影像由 {landsat_count} 景合成，"
@@ -341,8 +418,31 @@ def monthly_composite_started(landsat_count: int = 0, sentinel_count: int = 0) -
         detail = f"当月 Landsat 合成影像由 {landsat_count} 景合成。"
     elif sentinel_count:
         detail = f"当月 Sentinel-2 合成影像由 {sentinel_count} 景合成。"
-    return (f"**月度合成模式**：{detail}"
+    head = f"- **月度合成模式（{month}）**：" if month else "- **月度合成模式**："
+    return (f"{head}{detail}"
             f"将该月全部符合云量阈值的影像合成为一张月度产品后再处理\n")
+
+
+def step_divider() -> str:
+    """步骤**内部**内容块之间的分隔线（markdown 水平线），如调优各轮之间。"""
+    return "\n---\n\n"
+
+
+def indent(text: str) -> str:
+    """无项目符号的缩进行：与项目符号文字对齐（前端 HTML 会折叠普通空格，
+    因此用全角空格撑出视觉缩进；2 个全角空格 ≈ 28px，对齐 26px 的列表缩进）。"""
+    return "\u3000\u3000" + text
+
+
+def step_gap() -> str:
+    """步骤之间的垂直留白（不画线）：代替原来步骤间的分割线，比普通段落间距略大。
+
+    末尾必须带空行（两个换行）：marked 的 HTML block 解析会把行首的块级
+    HTML 标签（<div> 等）连同其后所有非空行吞进原始 HTML，直到空行才恢复
+    markdown 解析。若 <div> 后只跟单个换行，紧随其后的 "## 第 N 步" 标题
+    会被当原文输出（气泡里显示字面 "##"）。
+    """
+    return '<div class="step-gap"></div>\n\n'
 
 
 def waiting_for_user() -> str:
@@ -354,7 +454,7 @@ def skill_missing(skill_name: str) -> str:
 
 
 def no_pair_reason(detail: Dict[str, Any]) -> str:
-    """无合格配对时说清「搜到了什么、为什么都不合格」（技术方案 5.2）。"""
+    """无合格配对时说清「搜到了什么、为什么都不合格」。"""
     detail = detail or {}
     lines = [
         f"没有找到符合条件的影像组合：Landsat 8/9 {fmt_count(detail.get('landsat_count'))} 景，"
@@ -373,5 +473,5 @@ def no_pair_reason(detail: Dict[str, Any]) -> str:
 
 
 def rule_note(rule_id: str, text: str) -> str:
-    """规则覆盖 LLM 决策时的可追溯标注（技术方案 13.2）。"""
+    """规则覆盖 LLM 决策时的可追溯标注。"""
     return f"[规则] {rule_id} {text}"
