@@ -433,6 +433,8 @@ R^2=1-\frac{\sum_{i=1}^{n}(y_i-\widehat{y}_i)^2}{\sum_{i=1}^{n}(y_i-\overline{y}
 <div align="center"><img src="image/README/1786634710546.png" alt="1786634710546"></div>
 <div align="center"><b>图 14 武汉市 2024 年 7 月 22 日 10m 地表温度产品与 30m Landsat 温度产品对比</b></div>
 
+   从图 4 、图 5 以及本节图当中可以看出，GeoThermoAI 生成的 10m 地表温度产品相比 Landsat 产品具有清晰的街道、路网细节。本案例下载的数据和生成的结果已上传至 ModelScope（https://modelscope.cn/datasets/Adhara/Wuhan_10m_LST_20240722），供 GeoThermoAI 使用者参阅
+
 # **七、重要说明**
 
 ## **7.1 算法灵感**
