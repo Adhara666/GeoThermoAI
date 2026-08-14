@@ -16,7 +16,7 @@
 
 1. 如果想跳过项目介绍直接了解功能特色、使用方法，请前往第三章和第四章；
 2. 如需了解底层降尺度算法原理，可以前往第五章
-3. 我们在魔搭创空间 ModelScope Studio 部署了在线应用，但考虑到 Studio 硬件受限，如果需要进行严肃使用，我们更推荐您使用本仓库，在您本地使用 Docker 部署；如果您觉得在线使用耗时太长，仅仅只是想观摩 GeoThermoAI 是如何生产 10m 高分辨率地表温度产品的，我们也准备了武汉市 2024 年 7 月 配对模式+完全执行模式的 10m 地表温度产品生成演示，请访问
+3. 我们在魔搭创空间 ModelScope Studio 部署了在线应用（https://modelscope.cn/studios/Adhara/GeoThermoAI），但考虑到 Studio 硬件受限，如果需要进行严肃使用，我们更推荐您使用本仓库，在您本地使用 Docker 部署；如果您觉得在线使用耗时太长，仅仅只是想观摩 GeoThermoAI 是如何生产 10m 高分辨率地表温度产品的，我们也准备了武汉市 2024 年 7 月 配对模式+完全执行模式的 10m 地表温度产品生成演示，请访问 【GeoThermoAI 操作演示（以武汉市 2024 年 7 月配对模式为例）】 https://www.bilibili.com/video/BV1L8gP6vEBC/?share_source=copy_web&vd_source=4df098977e8101bf1323d293573b4a0d
 
 # **一、背景与动机**
 
