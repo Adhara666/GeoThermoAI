@@ -16,7 +16,7 @@
 
 1. 如果想跳过项目介绍直接了解功能特色、使用方法，请前往第三章和第四章；
 2. 如需了解底层降尺度算法原理，可以前往第五章
-3. 我们在魔搭创空间 ModelScope Studio 部署了在线应用（https://modelscope.cn/studios/Adhara/GeoThermoAI），但考虑到 Studio 硬件受限，如果需要进行严肃使用，我们更推荐您使用本仓库，在您本地使用 Docker 部署；如果您觉得在线使用耗时太长，仅仅只是想观摩 GeoThermoAI 是如何生产 10m 高分辨率地表温度产品的，我们也准备了武汉市 2024 年 7 月 配对模式+完全执行模式的 10m 地表温度产品生成演示，请访问 【GeoThermoAI 操作演示（以武汉市 2024 年 7 月配对模式为例）】 https://www.bilibili.com/video/BV1L8gP6vEBC/?share_source=copy_web&vd_source=4df098977e8101bf1323d293573b4a0d
+3. 我们在魔搭创空间 ModelScope Studio 部署了在线应用（<https://modelscope.cn/studios/Adhara/GeoThermoAI>），但考虑到 Studio 硬件受限，如果需要进行严肃使用，我们更推荐您使用本仓库，在您本地使用 Docker 部署；如果您觉得在线使用耗时太长，仅仅只是想观摩 GeoThermoAI 是如何生产 10m 高分辨率地表温度产品的，我们也准备了武汉市 2024 年 7 月 配对模式+完全执行模式的 10m 地表温度产品生成演示，请访问 【GeoThermoAI 操作演示（以武汉市 2024 年 7 月配对模式为例）】 https://www.bilibili.com/video/BV1L8gP6vEBC/?share_source=copy_web&vd_source=4df098977e8101bf1323d293573b4a0d
 
 # **一、背景与动机**
 
@@ -433,7 +433,7 @@ R^2=1-\frac{\sum_{i=1}^{n}(y_i-\widehat{y}_i)^2}{\sum_{i=1}^{n}(y_i-\overline{y}
 <div align="center"><img src="image/README/1786634710546.png" alt="1786634710546"></div>
 <div align="center"><b>图 14 武汉市 2024 年 7 月 22 日 10m 地表温度产品与 30m Landsat 温度产品对比</b></div>
 
-   从图 4 、图 5 以及本节图当中可以看出，GeoThermoAI 生成的 10m 地表温度产品相比 Landsat 产品具有清晰的街道、路网细节。本案例下载的数据和生成的结果已上传至 ModelScope（https://modelscope.cn/datasets/Adhara/Wuhan_10m_LST_20240722），供 GeoThermoAI 使用者参阅
+　　从图 4 、图 5 以及本节图当中可以看出，GeoThermoAI 生成的 10m 地表温度产品相比 Landsat 产品具有清晰的街道、路网细节。本案例下载的数据和生成的结果已上传至 ModelScope（<https://modelscope.cn/datasets/Adhara/Wuhan_10m_LST_20240722>），供 GeoThermoAI 使用者参阅
 
 # **七、重要说明**
 
