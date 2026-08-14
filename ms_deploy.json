@@ -1,0 +1,9 @@
+{
+  "$schema": "https://modelscope.cn/api/v1/studios/deploy_schema.json",
+  "sdk_type": "docker",
+  "resource_configuration": "platform/2v-cpu-16g-mem",
+  "port": 7860,
+  "environment_variables": {
+    "WORKSPACE_ROOT": "/mnt/workspace/data"
+  }
+}
