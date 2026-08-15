@@ -1,6 +1,7 @@
 <script setup>
 import { ref, onBeforeUnmount } from 'vue'
 import { api } from '../../api'
+import { t } from '../../i18n'
 import StatusResult from '../StatusResult.vue'
 
 const testing = ref('')
@@ -14,9 +15,9 @@ async function runTest(key, path, timeout) {
   clearTimeout(resultTimer)
   try {
     const r = await api.post(path)
-    result.value = r.result || '（空结果）'
+    result.value = r.result || t('dsrc.empty')
   } catch (e) {
-    result.value = `❌ 测试失败：${e.message}`
+    result.value = t('dsrc.failed', { msg: e.message })
   } finally {
     testing.value = ''
     resultTimer = setTimeout(() => { result.value = '' }, timeout)
@@ -38,18 +39,18 @@ const ZAP_ICON = '<polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>'
   <div class="data-source">
     <button class="btn btn--primary btn--block" :disabled="!!testing" @click="testPlanetary">
       <svg v-if="testing !== 'planetary'" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" v-html="ZAP_ICON"></svg>
-      <span v-else>测试中…</span>
-      <span v-if="testing !== 'planetary'">测试 Planetary Computer 连接</span>
+      <span v-else>{{ t('dsrc.testing') }}</span>
+      <span v-if="testing !== 'planetary'">{{ t('dsrc.pc') }}</span>
     </button>
     <button class="btn btn--primary btn--block" :disabled="!!testing" @click="testCdse">
       <svg v-if="testing !== 'cdse'" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" v-html="ZAP_ICON"></svg>
-      <span v-else>测试中…</span>
-      <span v-if="testing !== 'cdse'">测试 Copernicus Data Space 连接</span>
+      <span v-else>{{ t('dsrc.testing') }}</span>
+      <span v-if="testing !== 'cdse'">{{ t('dsrc.cdse') }}</span>
     </button>
     <button class="btn btn--primary btn--block" :disabled="!!testing" @click="testGdal">
       <svg v-if="testing !== 'gdal'" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" v-html="ZAP_ICON"></svg>
-      <span v-else>测试中…</span>
-      <span v-if="testing !== 'gdal'">测试地理处理环境</span>
+      <span v-else>{{ t('dsrc.testing') }}</span>
+      <span v-if="testing !== 'gdal'">{{ t('dsrc.gdal') }}</span>
     </button>
     <StatusResult :text="result" />
   </div>

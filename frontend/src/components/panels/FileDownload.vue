@@ -2,6 +2,7 @@
 import { ref, computed, onMounted, watch } from 'vue'
 import { useProjectStore } from '../../stores/project'
 import { api, downloadUrl, getToken } from '../../api'
+import { t, trServer } from '../../i18n'
 
 const project = useProjectStore()
 const files = ref([])
@@ -41,22 +42,22 @@ async function refresh() {
   if (!project.projectDir) {
     files.value = []
     selectedSet.value = new Set()
-    status.value = '❌ 请先在左侧边栏新建项目'
+    status.value = t('fd.noProject')
     return
   }
   loading.value = true
   try {
     const r = await api.get(`/api/files?project_dir=${encodeURIComponent(project.projectDir)}`)
     if (!r.ok) {
-      status.value = r.message || '目录不存在'
+      status.value = trServer(r.message) || t('fd.dirNotExist')
       files.value = []
       return
     }
     files.value = r.files || []
     selectedSet.value = new Set()
-    status.value = files.value.length ? `✅ 共 ${files.value.length} 个文件（含子目录）` : '⚠️ 目录为空'
+    status.value = files.value.length ? t('fd.count', { n: files.value.length }) : t('fd.emptyDir')
   } catch (e) {
-    status.value = `❌ ${e.message}`
+    status.value = `❌ ${trServer(e.message)}`
   } finally {
     loading.value = false
   }
@@ -121,7 +122,7 @@ async function doDownload() {
     })
     if (!res.ok) {
       const txt = await res.text().catch(() => '')
-      alert(`下载失败 ${res.status}: ${txt.slice(0, 200)}`)
+      alert(t('fd.alertFail', { status: res.status, msg: txt.slice(0, 200) }))
       return
     }
     const total = Number(res.headers.get('content-length') || 0)
@@ -138,7 +139,7 @@ async function doDownload() {
     const blob = new Blob(chunks, { type: 'application/zip' })
     saveBlob(blob, 'geothermoai_download.zip')
   } catch (e) {
-    alert(`下载失败: ${e.message}`)
+    alert(t('fd.alertFail2', { msg: e.message }))
   } finally {
     downloading.value = false
     progress.value = 0
@@ -153,7 +154,7 @@ async function downloadSingle(path) {
     const res = await fetch(url)
     if (!res.ok) {
       const txt = await res.text().catch(() => '')
-      alert(`下载失败 ${res.status}: ${txt.slice(0, 200)}`)
+      alert(t('fd.alertFail', { status: res.status, msg: txt.slice(0, 200) }))
       return
     }
     const total = Number(res.headers.get('content-length') || 0)
@@ -170,7 +171,7 @@ async function downloadSingle(path) {
     const blob = new Blob(chunks)
     saveBlob(blob, path.split('/').pop())
   } catch (e) {
-    alert(`下载失败: ${e.message}`)
+    alert(t('fd.alertFail2', { msg: e.message }))
   } finally {
     downloading.value = false
     progress.value = 0
@@ -195,10 +196,10 @@ watch(() => project.projectDir, () => refresh())
 
 <template>
   <div>
-    <p class="form-hint dl-tip">下载项目目录中的文件（含子目录，相对路径显示为「子目录/文件名」）；支持勾选多个文件打包下载</p>
+    <p class="form-hint dl-tip">{{ t('fd.tip') }}</p>
     <button class="btn btn--block" :disabled="loading" @click="refresh">
       <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
-      刷新文件列表
+      {{ t('fd.refresh') }}
     </button>
     <div v-if="status" class="form-hint dl-status" :class="`dl-status--${statusInfo.type}`">
       <svg v-if="STATUS_ICONS[statusInfo.type]" class="dl-status__icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" v-html="STATUS_ICONS[statusInfo.type]"></svg>
@@ -207,7 +208,7 @@ watch(() => project.projectDir, () => refresh())
 
     <template v-if="files.length">
       <div class="form-group" style="margin-top:8px">
-        <label>选择文件（可多选）</label>
+        <label>{{ t('fd.select') }}</label>
         <div class="dl-list">
           <div class="dl-list__inner">
             <div class="dl-list__item dl-list__item--all" @click="toggleAll">
@@ -218,7 +219,7 @@ watch(() => project.projectDir, () => refresh())
                 @click.stop
                 @change="toggleAll"
               />
-              <span class="dl-list__path">全选 / 取消全选</span>
+              <span class="dl-list__path">{{ t('fd.selectAll') }}</span>
             </div>
             <div
               v-for="f in files"
@@ -248,7 +249,7 @@ watch(() => project.projectDir, () => refresh())
         @click="doDownload"
       >
         <svg v-if="!downloading" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
-        {{ downloading ? `打包下载中… ${progress}%` : `下载已选 ${selectedCount} 个文件（${fmtSize(totalSize)}）` }}
+        {{ downloading ? t('fd.packing', { pct: progress }) : t('fd.downloadSelected', { n: selectedCount, size: fmtSize(totalSize) }) }}
       </button>
       <div v-if="downloading" class="dl-progress">
         <div class="dl-progress__bar" :style="{ width: progress + '%' }"></div>
@@ -259,9 +260,9 @@ watch(() => project.projectDir, () => refresh())
         style="margin-top:6px"
         :href="downloadUrl(project.projectDir, files.find((f) => selectedSet.has(f.path))?.path)"
         download
-      >浏览器直接下载</a>
+      >{{ t('fd.browserDirect') }}</a>
       <p class="form-hint" style="margin-top:6px">
-        点击主按钮后前端会显示实时下载进度，多文件将打包为 zip，下载完成自动保存到浏览器下载目录
+        {{ t('fd.bottomHint') }}
       </p>
     </template>
   </div>

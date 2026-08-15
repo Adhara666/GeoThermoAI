@@ -1,5 +1,6 @@
 import { defineStore } from 'pinia'
 import { api, getToken, setToken } from '../api'
+import { t, trServer } from '../i18n'
 
 export const useAuthStore = defineStore('auth', {
   state: () => ({
@@ -27,14 +28,14 @@ export const useAuthStore = defineStore('auth', {
 
     async login(username, password) {
       const r = await api.login(username, password)
-      if (!r || !r.ok) throw new Error((r && r.message) || '登录失败')
+      if (!r || !r.ok) throw new Error((r && trServer(r.message)) || t('auth.loginFailed'))
       setToken(r.token)
       this.user = r.user
     },
 
     async register(username, password, nickname) {
       const r = await api.register(username, password, nickname)
-      if (!r || !r.ok) throw new Error((r && r.message) || '注册失败')
+      if (!r || !r.ok) throw new Error((r && trServer(r.message)) || t('auth.registerFailed'))
       // 注册成功后自动登录
       await this.login(username, password)
     },

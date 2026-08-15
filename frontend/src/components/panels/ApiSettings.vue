@@ -1,9 +1,12 @@
 <script setup>
 import { ref, computed, watch } from 'vue'
 import { useSettingsStore } from '../../stores/settings'
+import { t } from '../../i18n'
 
 const settings = useSettingsStore()
-const fmt = ref('OpenAI Chat Completions 格式')
+// fmt 用稳定 id（openai|anthropic），展示文案由 t() 按语言输出，
+// 避免语言切换后 select 的值与选项文本失配
+const fmt = ref('openai')
 const baseUrl = ref('')
 const apiKey = ref('')
 const hasKey = ref(false)
@@ -17,7 +20,7 @@ watch(
   () => settings.settings,
   (s) => {
     if (!s) return
-    fmt.value = s.api_format === 'anthropic' ? 'Anthropic Messages 格式' : 'OpenAI Chat Completions 格式'
+    fmt.value = s.api_format === 'anthropic' ? 'anthropic' : 'openai'
     baseUrl.value = s.base_url || ''
     // 凭据不回传明文：已配置时按真实长度显示黑点；重新输入才替换原 Key
     hasKey.value = !!s.has_api_key
@@ -31,14 +34,14 @@ watch(
 )
 
 const urlHint = computed(() =>
-  fmt.value.includes('Anthropic')
-    ? '请填写 Claude API 地址，/v1/messages 会自动补到末尾'
-    : '请填写兼容 OpenAI 的地址，/chat/completions 会自动补到末尾',
+  fmt.value === 'anthropic'
+    ? t('api.urlHintAnthropic')
+    : t('api.urlHintOpenai'),
 )
 
 async function save() {
   const ok = await settings.saveSettings({
-    api_format: fmt.value.includes('Anthropic') ? 'anthropic' : 'openai',
+    api_format: fmt.value,
     base_url: baseUrl.value,
     // 仍是黑点占位（未重新输入）→ 传空，后端保持原 Key
     api_key: apiKey.value && !apiKey.value.startsWith('•') ? apiKey.value : '',
@@ -55,39 +58,39 @@ async function save() {
 <template>
   <div>
     <div class="form-group">
-      <label>API 格式</label>
+      <label>{{ t('api.fmt') }}</label>
       <select v-model="fmt" class="form-select">
-        <option>OpenAI Chat Completions 格式</option>
-        <option>Anthropic Messages 格式</option>
+        <option value="openai">{{ t('api.fmtOpenai') }}</option>
+        <option value="anthropic">{{ t('api.fmtAnthropic') }}</option>
       </select>
     </div>
     <div class="form-group">
-      <label>请求地址</label>
+      <label>{{ t('api.baseUrl') }}</label>
       <input v-model="baseUrl" class="form-input" placeholder="e.g. https://api.deepseek.com" />
       <p class="form-hint">{{ urlHint }}</p>
     </div>
     <div class="form-group">
-      <label>模型 ID</label>
+      <label>{{ t('api.modelId') }}</label>
       <input v-model="modelId" class="form-input" placeholder="e.g. deepseek-chat" />
     </div>
     <div class="form-group">
-      <label>API 密钥</label>
-      <input v-model="apiKey" type="password" class="form-input" placeholder="输入 API 密钥（保存后生效）；已配置时显示为黑点" />
+      <label>{{ t('api.apiKey') }}</label>
+      <input v-model="apiKey" type="password" class="form-input" :placeholder="t('api.apiKeyPh')" />
     </div>
     <details class="advanced" style="margin-bottom:12px">
-      <summary style="cursor:pointer;font-size:13px;color:var(--text-secondary)">高级配置</summary>
+      <summary style="cursor:pointer;font-size:13px;color:var(--text-secondary)">{{ t('api.advanced') }}</summary>
       <div style="margin-top:10px">
         <div class="form-group">
-          <label>模型展示名称</label>
-          <input v-model="displayName" class="form-input" placeholder="留空则用模型 ID" maxlength="32" />
+          <label>{{ t('api.displayName') }}</label>
+          <input v-model="displayName" class="form-input" :placeholder="t('api.displayNamePh')" maxlength="32" />
         </div>
         <div style="display:flex;gap:8px">
           <div class="form-group" style="flex:1">
-            <label>上下文-输入</label>
+            <label>{{ t('api.ctxIn') }}</label>
             <input v-model="ctxIn" type="number" class="form-input" />
           </div>
           <div class="form-group" style="flex:1">
-            <label>上下文-输出</label>
+            <label>{{ t('api.ctxOut') }}</label>
             <input v-model="ctxOut" type="number" class="form-input" />
           </div>
         </div>
@@ -95,8 +98,8 @@ async function save() {
     </details>
     <button class="btn btn--primary btn--block" @click="save">
       <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>
-      保存并应用
+      {{ t('api.saveApply') }}
     </button>
-    <p v-if="saved" class="form-hint" style="margin-top:8px;color:var(--success)">已保存并热更新模型</p>
+    <p v-if="saved" class="form-hint" style="margin-top:8px;color:var(--success)">{{ t('api.savedHot') }}</p>
   </div>
 </template>

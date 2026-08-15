@@ -5,11 +5,12 @@
 import { computed, ref, watch } from 'vue'
 import { useChatStore } from '../stores/chat'
 import { useToast } from '../composables/useToast'
+import { t, translateApprovalPayload } from '../i18n'
 
 const chat = useChatStore()
 const toast = useToast()
 
-const payload = computed(() => chat.approval || {})
+const payload = computed(() => translateApprovalPayload(chat.approval || {}))
 const options = computed(() => payload.value.options || [])
 
 const selected = ref('')
@@ -54,10 +55,10 @@ const invalidField = computed(() => activeFields.value.find((f) => outOfRange(f)
 
 async function confirm() {
   if (submitting.value) return
-  if (!selected.value) { toast.error('请选择一项'); return }
+  if (!selected.value) { toast.error(t('approval.errSelect')); return }
   if (invalidField.value) {
     const f = invalidField.value
-    toast.error(`${f.label} 需在 ${f.min} 到 ${f.max} 之间`)
+    toast.error(t('approval.errRange', { label: f.label, min: f.min, max: f.max }))
     return
   }
   submitting.value = true
@@ -83,7 +84,7 @@ async function confirm() {
       >
         <input type="radio" :value="o.id" v-model="selected" />
         <span class="approval-option__text">
-          {{ o.label }}<span v-if="o.recommended" class="approval-option__badge">（推荐）</span>
+          {{ o.label }}<span v-if="o.recommended" class="approval-option__badge">{{ t('approval.recommended') }}</span>
         </span>
         <span v-if="o.hint" class="approval-option__hint">{{ o.hint }}</span>
 
@@ -107,7 +108,7 @@ async function confirm() {
     </div>
 
     <div class="approval-card__actions">
-      <button class="btn btn--primary" :disabled="submitting" @click="confirm">确认</button>
+      <button class="btn btn--primary" :disabled="submitting" @click="confirm">{{ t('approval.confirm') }}</button>
     </div>
   </div>
 </template>

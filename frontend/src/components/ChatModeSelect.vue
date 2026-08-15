@@ -4,17 +4,18 @@
 // 风格与 ExecModeSelect 的"由我批准/完全执行"下拉一致：上拉面板选择
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useChatStore } from '../stores/chat'
+import { t } from '../i18n'
 
 const chat = useChatStore()
 const open = ref(false)
 const root = ref(null)
 
-const MODES = [
-  { id: 'work', label: 'Work', hint: '完整能力：可执行降尺度工作流等相关任务' },
-  { id: 'chat', label: 'Chat', hint: '只读对话：仅回答问题，不执行工作流、不改动文件' },
-]
+const MODES = computed(() => [
+  { id: 'work', label: 'Work', hint: t('chatMode.workHint') },
+  { id: 'chat', label: 'Chat', hint: t('chatMode.chatHint') },
+])
 
-const current = computed(() => MODES.find((m) => m.id === chat.chatMode) || MODES[0])
+const current = computed(() => MODES.value.find((m) => m.id === chat.chatMode) || MODES.value[0])
 
 function toggle() {
   open.value = !open.value

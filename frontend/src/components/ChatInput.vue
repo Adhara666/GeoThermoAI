@@ -2,6 +2,7 @@
 import { ref, computed } from 'vue'
 import { useChatStore } from '../stores/chat'
 import { useProjectStore } from '../stores/project'
+import { t } from '../i18n'
 import ExecModeSelect from './ExecModeSelect.vue'
 
 const chat = useChatStore()
@@ -33,7 +34,7 @@ async function submit() {
 
 <template>
   <div class="chat-input-area">
-    <div v-if="folderName" class="folder-chip" :title="showFullPath ? '点击收起路径' : '点击查看完整路径'" @click="showFullPath = !showFullPath">
+    <div v-if="folderName" class="folder-chip" :title="showFullPath ? t('chatInput.collapsePath') : t('chatInput.fullPath')" @click="showFullPath = !showFullPath">
       <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
         <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z" />
       </svg>
@@ -47,12 +48,12 @@ async function submit() {
         <textarea
           v-model="input"
           rows="1"
-          :placeholder="chat.streaming ? '回复生成中…' : (chat.chatMode === 'chat' ? 'Chat 模式：只读对话，仅回答问题' : '输入指令…（Enter 发送，Shift+Enter 换行）')"
+          :placeholder="chat.streaming ? t('chatInput.streamingPh') : (chat.chatMode === 'chat' ? t('chatInput.chatModePh') : t('chatInput.placeholder'))"
           @keydown="onKeydown"
         ></textarea>
         <!-- 只有 Work 模式显示执行模式（由我批准/完全执行） -->
         <ExecModeSelect v-if="chat.chatMode === 'work'" />
-        <button class="chat-send" :disabled="chat.streaming || !project.currentConv" @click="submit" title="发送">
+        <button class="chat-send" :disabled="chat.streaming || !project.currentConv" @click="submit" :title="t('chatInput.send')">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <line x1="22" y1="2" x2="11" y2="13" />
             <polygon points="22 2 15 22 11 13 2 9 22 2" />

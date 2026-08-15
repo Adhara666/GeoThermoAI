@@ -2,6 +2,7 @@ import { defineStore } from 'pinia'
 import { api } from '../api'
 import { useToast } from '../composables/useToast'
 import { useChatStore } from './chat'
+import { t, trServer } from '../i18n'
 
 export const useProjectStore = defineStore('project', {
   state: () => ({
@@ -71,22 +72,22 @@ export const useProjectStore = defineStore('project', {
     },
 
     async createProject(name) {
-      const t = useToast()
-      if (!name?.trim()) { t.error('请输入项目名称'); return }
+      const toast = useToast()
+      if (!name?.trim()) { toast.error(t('project.enterName')); return }
       // 项目目录由后端按用户自动分配，前端不再传路径
       const r = await api.post('/api/projects', { name: name.trim() })
-      if (!r.ok) { t.error(r.message); return }
+      if (!r.ok) { toast.error(trServer(r.message)); return }
       await this.bootstrap()
       await this.selectProject(name.trim())
-      t.success(r.message)
+      toast.success(trServer(r.message))
     },
 
     async renameProject(pid, newName) {
-      const t = useToast()
-      if (!newName?.trim()) { t.error('请输入新的项目名称'); return }
+      const toast = useToast()
+      if (!newName?.trim()) { toast.error(t('project.enterNewName')); return }
       if (newName.trim() === pid) return
       const r = await api.post(`/api/projects/${encodeURIComponent(pid)}/rename`, { name: newName.trim() })
-      if (!r.ok) { t.error(r.message); return }
+      if (!r.ok) { toast.error(trServer(r.message)); return }
       const wasCurrent = pid === this.currentProject
       await this.bootstrap()
       if (wasCurrent) {
@@ -94,13 +95,13 @@ export const useProjectStore = defineStore('project', {
         const p = this.tree.find((x) => x.project === newName.trim())
         this.projectDir = p?.project_dir || ''
       }
-      t.success(r.message)
+      toast.success(trServer(r.message))
     },
 
     async deleteProject(pid) {
-      const t = useToast()
+      const toast = useToast()
       const r = await api.del(`/api/projects/${encodeURIComponent(pid)}`)
-      if (!r.ok) { t.error(r.message); return }
+      if (!r.ok) { toast.error(trServer(r.message)); return }
       if (pid === this.currentProject) {
         this.currentProject = ''
         this.currentConv = ''
@@ -108,48 +109,48 @@ export const useProjectStore = defineStore('project', {
         useChatStore().clear()
       }
       await this.bootstrap()
-      t.success(r.message)
+      toast.success(trServer(r.message))
     },
 
     async createConv(title, pid) {
-      const t = useToast()
+      const toast = useToast()
       const target = pid || this.currentProject
-      if (!target) { t.error('请先选择项目'); return }
-      const r = await api.post('/api/conversations', { project: target, title: (title || '').trim() || '新对话' })
-      if (!r.ok) { t.error(r.message); return }
+      if (!target) { toast.error(t('project.selectFirst')); return }
+      const r = await api.post('/api/conversations', { project: target, title: (title || '').trim() || t('project.newConv') })
+      if (!r.ok) { toast.error(trServer(r.message)); return }
       await this.bootstrap()
       this.currentProject = target
       await this.selectConv(r.conv_id)
-      t.success(r.message)
+      toast.success(trServer(r.message))
     },
 
     async deleteConv(cid, pid = '') {
-      const t = useToast()
+      const toast = useToast()
       const target = pid || this.currentProject
       const r = await api.del(`/api/conversations/${encodeURIComponent(cid)}?project=${encodeURIComponent(target)}`)
-      if (!r.ok) { t.error(r.message); return }
+      if (!r.ok) { toast.error(trServer(r.message)); return }
       await this.bootstrap()
       if (cid === this.currentConv) {
         this.currentConv = ''
         useChatStore().clear()
       }
-      t.success(r.message)
+      toast.success(trServer(r.message))
     },
 
     async saveProjectDir(path) {
-      const t = useToast()
-      if (!this.currentProject) { t.error('请先选择项目'); return }
+      const toast = useToast()
+      if (!this.currentProject) { toast.error(t('project.selectFirst')); return }
       const r = await api.post(`/api/project/${encodeURIComponent(this.currentProject)}/dir`, { path })
-      if (!r.ok) { t.error(r.message); return }
+      if (!r.ok) { toast.error(trServer(r.message)); return }
       this.projectDir = r.path
       const p = this.tree.find((x) => x.project === this.currentProject)
       if (p) p.project_dir = r.path
-      t.success(r.message)
+      toast.success(trServer(r.message))
     },
 
     async uploadStudyArea(fileList) {
-      const t = useToast()
-      if (!fileList || !fileList.length) { t.error('请选择文件'); return }
+      const toast = useToast()
+      if (!fileList || !fileList.length) { toast.error(t('project.selectFile')); return }
       const r = await api.uploadStudyArea([...fileList])
       this.studyAreas = r.study_areas || []
       this.lastValidation = r.validations || []
@@ -161,28 +162,28 @@ export const useProjectStore = defineStore('project', {
       // 验证结果只在研究区面板内展示（与「测试」页同款状态行），toast 仅给简洁摘要
       const bad = (r.validations || []).filter((v) => v.level !== 'ok')
       if (bad.length) {
-        t.info(`上传完成：${bad.length} 个研究区文件未通过验证，详见研究区面板`)
+        toast.info(t('project.uploadWarn', { n: bad.length }))
       } else {
-        t.success('研究区上传完成')
+        toast.success(t('project.uploadDone'))
       }
     },
 
     async setCurrentStudyArea(name) {
-      const t = useToast()
-      if (!name) { t.error('未指定研究区'); return }
+      const toast = useToast()
+      if (!name) { toast.error(t('project.noArea')); return }
       const r = await api.setCurrentStudyArea(name)
-      if (!r.ok) { t.error(r.message); return }
+      if (!r.ok) { toast.error(trServer(r.message)); return }
       this.currentStudyArea = r.current || ''
-      t.success(r.message)
+      toast.success(trServer(r.message))
     },
 
     async deleteStudyArea(name) {
-      const t = useToast()
+      const toast = useToast()
       const r = await api.deleteStudyArea(name)
-      if (!r.ok) { t.error(r.message); return }
+      if (!r.ok) { toast.error(trServer(r.message)); return }
       this.studyAreas = r.study_areas || []
       this.currentStudyArea = r.current || ''
-      t.success(r.message)
+      toast.success(trServer(r.message))
     },
   },
 })

@@ -1,6 +1,7 @@
 <script setup>
 import { ref, watch } from 'vue'
 import { useSettingsStore } from '../../stores/settings'
+import { t } from '../../i18n'
 
 const settings = useSettingsStore()
 const params = ref({ n_estimators: 200, max_depth: 25, min_samples_split: 16, min_samples_leaf: 8 })
@@ -26,15 +27,15 @@ async function save() {
 <template>
   <div>
     <div class="form-group">
-      <label>机器学习方法</label>
+      <label>{{ t('mp.method') }}</label>
       <input class="form-input" :value="'Random Forest'" disabled />
     </div>
     <div class="form-group">
-      <label>n_estimators（决策树数量）：{{ params.n_estimators }}</label>
+      <label>{{ t('mp.ntrees', { n: params.n_estimators }) }}</label>
       <input v-model.number="params.n_estimators" type="range" min="50" max="1000" step="50" class="form-range" style="width:100%" />
     </div>
     <div class="form-group">
-      <label>max_depth（最大深度）：{{ params.max_depth }}</label>
+      <label>{{ t('mp.maxdepth', { n: params.max_depth }) }}</label>
       <input v-model.number="params.max_depth" type="range" min="5" max="50" step="1" class="form-range" style="width:100%" />
     </div>
     <div class="form-group">
@@ -47,7 +48,7 @@ async function save() {
     </div>
     <button class="btn btn--primary btn--block" @click="save">
       <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>
-      保存参数
+      {{ t('mp.save') }}
     </button>
   </div>
 </template>

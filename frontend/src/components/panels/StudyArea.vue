@@ -1,6 +1,7 @@
 <script setup>
 import { ref, watch, onBeforeUnmount } from 'vue'
 import { useProjectStore } from '../../stores/project'
+import { t } from '../../i18n'
 import StatusResult from '../StatusResult.vue'
 
 const project = useProjectStore()
@@ -48,9 +49,9 @@ function deleteConfirmText() {
   const name = deleteTarget.value || ''
   const ext = (name.split('.').pop() || '').toLowerCase()
   if (ext === 'shp') {
-    return `确定删除研究区「${name}」？将同时删除该文件及其配套的 Shapefile（.dbf/.shx/.prj）文件，此操作不可撤销。`
+    return t('sa.delShp', { name })
   }
-  return `确定删除研究区「${name}」？删除后不可恢复，此操作不可撤销。`
+  return t('sa.delGeo', { name })
 }
 
 async function confirmDelete() {
@@ -64,15 +65,15 @@ onBeforeUnmount(() => clearTimeout(validationTimer))
 
 <template>
   <div class="study-area">
-    <p class="form-hint">上传研究区文件（GeoJSON / Shapefile），Agent 执行数据获取/全流程前需要使用研究区范围</p>
+    <p class="form-hint">{{ t('sa.hint') }}</p>
     <label class="file-drop">
       <input type="file" accept=".geojson,.json,.shp,.dbf,.shx,.prj" multiple style="display:none" @change="onUpload" />
-      点击选择研究区文件
+      {{ t('sa.upload') }}
     </label>
     <StatusResult v-if="validationText" :text="validationText" />
 
     <div v-if="project.studyAreas.length" class="study-area__uploaded">
-      <span class="field-label">已上传研究区（点击行切换当前使用）</span>
+      <span class="field-label">{{ t('sa.uploaded') }}</span>
       <div class="layer-list">
         <div
           v-for="f in project.studyAreas"
@@ -84,9 +85,9 @@ onBeforeUnmount(() => clearTimeout(validationTimer))
         >
           <span class="dot" :class="f === project.currentStudyArea ? 'dot--yes' : 'dot--no'"></span>
           <span class="layer-item__name" :style="{ fontWeight: f === project.currentStudyArea ? 600 : 'normal' }">{{ f }}</span>
-          <span v-if="f === project.currentStudyArea" class="tag tag--success" style="margin-left:auto">当前使用</span>
-          <span v-else class="tag tag--muted" style="margin-left:auto">设为当前</span>
-          <button class="layer-item__del" title="删除该研究区" @click.stop="onAskDelete(f)">
+          <span v-if="f === project.currentStudyArea" class="tag tag--success" style="margin-left:auto">{{ t('sa.current') }}</span>
+          <span v-else class="tag tag--muted" style="margin-left:auto">{{ t('sa.setCurrent') }}</span>
+          <button class="layer-item__del" :title="t('sa.delTitle')" @click.stop="onAskDelete(f)">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
           </button>
         </div>
@@ -96,11 +97,11 @@ onBeforeUnmount(() => clearTimeout(validationTimer))
     <!-- 删除研究区确认弹窗（页面内弹窗，替代浏览器 confirm） -->
     <div v-if="deleteTarget" class="modal-mask" @click.self="deleteTarget = ''">
       <div class="modal-card modal-card--sm">
-        <h3>删除研究区</h3>
+        <h3>{{ t('sa.delModal') }}</h3>
         <p class="modal-text">{{ deleteConfirmText() }}</p>
         <div class="modal-actions">
-          <button class="btn btn--danger" @click="confirmDelete">删除</button>
-          <button class="btn btn--cancel" @click="deleteTarget = ''">取消</button>
+          <button class="btn btn--danger" @click="confirmDelete">{{ t('sa.del') }}</button>
+          <button class="btn btn--cancel" @click="deleteTarget = ''">{{ t('sa.cancel') }}</button>
         </div>
       </div>
     </div>

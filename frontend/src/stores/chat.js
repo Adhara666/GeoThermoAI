@@ -1,6 +1,7 @@
 import { defineStore } from 'pinia'
 import { api } from '../api'
 import { useToast } from '../composables/useToast'
+import { t, trServer } from '../i18n'
 
 const EXEC_MODE_KEY = 'gtai_exec_mode'
 const CHAT_MODE_KEY = 'gtai_chat_mode'
@@ -185,8 +186,8 @@ export const useChatStore = defineStore('chat', {
     },
 
     async send(message) {
-      const t = useToast()
-      if (this.streaming) { t.info('上一条回复还在生成中，请稍候'); return }
+      const t2 = useToast()
+      if (this.streaming) { t2.info(t('chat.busy')); return }
       const msg = (message || '').trim()
       if (!msg) return
       this.streaming = true
@@ -206,17 +207,17 @@ export const useChatStore = defineStore('chat', {
           exec_mode: this.execMode,
           chat_mode: this.chatMode, // Chat=只读对话 / Work=完整执行
         })
-        if (!r.ok) { t.error(r.message || '发送失败'); this.streaming = false; return }
+        if (!r.ok) { t2.error(trServer(r.message) || t('chat.sendFailed')); this.streaming = false; return }
         if (r.messages) this.messages = normalizeMessages(r.messages)
         await this._listen(useProjectStore().currentConv)
       } catch (e) {
-        t.error(`发送失败：${e.message}`)
+        t2.error(t('chat.sendFailedMsg', { msg: e.message }))
         this.streaming = false
       }
     },
 
     async _listen(conv) {
-      const t = useToast()
+      const toast = useToast()
       // 先关闭旧对话的连接，新事件只属于当前监听会话
       if (activeStream) {
         try { activeStream.close() } catch (_) {}
@@ -276,7 +277,7 @@ export const useChatStore = defineStore('chat', {
           this.pairs = []
           this.approval = null
         } else if (type === 'error') {
-          t.error(data.message || '执行出错')
+          toast.error(trServer(data.message) || t('chat.execError'))
           this.streaming = false
           this.paused = false
         }
@@ -284,40 +285,40 @@ export const useChatStore = defineStore('chat', {
     },
 
     async resume(pairIndex) {
-      const t = useToast()
+      const toast = useToast()
       try {
         const r = await api.post('/api/chat/resume', {
           conv: useProjectStore().currentConv,
           pair_index: pairIndex,
         })
-        if (!r.ok) { t.error(r.message); return }
+        if (!r.ok) { toast.error(trServer(r.message)); return }
         this.paused = false
         this.pairs = []
         this.approval = null
         this.streaming = true
         await this._listen(useProjectStore().currentConv)
       } catch (e) {
-        t.error(`恢复失败：${e.message}`)
+        toast.error(t('chat.resumeFailed', { msg: e.message }))
       }
     },
 
     /** 通用审批节点恢复（新协议） */
     async resumeApproval(optionId, values) {
-      const t = useToast()
+      const toast = useToast()
       try {
         const r = await api.post('/api/chat/resume', {
           conv: useProjectStore().currentConv,
           option_id: optionId,
           values: values || {},
         })
-        if (!r.ok) { t.error(r.message); return }
+        if (!r.ok) { toast.error(trServer(r.message)); return }
         this.paused = false
         this.approval = null
         this.pairs = []
         this.streaming = true
         await this._listen(useProjectStore().currentConv)
       } catch (e) {
-        t.error(`恢复失败：${e.message}`)
+        toast.error(t('chat.resumeFailed', { msg: e.message }))
       }
     },
 

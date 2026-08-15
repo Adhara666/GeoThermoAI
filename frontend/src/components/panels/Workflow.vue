@@ -2,22 +2,28 @@
 import { computed, onMounted, watch } from 'vue'
 import { useChatStore } from '../../stores/chat'
 import { useProjectStore } from '../../stores/project'
+import { t, wfStepLabel } from '../../i18n'
 
 const chat = useChatStore()
 const project = useProjectStore()
 
+const FALLBACK_STEPS = [
+  { id: 'data_acquisition', label: 'data_acquisition', status: 'pending' },
+  { id: 'data_pipeline', label: 'data_pipeline', status: 'pending' },
+  { id: 'ttri_compute', label: 'ttri_compute', status: 'pending' },
+  { id: 'rf_model', label: 'rf_model', status: 'pending' },
+  { id: 'tcr_compute', label: 'tcr_compute', status: 'pending' },
+  { id: 'lst_export', label: 'lst_export', status: 'pending' },
+  { id: 'accuracy_eval', label: 'accuracy_eval', status: 'pending' },
+  { id: 'postprocess', label: 'postprocess', status: 'pending' },
+]
+
 const steps = computed(() => {
-  if (chat.workflowSteps.length) return chat.workflowSteps
-  return [
-    { id: 'data_acquisition', label: '数据获取', status: 'pending' },
-    { id: 'data_pipeline', label: '数据预处理', status: 'pending' },
-    { id: 'ttri_compute', label: 'TTRI 计算', status: 'pending' },
-    { id: 'rf_model', label: '模型训练', status: 'pending' },
-    { id: 'tcr_compute', label: 'TCR 计算', status: 'pending' },
-    { id: 'lst_export', label: 'LST 导出', status: 'pending' },
-    { id: 'accuracy_eval', label: '精度评估', status: 'pending' },
-    { id: 'postprocess', label: '结果后处理（可选）', status: 'pending' },
-  ]
+  const list = chat.workflowSteps.length ? chat.workflowSteps : FALLBACK_STEPS
+  return list.map((s) => ({
+    ...s,
+    label: wfStepLabel(s.id, s.label),
+  }))
 })
 
 // 步骤状态图标：线性 SVG（Feather 风格）+ 状态色，与整体图标风格统一
@@ -32,10 +38,14 @@ const ICON_META = {
   pending: { path: '<circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>', color: '#9ca3af' },
 }
 
-const STATUS_LABELS = {
-  completed: '完成', running: '进行中', failed: '失败',
-  skipped_upstream: '未执行（上游失败）', skipped: '未执行（可选）', pending: '等待',
-}
+const STATUS_LABELS = computed(() => ({
+  completed: t('wf.status.completed'),
+  running: t('wf.status.running'),
+  failed: t('wf.status.failed'),
+  skipped_upstream: t('wf.status.skipped_upstream'),
+  skipped: t('wf.status.skipped'),
+  pending: t('wf.status.pending'),
+}))
 const STATUS_TAG_CLASS = {
   completed: 'success', running: '', failed: 'danger',
   skipped_upstream: 'muted', skipped: 'muted', pending: 'muted',
@@ -70,7 +80,7 @@ watch(() => project.currentConv, (cid) => {
         </span>
         <span class="wf-item__label">{{ s.label }}</span>
           <span class="tag" :class="`tag--${STATUS_TAG_CLASS[s.status] ?? 'muted'}`">
-          {{ STATUS_LABELS[s.status] ?? '等待' }}
+          {{ STATUS_LABELS[s.status] ?? t('wf.status.pending') }}
         </span>
       </div>
     </div>

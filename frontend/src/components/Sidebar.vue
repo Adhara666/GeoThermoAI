@@ -3,6 +3,8 @@ import { ref, computed, nextTick } from 'vue'
 import { useProjectStore } from '../stores/project'
 import { useChatStore } from '../stores/chat'
 import { useAuthStore } from '../stores/auth'
+import { t } from '../i18n'
+import LangSwitch from './LangSwitch.vue'
 
 defineProps({ open: Boolean })
 const emit = defineEmits(['close'])
@@ -119,17 +121,15 @@ const hasAny = computed(() => project.tree.length > 0)
   <aside class="sidebar" :class="{ 'sidebar--open': open }">
     <div class="sidebar__brand">
       <img src="/logo.png?v=2" alt="GeoThermoAI" onerror="this.style.display='none'" />
-      <div>
-        <div class="sidebar__brand-name">GeoThermoAI</div>
-        <div class="sidebar__brand-sub">高分辨率地表温度智能重建系统</div>
-      </div>
+      <div class="sidebar__brand-name">GeoThermoAI</div>
+      <span class="sidebar__lang"><LangSwitch /></span>
     </div>
 
     <div class="sidebar__body">
       <div class="sidebar__new">
         <button class="btn btn--primary btn--block" @click="openNewProject">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
-          新建项目
+          {{ t('sidebar.newProject') }}
         </button>
       </div>
 
@@ -145,7 +145,7 @@ const hasAny = computed(() => project.tree.length > 0)
             <button
               class="project-card__arrow"
               :class="{ 'project-card__arrow--open': isExpanded(p.project) }"
-              title="展开/收起"
+              :title="t('sidebar.expandCollapse')"
               @click="toggleExpand(p.project)"
             >
               <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
@@ -153,7 +153,7 @@ const hasAny = computed(() => project.tree.length > 0)
             <span
               v-if="renamingPid !== p.project"
               class="project-card__name"
-              :title="'点击重命名：' + p.project"
+              :title="t('sidebar.renameTitle') + p.project"
               @click="startRename(p)"
             >{{ p.project }}</span>
             <input
@@ -167,10 +167,10 @@ const hasAny = computed(() => project.tree.length > 0)
               @click.stop
             />
             <span class="project-card__count">{{ p.conversations.length }}</span>
-            <button class="project-card__btn" title="在此项目新建对话" @click="openNewConv(p.project)">
+            <button class="project-card__btn" :title="t('sidebar.newConvTitle')" @click="openNewConv(p.project)">
               <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
             </button>
-            <button class="project-card__btn project-card__btn--del" title="删除项目" @click="deleteProjectTarget = p.project">
+            <button class="project-card__btn project-card__btn--del" :title="t('sidebar.delProjectTitle')" @click="deleteProjectTarget = p.project">
               <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
             </button>
           </div>
@@ -184,23 +184,23 @@ const hasAny = computed(() => project.tree.length > 0)
               @click="onSelectConv(p, c)"
             >
               <span class="conv-item__title" :title="c.title">{{ c.title }}</span>
-              <button class="conv-item__del" title="删除对话" @click.stop="openDeleteConv(p, c)">✕</button>
+              <button class="conv-item__del" :title="t('sidebar.delConvTitle')" @click.stop="openDeleteConv(p, c)">✕</button>
             </div>
             <div v-if="!p.conversations.length" class="project-card__empty">
-              暂无对话，点击 + 新建
+              {{ t('sidebar.noConvs') }}
             </div>
           </div>
         </div>
       </div>
       <div v-else class="sidebar-empty">
-        还没有项目，点击上方「新建项目」开始
+        {{ t('sidebar.empty') }}
       </div>
     </div>
 
     <div class="sidebar__footer">
       <div class="sidebar__user" :title="auth.user?.username">
         <span class="sidebar__user-name">{{ auth.display }}</span>
-        <button class="sidebar__logout" title="退出登录" @click="onLogout">退出</button>
+        <button class="sidebar__logout" :title="t('sidebar.logoutTitle')" @click="onLogout">{{ t('sidebar.logout') }}</button>
       </div>
       <div class="sidebar__meta">GeoThermoAI</div>
     </div>
@@ -208,21 +208,21 @@ const hasAny = computed(() => project.tree.length > 0)
     <!-- 新建项目弹窗 -->
     <div v-if="showNewProject" class="modal-mask" @click.self="showNewProject = false">
       <div class="modal-card">
-        <h3>新建项目</h3>
+        <h3>{{ t('sidebar.modalNewProject') }}</h3>
         <div class="form-group">
-          <label>项目名称</label>
+          <label>{{ t('sidebar.projectName') }}</label>
           <input
             v-model="newProjectName"
             class="form-input"
-            placeholder="例如：武汉_202407"
+            :placeholder="t('sidebar.projectNamePh')"
             @keyup.enter="onNewProject"
             autofocus
           />
         </div>
-        <p class="form-hint" style="margin:2px 0 4px">数据将自动保存到你的私有工作区（按账号隔离）</p>
+        <p class="form-hint" style="margin:2px 0 4px">{{ t('sidebar.autoSaveHint') }}</p>
         <div class="modal-actions">
-          <button class="btn btn--confirm" @click="onNewProject">创建</button>
-          <button class="btn btn--cancel" @click="showNewProject = false">取消</button>
+          <button class="btn btn--confirm" @click="onNewProject">{{ t('sidebar.create') }}</button>
+          <button class="btn btn--cancel" @click="showNewProject = false">{{ t('sidebar.cancel') }}</button>
         </div>
       </div>
     </div>
@@ -230,20 +230,20 @@ const hasAny = computed(() => project.tree.length > 0)
     <!-- 新建对话弹窗 -->
     <div v-if="showNewConv" class="modal-mask" @click.self="showNewConv = false">
       <div class="modal-card modal-card--sm">
-        <h3>在「{{ convTarget }}」中新建对话</h3>
+        <h3>{{ t('sidebar.newConvIn', { name: convTarget }) }}</h3>
         <div class="form-group">
-          <label>对话名称</label>
+          <label>{{ t('sidebar.convName') }}</label>
           <input
             v-model="newConvTitle"
             class="form-input"
-            placeholder="留空则默认「新对话」"
+            :placeholder="t('sidebar.convNamePh')"
             @keyup.enter="onNewConv"
             autofocus
           />
         </div>
         <div class="modal-actions">
-          <button class="btn btn--confirm" @click="onNewConv">创建</button>
-          <button class="btn btn--cancel" @click="showNewConv = false">取消</button>
+          <button class="btn btn--confirm" @click="onNewConv">{{ t('sidebar.create') }}</button>
+          <button class="btn btn--cancel" @click="showNewConv = false">{{ t('sidebar.cancel') }}</button>
         </div>
       </div>
     </div>
@@ -251,11 +251,11 @@ const hasAny = computed(() => project.tree.length > 0)
     <!-- 删除项目确认弹窗（页面内弹窗，替代浏览器 confirm） -->
     <div v-if="deleteProjectTarget" class="modal-mask" @click.self="deleteProjectTarget = ''">
       <div class="modal-card modal-card--md">
-        <h3>删除项目</h3>
-        <p class="modal-text">确定删除项目「{{ deleteProjectTarget }}」？将删除其全部对话文件、清除该项目产生的实验记忆与历史经验，并彻底删除该项目的工作区数据文件夹（原始影像与全部处理产物），此操作不可撤销。</p>
+        <h3>{{ t('sidebar.delProject') }}</h3>
+        <p class="modal-text">{{ t('sidebar.delProjectBody', { name: deleteProjectTarget }) }}</p>
         <div class="modal-actions">
-          <button class="btn btn--danger" @click="confirmDeleteProject">删除</button>
-          <button class="btn btn--cancel" @click="deleteProjectTarget = ''">取消</button>
+          <button class="btn btn--danger" @click="confirmDeleteProject">{{ t('sidebar.del') }}</button>
+          <button class="btn btn--cancel" @click="deleteProjectTarget = ''">{{ t('sidebar.cancel') }}</button>
         </div>
       </div>
     </div>
@@ -263,11 +263,11 @@ const hasAny = computed(() => project.tree.length > 0)
     <!-- 删除对话确认弹窗（页面内弹窗，替代浏览器 confirm） -->
     <div v-if="deleteConvTarget" class="modal-mask" @click.self="deleteConvTarget = null">
       <div class="modal-card modal-card--sm">
-        <h3>删除对话「{{ deleteConvTarget?.title }}」</h3>
-        <p class="modal-text">确定删除对话「{{ deleteConvTarget?.title }}」？将清除所有消息、运行中的进程，以及该对话产生的实验记录。</p>
+        <h3>{{ t('sidebar.delConv', { title: deleteConvTarget?.title }) }}</h3>
+        <p class="modal-text">{{ t('sidebar.delConvBody', { title: deleteConvTarget?.title }) }}</p>
         <div class="modal-actions">
-          <button class="btn btn--danger" @click="confirmDeleteConv">删除</button>
-          <button class="btn btn--cancel" @click="deleteConvTarget = null">取消</button>
+          <button class="btn btn--danger" @click="confirmDeleteConv">{{ t('sidebar.del') }}</button>
+          <button class="btn btn--cancel" @click="deleteConvTarget = null">{{ t('sidebar.cancel') }}</button>
         </div>
       </div>
     </div>

@@ -9,6 +9,7 @@ import ApprovalCard from './components/ApprovalCard.vue'
 import Workbench from './components/Workbench.vue'
 import LoginView from './components/LoginView.vue'
 import { toasts } from './composables/useToast'
+import { t } from './i18n'
 import { useProjectStore } from './stores/project'
 import { useSettingsStore } from './stores/settings'
 import { useChatStore } from './stores/chat'
@@ -79,13 +80,13 @@ onBeforeUnmount(() => {
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
           </button>
           <ChatModeSelect />
-          <span class="chat-header__title">{{ project.currentConvTitle || '未选择对话' }}</span>
+          <span class="chat-header__title">{{ project.currentConvTitle || t('app.noConv') }}</span>
           <div class="chat-header__model">
             <span v-if="settings.configured" class="tag">🟢 {{ settings.displayName }}</span>
-            <span v-else class="tag tag--warning">⚪ 未配置模型</span>
+            <span v-else class="tag tag--warning">⚪ {{ t('app.noModel') }}</span>
             <!-- 工作面板打开按钮：位于模型标签右侧，蓝底白字 -->
-            <button v-if="!workbenchOpen" class="workbench-open-btn" @click="workbenchOpen = true" title="打开工作面板">
-              <span>工作面板</span>
+            <button v-if="!workbenchOpen" class="workbench-open-btn" @click="workbenchOpen = true" :title="t('app.openWorkbench')">
+              <span>{{ t('app.workbench') }}</span>
             </button>
           </div>
         </header>

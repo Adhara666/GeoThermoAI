@@ -3,17 +3,18 @@
 // 选择结果写入 chat store 的 execMode 并持久化到 localStorage，每次发送随请求带上。
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { useChatStore } from '../stores/chat'
+import { t } from '../i18n'
 
 const chat = useChatStore()
 const open = ref(false)
 const root = ref(null)
 
-const MODES = [
-  { id: 'approval', label: '由我批准', hint: '关键节点会停下来问你' },
-  { id: 'auto', label: '完全执行', hint: '一次跑完，不打断' },
-]
+const MODES = computed(() => [
+  { id: 'approval', label: t('execMode.approval'), hint: t('execMode.approvalHint') },
+  { id: 'auto', label: t('execMode.auto'), hint: t('execMode.autoHint') },
+])
 
-const current = computed(() => MODES.find((m) => m.id === chat.execMode) || MODES[0])
+const current = computed(() => MODES.value.find((m) => m.id === chat.execMode) || MODES.value[0])
 
 function toggle() {
   if (chat.streaming) return

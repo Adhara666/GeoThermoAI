@@ -2,6 +2,7 @@
 import { ref, watch, nextTick, onMounted, onUnmounted } from 'vue'
 import { useChatStore } from '../../stores/chat'
 import { api } from '../../api'
+import { t } from '../../i18n'
 
 const chat = useChatStore()
 const box = ref(null)
@@ -78,11 +79,11 @@ async function copyLog() {
 <template>
   <div class="log-panel">
     <div class="log-panel__head">
-      <span class="log-panel__title">实时日志</span>
-      <span class="log-panel__count">{{ chat.logAll.length || chat.logLines.length }} 行</span>
-      <button class="log-panel__clear" :disabled="!chat.logAll.length && !chat.logLines.length" @click="copyLog">{{ copied ? '已复制' : '复制' }}</button>
-      <button class="log-panel__clear" :disabled="!chat.logAll.length && !chat.logLines.length" @click="clearLog">清除</button>
-      <span v-if="usage" class="log-panel__usage" title="本软件实时占用（含所有项目数据）">内存 {{ usage.mem_gb.toFixed(2) }}G · 磁盘 {{ usage.disk_gb.toFixed(2) }}G</span>
+      <span class="log-panel__title">{{ t('log.title') }}</span>
+      <span class="log-panel__count">{{ t('log.count', { n: chat.logAll.length || chat.logLines.length }) }}</span>
+      <button class="log-panel__clear" :disabled="!chat.logAll.length && !chat.logLines.length" @click="copyLog">{{ copied ? t('log.copied') : t('log.copy') }}</button>
+      <button class="log-panel__clear" :disabled="!chat.logAll.length && !chat.logLines.length" @click="clearLog">{{ t('log.clear') }}</button>
+      <span v-if="usage" class="log-panel__usage" :title="t('log.usageTitle')">{{ t('log.usage', { m: usage.mem_gb.toFixed(2), d: usage.disk_gb.toFixed(2) }) }}</span>
     </div>
     <div ref="box" class="log-panel__box" @scroll="onScroll">
       <div

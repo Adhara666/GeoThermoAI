@@ -1,6 +1,7 @@
 <script setup>
 import { ref, watch } from 'vue'
 import { useSettingsStore } from '../../stores/settings'
+import { t } from '../../i18n'
 
 const settings = useSettingsStore()
 
@@ -56,64 +57,64 @@ async function save() {
 
 <template>
   <div>
-    <p class="form-hint">数据源：Microsoft Planetary Computer（Landsat 8/9 L2、Sentinel-2 L2A、Copernicus DEM）＋ Copernicus Data Space（Sentinel-2 L2A、DEM，优先使用，国内访问更快），通过 STAC API 自动搜索下载</p>
-    <p class="form-hint">各数据自动从数据源检索下载，无需手动上传原始影像</p>
+    <p class="form-hint">{{ t('ds.hintTop') }}</p>
+    <p class="form-hint">{{ t('ds.hintAuto') }}</p>
 
     <div class="ds-srcs">
       <div class="ds-src">
-        <span class="ds-src__name">Sentinel-2 L2A（多光谱 + SCL）</span>
-        <span class="ds-src__from">Copernicus Data Space（优先）</span>
-        <span class="ds-src__fb">失败回退 Microsoft Planetary Computer</span>
+        <span class="ds-src__name">{{ t('ds.sentinel') }}</span>
+        <span class="ds-src__from">{{ t('ds.cdsePref') }}</span>
+        <span class="ds-src__fb">{{ t('ds.fbPc') }}</span>
       </div>
       <div class="ds-src">
-        <span class="ds-src__name">Landsat 8/9 L2（LST + QA）</span>
-        <span class="ds-src__from">Microsoft Planetary Computer</span>
+        <span class="ds-src__name">{{ t('ds.landsat') }}</span>
+        <span class="ds-src__from">{{ t('ds.msPc') }}</span>
       </div>
       <div class="ds-src">
-        <span class="ds-src__name">DEM（Copernicus GLO-30）</span>
-        <span class="ds-src__from">Copernicus Data Space（优先）</span>
-        <span class="ds-src__fb">需配置 S3 密钥，否则用 Microsoft Planetary Computer</span>
+        <span class="ds-src__name">{{ t('ds.dem') }}</span>
+        <span class="ds-src__from">{{ t('ds.cdsePref') }}</span>
+        <span class="ds-src__fb">{{ t('ds.s3Need') }}</span>
       </div>
     </div>
 
     <div class="form-group" style="margin-top:14px">
-      <label>Copernicus Data Space 账号</label>
-      <input v-model="username" class="form-input" placeholder="注册邮箱（dataspace.copernicus.eu）" />
+      <label>{{ t('ds.account') }}</label>
+      <input v-model="username" class="form-input" :placeholder="t('ds.accountPh')" />
     </div>
     <div class="form-group">
-      <label>密码</label>
-      <input v-model="password" type="password" class="form-input" placeholder="哥白尼数据空间登录密码；已配置时显示为黑点" />
+      <label>{{ t('ds.password') }}</label>
+      <input v-model="password" type="password" class="form-input" :placeholder="t('ds.passwordPh')" />
     </div>
 
     <details class="advanced" style="margin-bottom:12px">
-      <summary style="cursor:pointer;font-size:13px;color:var(--text-secondary)">高级配置（可选，非必需）</summary>
+      <summary style="cursor:pointer;font-size:13px;color:var(--text-secondary)">{{ t('ds.adv') }}</summary>
       <div style="margin-top:10px">
         <div class="form-group">
           <label>OAuth2 Client ID</label>
-          <input v-model="clientId" class="form-input" placeholder="无账号时用于搜索影像" />
+          <input v-model="clientId" class="form-input" :placeholder="t('ds.clientIdPh')" />
         </div>
         <div class="form-group">
           <label>OAuth2 Client Secret</label>
-          <input v-model="clientSecret" type="password" class="form-input" placeholder="无账号时用于搜索影像；已配置时显示为黑点" />
+          <input v-model="clientSecret" type="password" class="form-input" :placeholder="t('ds.clientSecretPh')" />
         </div>
         <div class="form-group">
           <label>S3 Access Key</label>
-          <input v-model="s3Key" class="form-input" placeholder="DEM 走 CDSE 必需；无账号时亦用于下载" />
+          <input v-model="s3Key" class="form-input" :placeholder="t('ds.s3KeyPh')" />
         </div>
         <div class="form-group">
           <label>S3 Secret Key</label>
-          <input v-model="s3Secret" type="password" class="form-input" placeholder="与 S3 Access Key 配套；已配置时显示为黑点" />
+          <input v-model="s3Secret" type="password" class="form-input" :placeholder="t('ds.s3SecretPh')" />
         </div>
       </div>
     </details>
 
     <button class="btn btn--primary btn--block" :disabled="saving" @click="save">
       <svg v-if="!saving" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>
-      {{ saving ? '保存中…' : '保存数据源配置' }}
+      {{ saving ? t('ds.saving') : t('ds.saveBtn') }}
     </button>
-    <p v-if="saved" class="form-hint" style="margin-top:8px;color:var(--success)">已保存并应用</p>
+    <p v-if="saved" class="form-hint" style="margin-top:8px;color:var(--success)">{{ t('ds.saved') }}</p>
     <p class="form-hint" style="margin-top:10px">
-      Sentinel-2 填写账号密码即可优先走 Copernicus Data Space（国内更快）；DEM 走 CDSE 需额外配置 S3 密钥；未配置或下载失败时自动回退 Microsoft Planetary Computer
+      {{ t('ds.hintBottom') }}
     </p>
   </div>
 </template>

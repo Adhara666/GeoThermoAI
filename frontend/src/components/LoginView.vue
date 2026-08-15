@@ -2,6 +2,8 @@
 import { ref } from 'vue'
 import { useAuthStore } from '../stores/auth'
 import { useToast } from '../composables/useToast'
+import { t } from '../i18n'
+import LangSwitch from './LangSwitch.vue'
 
 const emit = defineEmits(['authed'])
 const auth = useAuthStore()
@@ -12,24 +14,26 @@ const username = ref('')
 const password = ref('')
 const nickname = ref('')
 const busy = ref(false)
+// 密码明文/密文切换（浏览器原生密码可见控件在部分环境不显示，代码内置保证处处可用）
+const showPwd = ref(false)
 
 async function submit() {
   if (busy.value) return
   const u = username.value.trim()
   const p = password.value
-  if (!u) { toast.error('请输入账号名'); return }
-  if (!p) { toast.error('请输入密码'); return }
+  if (!u) { toast.error(t('login.errEmptyUser')); return }
+  if (!p) { toast.error(t('login.errEmptyPwd')); return }
   busy.value = true
   try {
     if (mode.value === 'login') {
       await auth.login(u, p)
     } else {
-      if (p.length < 6) { toast.error('密码至少 6 位'); return }
+      if (p.length < 6) { toast.error(t('login.errPwdLen')); return }
       await auth.register(u, p, nickname.value.trim())
     }
     emit('authed')
   } catch (e) {
-    toast.error(e.message || '操作失败')
+    toast.error(e.message || t('login.errFailed'))
   } finally {
     busy.value = false
   }
@@ -38,40 +42,57 @@ async function submit() {
 
 <template>
   <div class="login-page">
+    <div class="login-lang"><LangSwitch /></div>
     <div class="login-card">
       <div class="login-brand">
         <img src="/logo.png?v=2" alt="GeoThermoAI" onerror="this.style.display='none'" />
         <div class="login-title">GeoThermoAI</div>
-        <div class="login-sub">高分辨率地表温度智能重建系统</div>
+        <div class="login-sub">{{ t('login.sub') }}</div>
       </div>
 
       <div class="login-tabs">
-        <button class="login-tab" :class="{ 'login-tab--active': mode === 'login' }" @click="mode = 'login'">登录</button>
-        <button class="login-tab" :class="{ 'login-tab--active': mode === 'register' }" @click="mode = 'register'">注册</button>
+        <button class="login-tab" :class="{ 'login-tab--active': mode === 'login' }" @click="mode = 'login'">{{ t('login.tabLogin') }}</button>
+        <button class="login-tab" :class="{ 'login-tab--active': mode === 'register' }" @click="mode = 'register'">{{ t('login.tabRegister') }}</button>
       </div>
 
       <form class="login-form" @submit.prevent="submit">
         <div class="form-group">
-          <label>账号名</label>
-          <input v-model="username" class="form-input" placeholder="仅字母/数字/_/-，2-32 位" autofocus />
+          <label>{{ t('login.username') }}</label>
+          <input v-model="username" class="form-input" :placeholder="t('login.usernamePh')" autofocus />
         </div>
         <div v-if="mode === 'register'" class="form-group">
-          <label>昵称（可选，用于展示）</label>
-          <input v-model="nickname" class="form-input" placeholder="留空则使用账号名" maxlength="32" />
+          <label>{{ t('login.nickname') }}</label>
+          <input v-model="nickname" class="form-input" :placeholder="t('login.nicknamePh')" maxlength="32" />
         </div>
         <div class="form-group">
-          <label>密码</label>
-          <input v-model="password" type="password" class="form-input" :placeholder="mode === 'register' ? '至少 6 位，支持大小写字母、数字与符号' : '输入密码'" />
+          <label>{{ t('login.password') }}</label>
+          <div class="pwd-wrap">
+            <input
+              v-model="password"
+              :type="showPwd ? 'text' : 'password'"
+              class="form-input pwd-input"
+              :placeholder="mode === 'register' ? t('login.pwdRegPh') : t('login.pwdPh')"
+            />
+            <button
+              type="button"
+              class="pwd-toggle"
+              :title="showPwd ? t('login.hidePwd') : t('login.showPwd')"
+              @click="showPwd = !showPwd"
+            >
+              <svg v-if="showPwd" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/></svg>
+              <svg v-else width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
+            </button>
+          </div>
         </div>
         <button class="btn btn--primary btn--block" :disabled="busy" type="submit">
-          {{ busy ? '请稍候…' : mode === 'login' ? '登 录' : '注册并登录' }}
+          {{ busy ? t('login.pleaseWait') : mode === 'login' ? t('login.loginBtn') : t('login.regBtn') }}
         </button>
       </form>
 
       <p class="login-foot">
-        {{ mode === 'login' ? '还没有账号？' : '已有账号？' }}
+        {{ mode === 'login' ? t('login.noAccount') : t('login.hasAccount') }}
         <a class="login-link" @click="mode = mode === 'login' ? 'register' : 'login'">
-          {{ mode === 'login' ? '立即注册' : '去登录' }}
+          {{ mode === 'login' ? t('login.goRegister') : t('login.goLogin') }}
         </a>
       </p>
     </div>
@@ -95,6 +116,7 @@ async function submit() {
   padding: 16px;
   overflow: auto;
 }
+.login-lang { position: absolute; top: 14px; left: 16px; z-index: 10; }
 .login-card {
   width: 380px;
   max-width: 100%;
@@ -114,4 +136,13 @@ async function submit() {
 .login-form { display: flex; flex-direction: column; gap: 12px; }
 .login-foot { text-align: center; font-size: 13px; color: var(--text-secondary); margin-top: 14px; }
 .login-link { color: var(--primary); cursor: pointer; }
+.pwd-wrap { position: relative; }
+.pwd-input { padding-right: 34px; }
+.pwd-toggle {
+  position: absolute; top: 50%; right: 4px; transform: translateY(-50%);
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 26px; height: 26px; padding: 0; border: none; background: none;
+  color: var(--text-muted); cursor: pointer; transition: color 0.15s;
+}
+.pwd-toggle:hover { color: var(--primary); }
 </style>

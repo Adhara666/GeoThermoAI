@@ -4,6 +4,7 @@ import L from 'leaflet'
 import 'leaflet/dist/leaflet.css'
 import { useProjectStore } from '../../stores/project'
 import { api, getToken } from '../../api'
+import { t, mapLayerLabel } from '../../i18n'
 
 const project = useProjectStore()
 const conv = computed(() => project.currentConv)
@@ -14,11 +15,11 @@ const panelOpen = ref(true)
 const layers = ref([]) // [{id,label,group,available,visible,opacity,bounds}]
 const currentBase = ref('gaode')
 
-const BASE_DEFS = [
-  { id: 'gaode', label: '街道地图', url: 'https://webrd0{s}.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=8&x={x}&y={y}&z={z}', maxZoom: 18, attr: '© 高德地图', subdomains: '1234' },
-  { id: 'gaode_sat', label: '卫星影像', url: 'https://webst0{s}.is.autonavi.com/appmaptile?style=6&x={x}&y={y}&z={z}', maxZoom: 18, attr: '© 高德地图', subdomains: '1234' },
-  { id: 'esri', label: 'Esri 卫星', url: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', maxZoom: 18, attr: '© Esri' },
-]
+const BASE_DEFS = computed(() => [
+  { id: 'gaode', label: t('map.street'), url: 'https://webrd0{s}.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=8&x={x}&y={y}&z={z}', maxZoom: 18, attr: t('map.attrGaode'), subdomains: '1234' },
+  { id: 'gaode_sat', label: t('map.satellite'), url: 'https://webst0{s}.is.autonavi.com/appmaptile?style=6&x={x}&y={y}&z={z}', maxZoom: 18, attr: t('map.attrGaode'), subdomains: '1234' },
+  { id: 'esri', label: t('map.esri'), url: 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', maxZoom: 18, attr: '© Esri' },
+])
 
 let map = null
 let baseLayer = null
@@ -33,7 +34,7 @@ function setBase(id) {
   currentBase.value = id
   if (!map) return
   if (baseLayer) map.removeLayer(baseLayer)
-  const def = BASE_DEFS.find((b) => b.id === id)
+  const def = BASE_DEFS.value.find((b) => b.id === id)
   if (!def) return
   baseLayer = L.tileLayer(def.url, { maxZoom: def.maxZoom, attribution: def.attr, subdomains: def.subdomains || 'abc' })
   baseLayer.addTo(map)
@@ -290,7 +291,8 @@ const groups = computed(() => {
   const g = {}
   for (const l of layers.value) {
     if (!l.available) continue
-    ;(g[l.group || '图层'] = g[l.group || '图层'] || []).push(l)
+    const gname = mapLayerLabel(l.group || '') || t('map.defaultGroup')
+    ;(g[gname] = g[gname] || []).push({ ...l, label: mapLayerLabel(l.label) || l.label || l.id })
   }
   return g
 })
@@ -301,7 +303,7 @@ const groups = computed(() => {
     <div class="map-toolbar">
       <button class="btn btn--sm" @click="refresh">
         <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
-        刷新
+        {{ t('map.refresh') }}
       </button>
       <div class="base-switch">
         <button
@@ -313,7 +315,7 @@ const groups = computed(() => {
         >{{ b.label }}</button>
       </div>
       <button class="btn btn--sm" @click="panelOpen = !panelOpen">
-        {{ panelOpen ? '▸ 收起图层' : '◂ 图层控制' }}
+        {{ panelOpen ? t('map.hideLayers') : t('map.showLayers') }}
       </button>
     </div>
 
@@ -321,22 +323,22 @@ const groups = computed(() => {
       <div ref="mapEl" class="map-canvas"></div>
 
       <div v-if="!hasAny" class="map-hint">
-        <div>未发现可渲染的数据图层</div>
-        <div class="map-hint__sub">请选择已设置项目目录的对话，并完成数据下载 / LST 生成后刷新</div>
+        <div>{{ t('map.noLayers') }}</div>
+        <div class="map-hint__sub">{{ t('map.noLayersSub') }}</div>
       </div>
 
       <div v-if="panelOpen && hasAny" class="layer-panel">
         <div class="layer-panel__title">
-          <span>图层控制</span>
+          <span>{{ t('map.layers') }}</span>
           <button
             v-if="lstLayers.length"
             class="temp-btn"
             :class="{ 'temp-btn--active': tempMode }"
-            :title="tempMode ? '关闭温度显示，恢复地图操作' : '显示鼠标所在像元在各 LST 图层上的温度'"
+            :title="tempMode ? t('map.hideTempTitle') : t('map.showTempTitle')"
             @click="toggleTempMode"
           >
             <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/><circle cx="12" cy="10" r="3"/></svg>
-            {{ tempMode ? '关闭温度' : '显示温度' }}
+            {{ tempMode ? t('map.hideTemp') : t('map.showTemp') }}
           </button>
         </div>
         <div v-for="(items, gname) in groups" :key="gname" class="layer-group">
@@ -355,7 +357,7 @@ const groups = computed(() => {
               class="layer-row__opacity"
               min="0" max="100"
               :value="Math.round(l.opacity * 100)"
-              :title="`透明度 ${Math.round(l.opacity * 100)}%`"
+              :title="t('map.opacityTitle', { pct: Math.round(l.opacity * 100) })"
               @input="onOpacity(l, $event.target.value)"
             />
             <span class="layer-row__pct">{{ Math.round(l.opacity * 100) }}%</span>
@@ -365,8 +367,8 @@ const groups = computed(() => {
 
       <div v-if="tempMode" class="temp-panel">
         <div class="temp-panel__head">
-          <span class="temp-panel__ttl">像元温度</span>
-          <span v-if="tempLocked" class="temp-panel__lock">已锁定</span>
+          <span class="temp-panel__ttl">{{ t('map.pixelTemp') }}</span>
+          <span v-if="tempLocked" class="temp-panel__lock">{{ t('map.locked') }}</span>
         </div>
         <div v-if="showCoord" class="temp-panel__coord">{{ coordText }}</div>
         <div v-if="checkedLstLayers.length" class="temp-panel__rows">
@@ -375,7 +377,7 @@ const groups = computed(() => {
             <span class="temp-panel__val">{{ fmtTemp(showValues[l.id]) }}</span>
           </div>
         </div>
-        <div v-else class="temp-panel__hint">请勾选至少一个LST图层</div>
+        <div v-else class="temp-panel__hint">{{ t('map.noLst') }}</div>
       </div>
     </div>
   </div>

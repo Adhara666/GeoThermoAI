@@ -1,5 +1,6 @@
 // API 封装：fetch + SSE，统一携带 JWT（Authorization: Bearer / ?token=）
 // 401 时清除本地 token 并广播未授权事件，由 App.vue 切回登录页
+import { trServer } from '../i18n'
 
 const TOKEN_KEY = 'gtai_token'
 
@@ -53,7 +54,14 @@ async function req(method, url, body) {
   }
   if (!res.ok) {
     const txt = await res.text().catch(() => '')
-    throw new Error(`${res.status} ${txt.slice(0, 200)}`)
+    // 优先取服务端 JSON 里的 message（英文态再经 trServer 翻译），
+    // 无 message 时降级为「状态码 + 原文片段」
+    let msg = `${res.status} ${txt.slice(0, 200)}`
+    try {
+      const j = JSON.parse(txt)
+      if (j && typeof j.message === 'string' && j.message) msg = trServer(j.message)
+    } catch (_) {}
+    throw new Error(msg)
   }
   const ct = res.headers.get('content-type') || ''
   if (ct.includes('application/json')) return res.json()
@@ -74,7 +82,7 @@ export const api = {
     const fd = new FormData()
     for (const f of files) fd.append('files', f)
     const res = await fetch(withTokenQuery('/api/study-area'), { method: 'POST', body: fd, headers: tokenHeader() })
-    if (!res.ok) throw new Error(`上传失败 ${res.status}`)
+    if (!res.ok) throw new Error(trServer(`上传失败 ${res.status}`))
     return res.json()
   },
 

@@ -1,6 +1,7 @@
 import { defineStore } from 'pinia'
 import { api } from '../api'
 import { useToast } from '../composables/useToast'
+import { trServer } from '../i18n'
 
 export const useSettingsStore = defineStore('settings', {
   state: () => ({
@@ -31,19 +32,19 @@ export const useSettingsStore = defineStore('settings', {
     async saveSettings(payload) {
       const t = useToast()
       const r = await api.post('/api/settings', payload)
-      if (!r.ok) { t.error(r.message); return false }
+      if (!r.ok) { t.error(trServer(r.message)); return false }
       // 重新拉取掩码状态，黑点长度与最新密钥一致
       try { this.settings = await api.get('/api/settings') } catch (_) {}
-      t.success(r.message)
+      t.success(trServer(r.message))
       return true
     },
 
     async saveModelParams(params) {
       const t = useToast()
       const r = await api.post('/api/model-params', params)
-      if (!r.ok) { t.error(r.message); return false }
+      if (!r.ok) { t.error(trServer(r.message)); return false }
       this.modelParams = { ...params }
-      t.success(r.message)
+      t.success(trServer(r.message))
       return true
     },
   },
