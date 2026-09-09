@@ -37,6 +37,14 @@ if str(_ROOT) not in sys.path:
 from core import auth
 from core.memtrim import release_rss_memory as _memtrim_release
 from core.ai_assistant import GeoThermoAI_Assistant
+from core.state_kernel import (
+    CommandConflictError,
+    StateStore,
+    mark_command_failed,
+    mark_command_processed,
+    mark_command_processing,
+    receive_command,
+)
 from core.skills.skill_registry import SkillRegistry
 from core.agent.geo_thermo_agent import GeoThermoAgent
 from core.agent import presentation
@@ -209,6 +217,11 @@ class AppBackend:
         # 每个对话已累积的实时日志（日志面板权威全量）：刷新/断线重连后恢复日志连续性
         self._stream_logs: Dict[str, list] = {}
 
+        # 状态内核（升级第一阶段）：SQLite 台账 + 命令接收服务。
+        # 单例惰性初始化；唯一写连接由内核内部写入者线程独占。
+        self._state_store: Optional[StateStore] = None
+        self._state_store_lock = threading.Lock()
+
     # ── 内部工具 ───────────────────────────────────────────────
 
     def _register_builtin_skills(self):
@@ -241,6 +254,57 @@ class AppBackend:
     @staticmethod
     def _uid() -> str:
         return _uid_ctx.get() or "default"
+
+    # ── 状态内核（升级第一阶段：状态内核） ────────────────
+
+    def _get_state_store(self) -> StateStore:
+        """台账单例：data/state_kernel/ledger.sqlite3，可用 GTAI_STATE_DB 覆盖。"""
+        with self._state_store_lock:
+            if self._state_store is None:
+                db_path = os.environ.get("GTAI_STATE_DB", "").strip()
+                if not db_path:
+                    db_path = str(_ROOT / "data" / "state_kernel" / "ledger.sqlite3")
+                self._state_store = StateStore(Path(db_path))
+            return self._state_store
+
+    def ledger_snapshot(self, limit: int = 50) -> dict:
+        """台账只读快照（供验收巡检；不在 SSE 生命周期内持有读事务）。"""
+        store = self._get_state_store()
+        uid = self._uid()
+        limit = max(1, min(int(limit), 500))
+
+        def _snapshot(conn):
+            def _rows(sql, args):
+                cols = None
+                out = []
+                cur = conn.execute(sql, args)
+                cols = [d[0] for d in cur.description]
+                for r in cur.fetchmany(limit):
+                    out.append(dict(zip(cols, r)))
+                return out
+
+            return {
+                "schema_version": conn.execute("PRAGMA user_version").fetchone()[0],
+                "commands": _rows(
+                    "SELECT id, dedup_key, operation_type, status, created_at,"
+                    " processed_at, message_id FROM commands WHERE user_id = ?"
+                    " ORDER BY created_at DESC LIMIT ?",
+                    (uid, limit),
+                ),
+                "messages": _rows(
+                    "SELECT m.id, m.seq, m.role, m.content, m.created_at"
+                    " FROM messages m JOIN conversations c ON m.conversation_id = c.id"
+                    " WHERE c.user_id = ? ORDER BY m.created_at DESC LIMIT ?",
+                    (uid, limit),
+                ),
+                "events": _rows(
+                    "SELECT seq, type, occurred_at, object_type, object_id"
+                    " FROM events WHERE user_id = ? ORDER BY seq DESC LIMIT ?",
+                    (uid, limit),
+                ),
+            }
+
+        return store.read(_snapshot)
 
     def _user_dir(self) -> Path:
         return _ROOT / "data" / "users" / self._uid()
@@ -1675,10 +1739,40 @@ class AppBackend:
 
     # ── 聊天流式（线程 + 队列，复刻旧版语义） ─────────────────
 
-    def chat_start(self, pid: str, cid: str, user_msg: str, exec_mode: str = "", chat_mode: str = "") -> dict:
+    def chat_start(self, pid: str, cid: str, user_msg: str, exec_mode: str = "", chat_mode: str = "", request_id: str = "") -> dict:
         user_msg = (user_msg or "").strip()
         if not user_msg:
             return {"ok": False, "message": "消息不能为空"}
+
+        # ── 状态内核（升级第一阶段）：命令先持久化再处理 ──
+        # 同一请求编号 + 相同载荷只生效一次（去重）；同键不同载荷报冲突。
+        # 事务提交后立即回执，不等任务完成（总体方案 §3.4「接收消息」）。
+        # 去重检查必须先于线程占用检查：即使首个请求的任务线程仍在执行，
+        # 重复请求也应命中幂等返回，而不是被“已有任务在执行中”误拦
+        # （9.1 验收第 2 条：同一请求发两次，台账里只记一次）。
+        receipt = None
+        try:
+            receipt = receive_command(
+                self._get_state_store(),
+                user_id=self._uid(),
+                project_id=pid,
+                conversation_id=cid,
+                message=user_msg,
+                dedup_key=(request_id or "").strip(),
+                operation_type="chat.command",
+                payload={"exec_mode": exec_mode, "chat_mode": chat_mode},
+            )
+        except CommandConflictError as e:
+            return {"ok": False, "message": f"命令冲突：{e}"}
+        except Exception as e:  # 台账故障不阻断旧链路，但要留痕
+            print(f"[state_kernel] 命令持久化失败（旧链路继续）：{e}")
+        if receipt is not None and receipt.duplicate:
+            # 重复请求：幂等命中，不再启动第二个执行线程
+            return {"ok": True, "duplicate": True,
+                    "command_id": receipt.command_id,
+                    "messages": self.load_conversations().get(pid, {}).get(cid, {}).get("messages", [])}
+        command_id = receipt.command_id if receipt is not None else None
+
         # 同一对话已有任务线程在执行/挂起时拒绝重复启动（前端有 streaming 保护，
         # API 直调无防护；双线程会互相 set/reset pause 事件造成串扰）
         prev = self._agent_threads.get(cid)
@@ -1687,6 +1781,7 @@ class AppBackend:
         convs = self.load_conversations()
         if pid not in convs or cid not in convs[pid]:
             return {"ok": False, "message": "对话不存在，请先选择对话"}
+
         history = convs[pid][cid].get("messages", [])
         history = history + [{"role": "user", "content": user_msg}]
 
@@ -1694,6 +1789,13 @@ class AppBackend:
         if not assistant.api_key and not assistant.api_base_url:
             history.append({"role": "assistant", "content": "⚠️ 请先在右侧「🔑 API 设置」配置模型。"})
             self._save_history(pid, cid, history)
+            # 不启动任务线程：命令同步完成，回写终态避免停留在 received
+            if command_id:
+                try:
+                    mark_command_processed(self._get_state_store(), command_id,
+                                           {"ok": True, "note": "no_api_key"})
+                except Exception as ke:
+                    print(f"[state_kernel] 命令完成态回写异常：{ke}")
             return {"ok": True, "messages": history}
 
         conv_state = self._get_conv_state(cid)
@@ -1721,11 +1823,23 @@ class AppBackend:
                 history.append({"role": "assistant",
                                 "content": "⚠️ 请先上传研究区文件（Shapefile 或 GeoJSON），然后再发送指令。"})
                 self._save_history(pid, cid, history)
+                if command_id:
+                    try:
+                        mark_command_processed(self._get_state_store(), command_id,
+                                               {"ok": True, "note": "no_study_area"})
+                    except Exception as ke:
+                        print(f"[state_kernel] 命令完成态回写异常：{ke}")
                 return {"ok": True, "messages": history}
             if not project_dir or not os.path.isdir(project_dir):
                 history.append({"role": "assistant",
                                 "content": "⚠️ 请先设置项目保存路径，然后再执行一键全流程。"})
                 self._save_history(pid, cid, history)
+                if command_id:
+                    try:
+                        mark_command_processed(self._get_state_store(), command_id,
+                                               {"ok": True, "note": "no_project_dir"})
+                    except Exception as ke:
+                        print(f"[state_kernel] 命令完成态回写异常：{ke}")
                 return {"ok": True, "messages": history}
 
         # 追加占位 assistant 气泡（空内容，不显示黑竖线；生成中由前端打字光标指示）
@@ -1761,10 +1875,11 @@ class AppBackend:
 
         def _runner():
             ctx_token = _uid_ctx.set(uid)  # 后台线程不带请求 contextvars，需显式恢复用户
-            # 记录最后一次 token 全文：收尾兜底直接用它，绝不 get_nowait 弹队列
+            # 记录最后一次 token 全文：收尾兑底直接用它，绝不 get_nowait 弹队列
             # （避免与活跃 SSE 生成器竞争事件，抢走最后一条 token 后生成器本地
             # accumulated 落后，done 推给前端的是半截气泡）。所有分支共用。
             tail_token = [""]
+            runner_failed = [False]
 
             def _put_token(content: str):
                 tail_token[0] = content
@@ -1886,7 +2001,13 @@ class AppBackend:
                     )
                     q.put(("done", None))
             except Exception as e:
+                runner_failed[0] = True
                 q.put(("error", str(e)))
+                if command_id:
+                    try:
+                        mark_command_failed(self._get_state_store(), command_id, str(e))
+                    except Exception as ke:
+                        print(f"[state_kernel] 命令失败态回写异常：{ke}")
             finally:
                 _uid_ctx.reset(ctx_token)
                 # 兜底持久化流尾部：长流程中（如空洞填补）SSE 生成器可能已断线/
@@ -1929,6 +2050,16 @@ class AppBackend:
                     gdal.SetCacheMax(256 * 1024 * 1024)
                 except Exception:
                     pass
+                # 命令处理闭环（升级第一阶段）：成功/纯对话 → processed；
+                # 失败已在 except 分支回写 failed，避免命令永久停在 received。
+                if command_id and not runner_failed[0]:
+                    try:
+                        mark_command_processed(
+                            self._get_state_store(), command_id,
+                            {"ok": True, "tail_chars": len(tail_token[0])},
+                        )
+                    except Exception as ke:
+                        print(f"[state_kernel] 命令完成态回写异常：{ke}")
                 release_rss_memory()
 
         thread = threading.Thread(target=_runner, daemon=True)
@@ -2570,7 +2701,15 @@ def chat_start(payload: dict):
         payload.get("project", ""), payload.get("conv", ""), payload.get("message", ""),
         exec_mode=payload.get("exec_mode", ""),
         chat_mode=payload.get("chat_mode", ""),
+        request_id=payload.get("request_id", ""),
     )
+
+
+# ── API：状态内核台账只读巡检（升级第一阶段验收入口） ─────────
+
+@app.get("/api/kernel/ledger")
+def kernel_ledger(limit: int = 50):
+    return backend.ledger_snapshot(limit)
 
 
 @app.get("/api/chat/stream")

@@ -200,12 +200,17 @@ export const useChatStore = defineStore('chat', {
       _logBuf = []
       if (_logTimer) { clearTimeout(_logTimer); _logTimer = null }
       try {
+        // 请求编号（升级第一阶段：状态内核命令去重）。同一次发送的重试/重复
+        // 提交携带同一编号时，后端只记一次；界面无感知。
+        if (!this._requestSeq) this._requestSeq = 0
+        const requestId = (crypto?.randomUUID?.() || `req-${Date.now()}-${++this._requestSeq}`)
         const r = await api.post('/api/chat/start', {
           project: useProjectStore().currentProject,
           conv: useProjectStore().currentConv,
           message: msg,
           exec_mode: this.execMode,
           chat_mode: this.chatMode, // Chat=只读对话 / Work=完整执行
+          request_id: requestId,
         })
         if (!r.ok) { t2.error(trServer(r.message) || t('chat.sendFailed')); this.streaming = false; return }
         if (r.messages) this.messages = normalizeMessages(r.messages)
