@@ -63,7 +63,7 @@ class GeoThermoAgent:
 
     # ── 公开接口 ─────────────────────────────────────────────────────
 
-    def process_command(self, user_input: str, on_token=None, on_log=None, pause_callback=None, project_dir: str = "", workflow_callback=None, settings_path: str = "", study_areas_dir: str = "", conv_id: str = "", project_id: str = "", memory_manager=None, exec_mode: str = "", prior_messages=None, session_state=None, on_thinking=None) -> str:
+    def process_command(self, user_input: str, on_token=None, on_log=None, pause_callback=None, project_dir: str = "", workflow_callback=None, settings_path: str = "", study_areas_dir: str = "", conv_id: str = "", project_id: str = "", memory_manager=None, exec_mode: str = "", prior_messages=None, session_state=None, on_thinking=None, resolved_task=None) -> str:
         """处理用户自然语言指令
 
         流程：
@@ -88,8 +88,25 @@ class GeoThermoAgent:
         prior_messages:   完整对话历史（修复「Agent 路径看不到上文」）
         session_state:    本对话已确认槽位
 
-        以上三个参数均为可选，不传时行为与角色化改造前完全一致。
+        resolved_task:    理解层（升级第二阶段）已绑定校验完成的任务；非空时角色
+                          路径跳过重新理解，直接按已确认参数执行
+
+        以上参数均为可选，不传时行为与角色化改造前完全一致。
         """
+        # 理解层已经决定好做什么时，不再走关键词分流与旧路径兜底：
+        # 那些猜测逻辑正是阶段 2 要移除的「关键词劫持意图」（§4.1 末段）。
+        if resolved_task is not None:
+            return self.process_command_with_roles(
+                user_input, on_token=on_token, on_log=on_log,
+                pause_callback=pause_callback, project_dir=project_dir,
+                workflow_callback=workflow_callback, settings_path=settings_path,
+                study_areas_dir=study_areas_dir, conv_id=conv_id,
+                project_id=project_id, memory_manager=memory_manager,
+                exec_mode=exec_mode, prior_messages=prior_messages,
+                session_state=session_state, on_thinking=on_thinking,
+                resolved_task=resolved_task,
+            )
+
         # 结果后处理（空洞填补）请求：角色编排开启时**交由规划 Agent 判断**——
         # 规划 Agent 用 LLM 意图分类理解用户消息（intent=postprocess），并生成只含
         # lst_gapfill 的单步计划，执行阶段再由结果 Agent（EvalAgent）接管填洞；
@@ -250,7 +267,8 @@ class GeoThermoAgent:
                                    study_areas_dir: str = "", conv_id: str = "",
                                    project_id: str = "", memory_manager=None,
                                    exec_mode: str = "", prior_messages=None,
-                                   session_state=None, on_thinking=None) -> str:
+                                   session_state=None, on_thinking=None,
+                                   resolved_task=None) -> str:
         """多角色路径（薄委托）：规划 Agent 出 plan，总调度按 plan 依次调用执行 Agent。
 
         实现在 `core/agent/orchestrator/role_flow.py`；与旧路径互不影响，
@@ -265,7 +283,7 @@ class GeoThermoAgent:
             study_areas_dir=study_areas_dir, conv_id=conv_id, project_id=project_id,
             memory_manager=memory_manager, exec_mode=exec_mode,
             prior_messages=prior_messages, session_state=session_state,
-            on_thinking=on_thinking,
+            on_thinking=on_thinking, resolved_task=resolved_task,
         )
 
     def _resolved_study_areas_dir(self, study_areas_dir: str = "") -> str:

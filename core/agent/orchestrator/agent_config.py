@@ -31,6 +31,9 @@ AGENT_DEFAULTS: Dict[str, Any] = {
     # 安全阀：P0–P6 全部阶段测试与回归验收通过，已置为 True。
     # 出现问题时把 config/settings.json 的 agent.roles_enabled 改回 false 即可整体回退到旧路径。
     "roles_enabled": True,
+    # 升级第二阶段（理解层）：模型只输出候选操作，程序绑定校验后再决定。
+    # 关掉即整体回退到旧的「Planner 直接出计划」路径，是同一类安全阀。
+    "understanding_enabled": True,
     "replan_max": REPLAN_MAX,
     "tuning_max_rounds": DEFAULT_TUNING_ROUNDS,
     "approval_wait_seconds": APPROVAL_WAIT_TIMEOUT,
@@ -81,6 +84,8 @@ def resolve(settings: Optional[dict]) -> Dict[str, Any]:
 
     return {
         "roles_enabled": bool(raw.get("roles_enabled", AGENT_DEFAULTS["roles_enabled"])),
+        "understanding_enabled": bool(raw.get("understanding_enabled",
+                                              AGENT_DEFAULTS["understanding_enabled"])),
         "replan_max": _as_int(raw.get("replan_max"), AGENT_DEFAULTS["replan_max"], 0, 10),
         "tuning_max_rounds": _as_int(raw.get("tuning_max_rounds"),
                                      AGENT_DEFAULTS["tuning_max_rounds"],

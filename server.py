@@ -43,8 +43,11 @@ from core.state_kernel import (
     mark_command_failed,
     mark_command_processed,
     mark_command_processing,
+    questions as q_store,
     receive_command,
+    tasks as t_store,
 )
+from core.agent import understanding
 from core.skills.skill_registry import SkillRegistry
 from core.agent.geo_thermo_agent import GeoThermoAgent
 from core.agent import presentation
@@ -305,6 +308,139 @@ class AppBackend:
             }
 
         return store.read(_snapshot)
+
+    # ── 理解层（升级第二阶段） ────────────────────────────────
+
+    def _conversation_pk(self, pid: str, cid: str) -> str:
+        """台账内部对话主键；命令接收时已登记，这里只读。"""
+        from core.state_kernel import conversation_pk
+
+        store = self._get_state_store()
+        uid = self._uid()
+        return store.read(
+            lambda conn: conversation_pk(conn, uid, pid, cid)) or ""
+
+    def _resolve_context(self, pid: str, cid: str, *, message: str,
+                         chat_mode: str, tz_offset: float,
+                         conv_pk: str = ""):
+        """组装理解上下文（真实边界文件 + 台账任务/问题快照）。"""
+        store = self._get_state_store()
+        conv_pk = conv_pk or self._conversation_pk(pid, cid)
+        ledger = understanding.load_ledger_context(
+            store, user_id=self._uid(), conversation_id=conv_pk)
+        study_dir = self._study_dir()
+        paths = sorted(study_dir.glob("*.geojson"),
+                       key=lambda p: p.stat().st_mtime, reverse=True) \
+            if study_dir.exists() else []
+        return conv_pk, understanding.build_resolve_context(
+            message=message,
+            received_at=datetime.now(timezone.utc),
+            tz_offset=tz_offset,
+            chat_mode=chat_mode,
+            study_area_paths=paths,
+            ledger=ledger,
+        )
+
+    def _understand(self, pid: str, cid: str, message: str, *,
+                    chat_mode: str, tz_offset: float, command_id: str,
+                    message_id: str, conv_pk: str, prior_messages=None,
+                    on_log=None):
+        """跑一次理解层；返回 UnderstandingResult。异常向上抛给调用方处理。"""
+        store = self._get_state_store()
+        conv_pk, ctx = self._resolve_context(
+            pid, cid, message=message, chat_mode=chat_mode,
+            tz_offset=tz_offset, conv_pk=conv_pk)
+        agent = understanding.CandidateUnderstander(
+            self._assistant_for(), on_log=on_log)
+        return understanding.handle_message(
+            store, agent,
+            user_id=self._uid(), project_id=pid, conversation_id=conv_pk,
+            message=message, ctx=ctx, command_id=command_id,
+            message_id=message_id, history=prior_messages or [],
+        )
+
+    def session_snapshot(self, pid: str, cid: str, limit: int = 50) -> dict:
+        """会话快照：本对话的任务卡与待答问题（阶段 6 界面的数据来源雏形）。"""
+        store = self._get_state_store()
+        uid = self._uid()
+        conv_pk = self._conversation_pk(pid, cid)
+        if not conv_pk:
+            return {"tasks": [], "questions": [], "conversation_id": ""}
+
+        def _read(conn):
+            return {
+                "conversation_id": conv_pk,
+                "tasks": [
+                    {**understanding.ResolvedTask(t).to_summary(),
+                     "summary_status": t.get("summary_status"),
+                     "negations": (t.get("slots") or {}).get("negations") or []}
+                    for t in t_store.list_tasks(conn, user_id=uid,
+                                                conversation_id=conv_pk,
+                                                limit=limit)
+                ],
+                "questions": [
+                    {"id": q["id"], "prompt": q.get("prompt") or "",
+                     "candidates": q.get("candidates") or [],
+                     "targets": q.get("targets") or [],
+                     "version": q.get("version")}
+                    for q in q_store.list_open_questions(
+                        conn, user_id=uid, conversation_id=conv_pk, limit=limit)
+                ],
+            }
+
+        return store.read(_read)
+
+    def _settle_task(self, resolved, output: str) -> None:
+        """执行链返回后回写任务汇总状态（§3.5：状态由真实进展推导）。
+
+        阶段 2 还没有节点级状态，这里只区分三种可判定的结局：
+        等待用户选择（暂停标记）、失败（执行链报错）、完成。
+        """
+        from core.agent.executor import PAUSE_MARKER
+
+        text = str(output or "")
+        if PAUSE_MARKER in text:
+            status = t_store.TASK_RUNNING
+        elif "执行出错" in text or "失败" in text and "重新" in text:
+            status = t_store.TASK_FAILED
+        else:
+            status = t_store.TASK_COMPLETED
+
+        def _tx(conn):
+            row = conn.execute("SELECT version FROM tasks WHERE id = ?",
+                               (resolved.task_id,)).fetchone()
+            if row is None:
+                return None
+            return t_store.patch_task(conn, resolved.task_id, int(row[0]),
+                                      summary_status=status,
+                                      event_type="task.settled",
+                                      event_payload={"status": status})
+
+        try:
+            self._get_state_store().submit_write(_tx)
+        except Exception as e:
+            print(f"[understanding] 任务状态回写失败（不影响结果）：{e}")
+
+    def answer_question(self, pid: str, cid: str, question_id: str,
+                        text: str, tz_offset: float = _DEFAULT_TZ_OFFSET) -> dict:
+        """回答一条持久问题（卡片点击入口，与文字回答共用消费逻辑）。"""
+        if not question_id or not str(text or "").strip():
+            return {"ok": False, "message": "缺少问题编号或答复内容"}
+        store = self._get_state_store()
+        conv_pk, ctx = self._resolve_context(
+            pid, cid, message=text, chat_mode="work", tz_offset=tz_offset)
+        if not conv_pk:
+            return {"ok": False, "message": "这条对话还没有台账记录"}
+        applied = understanding.answer_question(
+            store, user_id=self._uid(), project_id=pid,
+            conversation_id=conv_pk, question_id=question_id,
+            text=str(text), ctx=ctx)
+        if applied is None:
+            return {"ok": False, "expired": True,
+                    "message": "这张问题卡片已失效（任务已更新或问题已被回答），"
+                               "请按最新状态重新操作"}
+        snapshot = self.session_snapshot(pid, cid)
+        return {"ok": True, "task": applied, **snapshot}
 
     def _user_dir(self) -> Path:
         return _ROOT / "data" / "users" / self._uid()
@@ -1772,6 +1908,8 @@ class AppBackend:
                     "command_id": receipt.command_id,
                     "messages": self.load_conversations().get(pid, {}).get(cid, {}).get("messages", [])}
         command_id = receipt.command_id if receipt is not None else None
+        message_id = receipt.message_id if receipt is not None else ""
+        conv_pk = receipt.conversation_id if receipt is not None else ""
 
         # 同一对话已有任务线程在执行/挂起时拒绝重复启动（前端有 streaming 保护，
         # API 直调无防护；双线程会互相 set/reset pause 事件造成串扰）
@@ -1803,6 +1941,10 @@ class AppBackend:
 
         agent_cfg = self._agent_settings()
         roles_enabled = agent_cfg["roles_enabled"]
+        # 理解层只在 Work 模式 + 角色路径下接管；Chat 模式从入口就不允许
+        # 创建生产任务（§4.5），不是靠提示词约束
+        understanding_on = bool(agent_cfg.get("understanding_enabled")) \
+            and roles_enabled and chat_mode != "chat" and bool(conv_pk)
 
         # 执行模式：本次请求 > 会话已记录 > settings 默认值
         resolved_mode = normalize_exec_mode(
@@ -1972,6 +2114,31 @@ class AppBackend:
                         wp["steps"] = steps
                         q.put(("workflow", None))
 
+                    # ── 理解层（升级第二阶段）：模型只提候选，程序做决定 ──
+                    # 追问在这里直接返回并释放线程，问题已落台账；
+                    # 只有信息齐全的任务才继续走执行链。
+                    resolved_task = None
+                    if understanding_on:
+                        outcome = self._understand(
+                            pid, cid, user_msg,
+                            chat_mode="work", tz_offset=_DEFAULT_TZ_OFFSET,
+                            command_id=command_id or "", message_id=message_id,
+                            conv_pk=conv_pk, prior_messages=prior_messages,
+                            on_log=lambda text: q.put(("log", text)))
+                        q.put(("log", f"  [understanding] {outcome.candidate_log}\n"))
+                        q.put(("tasks", self.session_snapshot(pid, cid)))
+                        if not outcome.should_execute:
+                            _put_token(outcome.message or "已记录你的说明。")
+                            q.put(("done", None))
+                            return
+                        resolved_task = understanding.ResolvedTask(
+                            outcome.ready_tasks[0])
+                        if len(outcome.ready_tasks) > 1:
+                            _put_token(
+                                f"这条消息里有 {len(outcome.ready_tasks)} 个任务，"
+                                f"先执行「{resolved_task.label}」，"
+                                f"其余已排队等待。\n")
+
                     result = self._agent_for().process_command(
                         user_msg,
                         on_token=on_token,
@@ -1987,7 +2154,11 @@ class AppBackend:
                         memory_manager=self._memory_for(),
                         exec_mode=resolved_mode,
                         prior_messages=prior_messages,
+                        resolved_task=resolved_task,
                     )
+                    if resolved_task is not None:
+                        self._settle_task(resolved_task, result)
+                        q.put(("tasks", self.session_snapshot(pid, cid)))
                     q.put(("done", None))
                 else:
                     context = {
@@ -2237,6 +2408,10 @@ class AppBackend:
                     pause_event.set()
                 elif event_type == "workflow":
                     yield from _emit("workflow", {"steps": self.get_workflow_status(cid)})
+                elif event_type == "tasks":
+                    # 理解层任务卡快照（升级第二阶段）：一条消息可能产生多张卡，
+                    # 前端未监听该事件时自动忽略，不影响既有渲染
+                    yield from _emit("tasks", data if isinstance(data, dict) else {})
                 elif event_type == "log":
                     # 日志行统一加时间戳（年月日时分秒，按用户本地时区）；累积供刷新/重连恢复，
                     # 上限与前端 LOG_ALL_MAX 一致，超出丢弃最旧
@@ -2710,6 +2885,26 @@ def chat_start(payload: dict):
 @app.get("/api/kernel/ledger")
 def kernel_ledger(limit: int = 50):
     return backend.ledger_snapshot(limit)
+
+
+@app.get("/api/kernel/session")
+def kernel_session(project: str = "", conv: str = "", limit: int = 50):
+    """会话快照：本对话的任务卡与待答问题（升级第二阶段理解层）。"""
+    if not project or not conv:
+        return JSONResponse({"error": "缺少 project 或 conv"}, status_code=400)
+    return backend.session_snapshot(project, conv, limit)
+
+
+@app.post("/api/kernel/answer")
+def kernel_answer(payload: dict):
+    """回答一条持久问题（卡片点击）；与文字回答共用同一套消费逻辑。"""
+    return backend.answer_question(
+        str(payload.get("project") or ""),
+        str(payload.get("conv") or ""),
+        str(payload.get("question_id") or ""),
+        str(payload.get("answer") or ""),
+        float(payload.get("tz") or _DEFAULT_TZ_OFFSET),
+    )
 
 
 @app.get("/api/chat/stream")

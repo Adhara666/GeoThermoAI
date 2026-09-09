@@ -51,7 +51,12 @@ class PlannerContext:
                  replan_reason: str = "", replan_count: int = 0,
                  previous_plan: Optional[dict] = None, today: Optional[datetime.date] = None,
                  replan_payload: Optional[dict] = None,
-                 adjust_history: Optional[List[str]] = None):
+                 adjust_history: Optional[List[str]] = None,
+                 resolved: Optional[Any] = None):
+        # 升级第二阶段：理解层已绑定校验完成的任务（understanding.ResolvedTask）。
+        # 非空时 run() 跳过「意图分类 + 槽位合并 + 研究区解析」，
+        # 直接按程序已决定的参数出 plan——模型不再有第二次改写机会（§4.1/§5.3）。
+        self.resolved = resolved
         self.user_input = user_input or ""
         self.prior_messages = list(prior_messages or [])
         self.session_state = dict(session_state or {})
@@ -743,9 +748,43 @@ class PlannerAgent(RoleAgent):
 
     # ── 对外入口 ──────────────────────────────────────────────────
 
+    def run_resolved(self, ctx: PlannerContext) -> PlannerOutcome:
+        """理解层已确认的任务：按已决定的参数直接出 plan（升级第二阶段）。
+
+        跳过意图分类、槽位合并与研究区解析——这些在理解层已经用真实边界
+        文件和锚点日期校验过了，再让模型判一次只会引入新的猜测。
+        仍然跑确定性规则 P1–P7 作为安全网（规则永远覆盖模型，§4.2）。
+        """
+        resolved = ctx.resolved
+        plan = plan_schema.parse(
+            resolved.to_plan(constraints=self._constraints(ctx, {})),
+            registry=self.registry)
+        plan_after, rule_result = planner_rules.check(
+            plan,
+            registry=self.registry,
+            study_areas_dir=ctx.study_areas_dir,
+            study_areas=ctx.study_areas,
+            wants_full_workflow=plan.get("intent") in ("task", "modify"),
+            replan_count=ctx.replan_count,
+            replan_max=self.replan_max,
+            today=ctx.today,
+        )
+        if rule_result.action == Action.CHAT_ONLY:
+            return PlannerOutcome(PlannerOutcome.CHAT, intent="qa",
+                                  note=rule_result.note, reflection=rule_result)
+        if rule_result.action == Action.ASK:
+            return PlannerOutcome(PlannerOutcome.ASK, question=rule_result.question,
+                                  intent=plan.get("intent", "task"),
+                                  note=rule_result.note, reflection=rule_result)
+        return PlannerOutcome(PlannerOutcome.PLAN, plan=plan_after,
+                              intent=plan_after.get("intent", "task"),
+                              note=rule_result.note, reflection=rule_result)
+
     def run(self, ctx: PlannerContext) -> PlannerOutcome:
         """一次完整规划：分类 → 合并槽位 → 解析研究区 → 出 plan → 轻反思。"""
         self._current_user_input = ctx.user_input  # 供 _builtin_steps 推断 partial 步骤
+        if getattr(ctx, "resolved", None) is not None:
+            return self.run_resolved(ctx)
         classified = self.classify_intent(ctx)
         intent = classified["intent"]
         merged = self.merge_slots(ctx, classified)

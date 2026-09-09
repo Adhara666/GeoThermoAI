@@ -17,7 +17,7 @@ from typing import List, Optional, Tuple
 
 # 当前数据库结构版本：每次结构变更（新增表/字段/约束）必须 +1，
 # 并在 MIGRATIONS 末尾追加对应的迁移条目。
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # 建库时冻结的默认连接参数（§3.3）：
 #   - 默认回滚日志模式（不启用 WAL）
@@ -282,6 +282,31 @@ CREATE TABLE IF NOT EXISTS projection_jobs (
 """
 
 
+# ── 版本 2：理解层（升级第二阶段）所需字段与索引 ────────────────
+# 阶段 1 只建了表骨架；阶段 2 开始真正写入 tasks / questions，需要补：
+#   - tasks：任务标签、原始消息、来源命令（§5.2「任务最少保存…原消息」）
+#   - questions：问题正文、答案、回答时间、被谁接替、来源命令
+#     （§4.4「问题保存真实候选…答案一次消费」需要答案落库）
+#   - 按对话+状态查开放问题、按任务查问题目标的索引
+
+_DDL_V2 = """
+ALTER TABLE tasks ADD COLUMN label TEXT;
+ALTER TABLE tasks ADD COLUMN origin_message_id TEXT;
+ALTER TABLE tasks ADD COLUMN origin_command_id TEXT;
+
+ALTER TABLE questions ADD COLUMN prompt TEXT;
+ALTER TABLE questions ADD COLUMN answer TEXT;
+ALTER TABLE questions ADD COLUMN answered_at TEXT;
+ALTER TABLE questions ADD COLUMN superseded_by TEXT;
+ALTER TABLE questions ADD COLUMN origin_command_id TEXT;
+
+CREATE INDEX IF NOT EXISTS ix_questions_conv_status
+    ON questions (conversation_id, status);
+CREATE INDEX IF NOT EXISTS ix_question_targets_task
+    ON question_targets (task_id);
+"""
+
+
 def _apply_connection_pragmas(conn: sqlite3.Connection) -> None:
     """按 §3.3 设置连接参数。读/写连接共用（默认回滚日志模式，不用 WAL）。"""
     conn.execute("PRAGMA foreign_keys=ON")
@@ -292,7 +317,10 @@ def _apply_connection_pragmas(conn: sqlite3.Connection) -> None:
 
 def migrations() -> List[Tuple[int, str, str]]:
     """返回 [(目标版本, 说明, DDL), ...]，按版本升序。"""
-    return [(1, "初始表结构（总体技术方案 §3.2 全部必需表）", _DDL_V1)]
+    return [
+        (1, "初始表结构（总体技术方案 §3.2 全部必需表）", _DDL_V1),
+        (2, "理解层：任务标签/原始消息、问题正文/答案/接替关系与查询索引", _DDL_V2),
+    ]
 
 
 def _backup_database(db_path: Path, to_version: int) -> Optional[Path]:
