@@ -225,6 +225,26 @@ def test_contract():
           a.patch_for(ops.F_MODEL) is None
           and b.patch_for(ops.F_MODEL) is not None)
 
+    # 「都是 2025 年」：共享的是年，各目标自己带的是月，两者互补不是覆盖
+    complementary = ops.apply_shared_modifiers(ops.parse_batch({
+        "operations": [
+            {"op": "create", "label": "A", "capability": "full_lst",
+             "patches": {"time": {"action": "set", "value": "7 月"}}},
+            {"op": "create", "label": "B", "capability": "full_lst",
+             "patches": {"time": {"action": "set", "value": "8 月"}}},
+            {"op": "create", "label": "C", "capability": "full_lst",
+             "patches": {"time": {"action": "set", "value": "9 月"}}}],
+        "shared_modifiers": [{"patches": {"time": {"action": "set",
+                                                   "value": "2025 年"}},
+                              "applies_to": ["A", "B"]}],
+    }))
+    values = {o.label: o.patch_for(ops.F_TIME).value
+              for o in complementary.operations}
+    check("共享的年与各自的月合并成一句",
+          values["A"] == "2025 年 7 月" and values["B"] == "2025 年 8 月",
+          str(values))
+    check("不在作用范围内的目标不受影响", values["C"] == "9 月", str(values))
+
 
 # ── 组 2：时间解析 ───────────────────────────────────────────────
 
@@ -388,19 +408,21 @@ def test_two_cities(tmp: Path):
               for t in h.tasks()),
           str([SlotBook(t["slots"]).value(ops.F_TIME) for t in h.tasks()]))
 
-    # 正确写法：共享修饰带 applies_to
+    # 正确写法：共享修饰写清 applies_to，年由共享给、月各自给
     h2 = Harness(tmp, "two_cities_ok")
     ok_reply = reply(
         [
             {"op": "create", "label": "A", "capability": "full_lst",
              "patches": {"region": {"action": "set", "value": "武汉市_市"},
-                         "time": {"action": "set", "value": "2025 年 7 月"},
+                         "time": {"action": "set", "value": "7 月"},
                          "product_mode": {"action": "set", "value": "monthly"}}},
             {"op": "create", "label": "B", "capability": "full_lst",
              "patches": {"region": {"action": "set", "value": "南京市_市"},
-                         "time": {"action": "set", "value": "2025 年 8 月"},
+                         "time": {"action": "set", "value": "8 月"},
                          "product_mode": {"action": "set", "value": "monthly"}}},
-        ])
+        ],
+        shared=[{"patches": {"time": {"action": "set", "value": "2025 年"}},
+                 "applies_to": ["A", "B"], "evidence": "都是 2025 年"}])
     result2 = h2.send(message, ok_reply)
     tasks = h2.tasks()
     check("一条消息登记两个独立任务", len(tasks) == 2, f"实际 {len(tasks)}")

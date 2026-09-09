@@ -394,8 +394,16 @@ def ensure_schema(db_path: Path) -> int:
     return SCHEMA_VERSION
 
 
-def open_connection(db_path: Path) -> sqlite3.Connection:
-    """按 §3.3 打开一个连接（读连接或测试用；写连接由 StateStore 的写入者线程独占）。"""
-    conn = sqlite3.connect(str(db_path), timeout=BUSY_TIMEOUT_MS / 1000.0)
+def open_connection(db_path: Path,
+                    allow_cross_thread: bool = False) -> sqlite3.Connection:
+    """按 §3.3 打开一个连接（读连接或测试用；写连接由写入者线程独占）。
+
+    `allow_cross_thread=True` 关闭 sqlite3 的同线程检查，仅供**读连接**使用：
+    读连接由 `StateStore._read_lock` 串行化，但调用方来自不同线程
+    （Web 请求线程池、聊天任务线程、写回执行器），默认的同线程检查会
+    在跨线程读取时直接抛错。写连接不开这个口子，单一写入者靠线程独占保证。
+    """
+    conn = sqlite3.connect(str(db_path), timeout=BUSY_TIMEOUT_MS / 1000.0,
+                           check_same_thread=not allow_cross_thread)
     _apply_connection_pragmas(conn)
     return conn

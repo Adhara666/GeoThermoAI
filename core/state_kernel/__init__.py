@@ -29,6 +29,7 @@ from core.state_kernel.intake import (
     mark_command_failed,
     mark_command_processed,
     mark_command_processing,
+    mark_command_rejected,
     payload_fingerprint,
     receive_command,
 )
@@ -47,6 +48,7 @@ __all__ = [
     "mark_command_failed",
     "mark_command_processed",
     "mark_command_processing",
+    "mark_command_rejected",
     "new_id",
     "open_connection",
     "payload_fingerprint",

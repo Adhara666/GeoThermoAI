@@ -239,6 +239,32 @@ def test_serialized_writes(tmp: Path):
     store.close()
 
 
+def test_cross_thread_read(tmp: Path):
+    print("测试组 5b：跨线程读取（Web 线程池与任务线程共用一个读连接）")
+    store = make_store(tmp, "t5b.sqlite3")
+    receive_command(store, user_id="u1", project_id="p1", conversation_id="c1",
+                    message="跨线程读取", dedup_key="req-xthread",
+                    operation_type="chat.command")
+    results: list = []
+    errors: list = []
+
+    def _reader():
+        try:
+            results.append(store.read(
+                lambda c: c.execute("SELECT COUNT(*) FROM commands").fetchone()[0]))
+        except BaseException as e:  # noqa: BLE001
+            errors.append(e)
+
+    threads = [threading.Thread(target=_reader) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30.0)
+    check("其它线程读取台账不报错", not errors, f"errors={errors[:2]}")
+    check("跨线程读到同一份数据", results == [1] * 8, f"实际 {results}")
+    store.close()
+
+
 def test_restart_persistence(tmp: Path):
     print("测试组 6：重启持久化（关闭后重开，记录还在、序号不回退）")
     db = tmp / "t6.sqlite3"
@@ -361,6 +387,7 @@ def main() -> int:
         test_version_guard(tmp)
         test_rollback(tmp)
         test_serialized_writes(tmp)
+        test_cross_thread_read(tmp)
         test_restart_persistence(tmp)
         test_failed_command_closure(tmp)
         test_migration_v1_to_v2(tmp)

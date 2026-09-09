@@ -332,30 +332,65 @@ def parse_batch(raw: Any, *, raw_output: str = "") -> CandidateBatch:
     return batch
 
 
-def apply_shared_modifiers(batch: CandidateBatch) -> CandidateBatch:
-    """把共享修饰合并进对应标签的操作；已有同字段补丁的目标不被覆盖。
+def _merge_time_expression(shared_value: Any, own_value: Any) -> Any:
+    """把共享的时间修饰与目标自己的时间表达拼成一句。
 
-    「都是 2025 年」只作用于模型显式列出的标签；本轮已明确给了该字段的目标
-    保留自己的值（§4.2 槽位优先级：本轮明确值最高）。
+    「武汉 7 月、南京 8 月，都是 2025 年」里，共享的是**年**，各目标自己
+    带的是**月**——两者是互补关系，不是覆盖关系。这里只做字符串拼接，
+    年月怎么组合仍由 `timeparse` 的确定性解析决定，本模块不解释时间。
+    """
+    shared_text = str(shared_value or "").strip()
+    own_text = str(own_value or "").strip()
+    if not shared_text:
+        return own_value
+    if not own_text or shared_text in own_text:
+        return shared_value if not own_text else own_value
+    return f"{shared_text} {own_text}"
+
+
+def apply_shared_modifiers(batch: CandidateBatch) -> CandidateBatch:
+    """把共享修饰合并进模型显式列出的那几个标签（§4.1「共享修饰范围」）。
+
+    - 目标本轮没给该字段 → 直接采用共享值。
+    - 目标本轮给了该字段：时间是**互补**的（共享年 + 各自月），拼成一句
+      交给确定性解析；其余字段按槽位优先级由目标自己的值胜出。
+    - 标签不在 `applies_to` 里的目标一律不受影响，不做笛卡尔积。
     """
     if not batch.shared:
         return batch
     merged: List[CandidateOperation] = []
     for op in batch.operations:
-        extra: List[FieldPatch] = []
+        if not op.label:
+            merged.append(op)
+            continue
+        patches = {p.field: p for p in op.patches}
+        changed = False
         for shared in batch.shared:
-            if op.label and op.label in shared.applies_to:
-                for patch in shared.patches:
-                    if op.patch_for(patch.field) is None and \
-                            all(p.field != patch.field for p in extra):
-                        extra.append(patch)
-        merged.append(op if not extra
-                      else CandidateOperation(
-                          op=op.op, label=op.label, target_ref=op.target_ref,
-                          capability=op.capability,
-                          patches=tuple(list(op.patches) + extra),
-                          question_id=op.question_id,
-                          answer_text=op.answer_text, missing=op.missing,
-                          ambiguity=op.ambiguity, evidence=op.evidence))
+            if op.label not in shared.applies_to:
+                continue
+            for patch in shared.patches:
+                existing = patches.get(patch.field)
+                if existing is None:
+                    patches[patch.field] = patch
+                    changed = True
+                elif patch.field == F_TIME and patch.action == PATCH_SET \
+                        and existing.action == PATCH_SET:
+                    combined = _merge_time_expression(patch.value, existing.value)
+                    if combined != existing.value:
+                        patches[patch.field] = FieldPatch(
+                            field=F_TIME, action=PATCH_SET, value=combined,
+                            evidence=(existing.evidence or patch.evidence))
+                        changed = True
+        if not changed:
+            merged.append(op)
+            continue
+        ordered = tuple(patches[p.field] for p in op.patches) + tuple(
+            v for k, v in patches.items()
+            if all(k != p.field for p in op.patches))
+        merged.append(CandidateOperation(
+            op=op.op, label=op.label, target_ref=op.target_ref,
+            capability=op.capability, patches=ordered,
+            question_id=op.question_id, answer_text=op.answer_text,
+            missing=op.missing, ambiguity=op.ambiguity, evidence=op.evidence))
     batch.operations = merged
     return batch

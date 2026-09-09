@@ -282,6 +282,48 @@ def mark_command_processed(store: StateStore, command_id: str,
     store.submit_write(_tx, timeout=timeout)
 
 
+def mark_command_rejected(store: StateStore, command_id: str, reason: str,
+                          timeout: float = 30.0) -> None:
+    """回写命令被拒绝的终态（如对话已有任务在执行中）。
+
+    拒绝也是一种处理结果：命令已经落库，就必须有终态，
+    不能停在 received（§3.4 的处理闭环要求）。
+    """
+    now = utcnow_iso()
+
+    def _tx(conn):
+        row = conn.execute(
+            "SELECT user_id, message_id, status FROM commands WHERE id = ?",
+            (command_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"命令不存在：{command_id}")
+        user_id, msg_id, status = row
+        if status != COMMAND_STATUS_RECEIVED:
+            return          # 已经有终态的命令不被拒绝态覆盖
+        conn.execute(
+            "UPDATE commands SET status = ?, result = ?, processed_at = ?"
+            " WHERE id = ?",
+            (COMMAND_STATUS_REJECTED,
+             json.dumps({"rejected": reason}, ensure_ascii=False), now,
+             command_id),
+        )
+        conv_row = conn.execute(
+            "SELECT conversation_id FROM messages WHERE id = ?", (msg_id,)
+        ).fetchone()
+        append_event(
+            conn,
+            type="command.rejected",
+            user_id=user_id,
+            conversation_id=conv_row[0] if conv_row else None,
+            object_type="command",
+            object_id=command_id,
+            payload={"reason": reason[:500]},
+        )
+
+    store.submit_write(_tx, timeout=timeout)
+
+
 def mark_command_failed(store: StateStore, command_id: str, error: str,
                         timeout: float = 30.0) -> None:
     """回写命令失败终态（不吞异常：失败也要留痕并记录事件）。"""

@@ -43,6 +43,7 @@ from core.state_kernel import (
     mark_command_failed,
     mark_command_processed,
     mark_command_processing,
+    mark_command_rejected,
     questions as q_store,
     receive_command,
     tasks as t_store,
@@ -1912,13 +1913,23 @@ class AppBackend:
         conv_pk = receipt.conversation_id if receipt is not None else ""
 
         # 同一对话已有任务线程在执行/挂起时拒绝重复启动（前端有 streaming 保护，
-        # API 直调无防护；双线程会互相 set/reset pause 事件造成串扰）
+        # API 直调无防护；双线程会互相 set/reset pause 事件造成串扰）。
+        # 命令已经落库，被拒也要回写终态，不能永久停在 received（§3.4 处理闭环）。
+        def _reject(message: str) -> dict:
+            if command_id:
+                try:
+                    mark_command_rejected(self._get_state_store(), command_id,
+                                          message)
+                except Exception as ke:
+                    print(f"[state_kernel] 命令拒绝态回写异常：{ke}")
+            return {"ok": False, "message": message}
+
         prev = self._agent_threads.get(cid)
         if prev is not None and prev.is_alive():
-            return {"ok": False, "message": "该对话已有任务在执行中，请等待当前任务完成"}
+            return _reject("该对话已有任务在执行中，请等待当前任务完成")
         convs = self.load_conversations()
         if pid not in convs or cid not in convs[pid]:
-            return {"ok": False, "message": "对话不存在，请先选择对话"}
+            return _reject("对话不存在，请先选择对话")
 
         history = convs[pid][cid].get("messages", [])
         history = history + [{"role": "user", "content": user_msg}]
