@@ -443,6 +443,42 @@ class AppBackend:
         snapshot = self.session_snapshot(pid, cid)
         return {"ok": True, "task": applied, **snapshot}
 
+    # ── 计划编译（升级第三阶段：状态内核 → 节点图） ───────
+
+    def planning_compile(self, task_id: str, expected_version: int) -> dict:
+        """编译确认后的任务草稿为运行 + 节点图（排队态，不派发执行）。
+
+        参数快照在本调用（进队前）建立并冻结；本调用之后修改设置
+        不影响该运行的实际参数（§5.3，验收第 1 条）。
+        """
+        from core.planning import CompileError, compile_task
+
+        if not task_id or expected_version < 1:
+            return {"ok": False, "message": "缺少 task_id 或 expected_version"}
+        store = self._get_state_store()
+        settings = self._load_settings()
+        try:
+            result = compile_task(
+                store, task_id=task_id,
+                expected_task_version=int(expected_version), settings=settings)
+        except CompileError as e:
+            return {"ok": False, "message": f"编译失败：{e}"}
+        return {"ok": True, **result}
+
+    def planning_run_detail(self, run_id: str) -> dict:
+        """查看运行详情：冻结参数快照（逐项含来源）+ 节点清单与依赖顺序。"""
+        from core.planning import get_run_graph, get_run_snapshot
+
+        if not run_id:
+            return {"ok": False, "message": "缺少 run_id"}
+        store = self._get_state_store()
+        snapshot = get_run_snapshot(store, run_id)
+        if snapshot is None:
+            return {"ok": False, "message": "运行不存在"}
+        return {"ok": True, "run_id": run_id,
+                "snapshot": snapshot,
+                "nodes": get_run_graph(store, run_id)}
+
     def _user_dir(self) -> Path:
         return _ROOT / "data" / "users" / self._uid()
 
@@ -2916,6 +2952,23 @@ def kernel_answer(payload: dict):
         str(payload.get("answer") or ""),
         float(payload.get("tz") or _DEFAULT_TZ_OFFSET),
     )
+
+
+# ── API：计划编译（升级第三阶段验收入口） ──────────────
+
+@app.post("/api/planning/compile")
+def planning_compile(payload: dict):
+    """编译确认后的任务：建快照（进队前冻结）+ 节点图落库（不派发）。"""
+    return backend.planning_compile(
+        str(payload.get("task_id") or ""),
+        int(payload.get("expected_version") or 0),
+    )
+
+
+@app.get("/api/planning/run/{run_id}")
+def planning_run(run_id: str):
+    """查运行详情：冻结参数快照（逐项来源）+ 节点清单与依赖顺序。"""
+    return backend.planning_run_detail(run_id)
 
 
 @app.get("/api/chat/stream")
