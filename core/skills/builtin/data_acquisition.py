@@ -1558,7 +1558,7 @@ class DataAcquisitionSkill(BaseSkill):
                             )
                         elif auth_headers:
                             xml_headers = auth_headers
-                    scene_calibration = s2cal.fetch_scene_calibration(
+                    scene_calibration = self._scene_calibration(
                         scene_item, log_callback=log_callback, headers=xml_headers)
                     s2_provenance.append(scene_calibration)
 
@@ -1632,23 +1632,21 @@ class DataAcquisitionSkill(BaseSkill):
                     # 实测 Azure Blob 对单连接限速（约 0.05MB/s），GDAL 云端按需 warp
                     # 同样受限于单连接串行 Range 请求；并发分块下载（8 连接）可到
                     # 约 3.7MB/s，因此不再对 PC 源做 GDAL 云端按需读取。
-                    data_bytes = self._fetch_asset_parallel(
-                        url, log_callback, headers=headers,
+                    downloaded = self._fetch_asset_parallel(
+                        url, log_callback, headers=headers, output_path=raw_path,
                         progress_callback=_dl_progress,
                         progress_label=f"{b} / {item.id}",
                     )
-                    if data_bytes is None:
+                    if downloaded is None:
                         # 并发失败回退单连接流式下载
-                        data_bytes = self._fetch_asset(
-                            url, log_callback, headers=headers,
+                        downloaded = self._fetch_asset(
+                            url, log_callback, headers=headers, output_path=raw_path,
                             progress_callback=_dl_progress,
                             progress_label=f"{b} / {item.id}",
                         )
-                    if data_bytes is None:
+                    if downloaded is None:
                         download_errors.append(f"{item.id}/{b}: 下载失败")
                         continue
-                    with open(raw_path, "wb") as f:
-                        f.write(data_bytes)
 
                     if apply_s2_calibration and scene_calibration is not None:
                         offset = s2cal.offset_for_band(scene_calibration, b)
@@ -2122,23 +2120,21 @@ class DataAcquisitionSkill(BaseSkill):
                         continue
                     raw_path = os.path.join(tmp_dir, f"{idx:03d}_{band_key}_mask_raw.tif")
                     _mask_label = f"晴空掩膜 第 {idx + 1}/{len(items)} 景"
-                    data_bytes = self._fetch_asset_parallel(
-                        url, log_callback, headers=headers,
+                    downloaded = self._fetch_asset_parallel(
+                        url, log_callback, headers=headers, output_path=raw_path,
                         progress_callback=None,
                         progress_label=_mask_label,
                     )
-                    if data_bytes is None:
-                        data_bytes = self._fetch_asset(
-                            url, log_callback, headers=headers,
+                    if downloaded is None:
+                        downloaded = self._fetch_asset(
+                            url, log_callback, headers=headers, output_path=raw_path,
                             progress_callback=None,
                             progress_label=_mask_label,
                         )
-                    if data_bytes is None:
+                    if downloaded is None:
                         if log_callback:
                             log_callback("WARN", f"  {_mask_label}（{item.id}）: 掩膜数据下载失败，跳过")
                         continue
-                    with open(raw_path, "wb") as f:
-                        f.write(data_bytes)
                     for s in scales:
                         grid_path = os.path.join(tmp_dir, f"{idx:03d}_{band_key}_mask_s{s}.tif")
                         try:
@@ -2203,23 +2199,21 @@ class DataAcquisitionSkill(BaseSkill):
                     # 同样受限于单连接串行 Range 请求；并发分块下载（8 连接）约 3.7MB/s，
                     # 因此 PC 源（COG）与 CDSE（JP2 等）都不再依赖 GDAL 云端按需读取。
                     _dl_label = f"{label} 第 {idx + 1}/{len(items)} 景"
-                    data_bytes = self._fetch_asset_parallel(
-                        url, log_callback, headers=headers,
+                    downloaded = self._fetch_asset_parallel(
+                        url, log_callback, headers=headers, output_path=raw_path,
                         progress_callback=None,
                         progress_label=_dl_label,
                     )
-                    if data_bytes is None:
-                        data_bytes = self._fetch_asset(
-                            url, log_callback, headers=headers,
+                    if downloaded is None:
+                        downloaded = self._fetch_asset(
+                            url, log_callback, headers=headers, output_path=raw_path,
                             progress_callback=None,
                             progress_label=_dl_label,
                         )
-                    if data_bytes is None:
+                    if downloaded is None:
                         if log_callback:
                             log_callback("WARN", f"  {item.id}/{band_key}: 下载失败，跳过")
                         continue
-                    with open(raw_path, "wb") as f:
-                        f.write(data_bytes)
                     try:
                         self._warp_cloud_to_grid(
                             raw_path, grid_path, headers=None, bbox=bbox, scale=scale,
@@ -2251,7 +2245,7 @@ class DataAcquisitionSkill(BaseSkill):
                                         "GET", "eodata.dataspace.copernicus.eu", _pm_path)
                                 elif ds_headers:
                                     xml_headers = ds_headers
-                            cal = s2cal.fetch_scene_calibration(
+                            cal = self._scene_calibration(
                                 item, log_callback=log_callback, headers=xml_headers)
                             offset = s2cal.offset_for_band(cal, band_key)
                             corr = grid_path.replace(".tif", "_corr.tif")
@@ -2392,199 +2386,52 @@ class DataAcquisitionSkill(BaseSkill):
 
     @staticmethod
     def _fetch_asset(url: str, log_callback, headers: Optional[dict] = None,
-                     progress_callback=None, progress_label: str = "") -> Optional[bytes]:
-        """下载 asset 原始字节（流式，带实时进度回调），带重试（最多 5 次）
-
-        每次失败用新 session（避免梯子切换导致连接池脏连接），
-        重试前强制重建 socket。
-        headers: 附加请求头（如 Data Space 的 Bearer token / S3 SigV4 签名）。
-        progress_callback: 回调 (downloaded_bytes, total_bytes|None, label)，
-                           每约 2MB 推送一次，供大文件下载时气泡持续更新。
-        """
-        import time as _time
-        last_err = None
-        # 下载日志统一带 progress_label（波段/景）前缀，日志里能直接看出在下载什么
-        _tag = f"{progress_label}: " if progress_label else ""
-        for attempt in range(5):
-            t0 = _time.time()
-            timeout = min(120 + attempt * 45, 300)
-            try:
-                sess = requests.Session()
-                sess.mount("https://", requests.adapters.HTTPAdapter(
-                    pool_connections=0, pool_maxsize=0,
-                    max_retries=0,
-                ))
-                sess.mount("http://", requests.adapters.HTTPAdapter(
-                    pool_connections=0, pool_maxsize=0,
-                    max_retries=0,
-                ))
-                sess.trust_env = False
-                if log_callback and attempt == 0:
-                    log_callback("INFO", f"  {_tag}开始下载 ({timeout}s超时): {url[:70]}...")
-                resp = sess.get(url, timeout=timeout, headers=headers, stream=True)
-                resp.raise_for_status()
-                try:
-                    total_header = resp.headers.get("Content-Length")
-                    total_bytes = int(total_header) if total_header else None
-                    chunks = []
-                    downloaded = 0
-                    last_report = 0
-                    for chunk in resp.iter_content(chunk_size=256 * 1024):
-                        if chunk:
-                            chunks.append(chunk)
-                            downloaded += len(chunk)
-                            if progress_callback:
-                                # 每约 2MB 或下载完成时推送一次，避免事件过多
-                                if (downloaded - last_report >= 2 * 1024 * 1024
-                                        or (total_bytes and downloaded >= total_bytes)):
-                                    progress_callback(downloaded, total_bytes, progress_label)
-                                    last_report = downloaded
-                    data = b"".join(chunks)
-                finally:
-                    resp.close()
-                sess.close()
-                elapsed = _time.time() - t0
-                if log_callback:
-                    log_callback("INFO", f"  {_tag}下载完成 ({elapsed:.1f}s, {len(data)/1024/1024:.1f}MB)")
-                return data
-            except requests.exceptions.RequestException as e:
-                elapsed = _time.time() - t0
-                last_err = e
-                is_network_flap = isinstance(e, (
-                    requests.exceptions.ConnectionError,
-                    requests.exceptions.ProxyError,
-                    requests.exceptions.SSLError,
-                    requests.exceptions.Timeout,
-                ))
-                if log_callback:
-                    if is_network_flap and attempt < 4:
-                        log_callback("WARN", f"  {_tag}网络抖动 ({type(e).__name__}), 第{attempt+1}/5次重试...")
-                    else:
-                        log_callback("WARN", f"  {_tag}下载失败 ({elapsed:.1f}s, 第{attempt+1}次): {e}")
-                sleep_sec = min(2 ** attempt, 15)
-                _time.sleep(sleep_sec)
-        if log_callback:
-            log_callback("WARN", f"  {_tag}下载最终失败 (5次重试): {last_err}")
-        return None
+                     progress_callback=None, progress_label: str = "",
+                     output_path: str = None):
+        """固定缓冲流式落盘，返回文件描述。仅传输接口改变，定标与栅格逻辑不变。"""
+        from core.scheduling.transfer import fetch_file, TransferError
+        target = output_path
+        if not target:
+            fd, target = tempfile.mkstemp(prefix="asset_", suffix=".tif")
+            os.close(fd)
+        try:
+            return fetch_file(url, target, headers=headers, parallel=False,
+                              progress=progress_callback, label=progress_label)
+        except TransferError as e:
+            if log_callback:
+                log_callback("WARN", str(e))
+            return None
 
     @staticmethod
     def _fetch_asset_parallel(url: str, log_callback, headers: Optional[dict] = None,
                               workers: int = 8, chunk_mb: int = 4,
-                              progress_callback=None, progress_label: str = "") -> Optional[bytes]:
-        """并发分块 Range 下载（多连接绕过 Azure 对单连接限速）。
-
-        实测（Planetary Computer 的 Azure Blob）：单连接持续传输仅约 0.05MB/s
-        （90MB 需约 30 分钟，GDAL 云端按需 warp 也因单连接串行请求而极慢）；
-        8 连接 × 4MB 块可达约 3.7MB/s（90MB 约 23 秒）。因此大文件统一走
-        并发分块下载后本地 warp，不再依赖 GDAL 云端按需读取。
-
-        小文件（≤16MB）回退单连接流式下载（_fetch_asset），避免分块开销。
-        任一块重试后仍失败则返回 None，由调用方回退 _fetch_asset 单连接。
-        """
-        import time as _time
-        import concurrent.futures
-        from requests.adapters import HTTPAdapter
-
-        def _make_session() -> requests.Session:
-            s = requests.Session()
-            s.trust_env = False
-            adapter = HTTPAdapter(pool_connections=0, pool_maxsize=0, max_retries=0)
-            s.mount("https://", adapter)
-            s.mount("http://", adapter)
-            return s
-
-        # 探测文件大小（GET + Range(0-0)）：S3 SigV4 签名按 HTTP 方法签名，
-        # HEAD 请求的签名与 GET 不匹配会 403（eodata 的 S3 签名 URL）。
-        # GET Range 与分块下载同方法，签名一致；Content-Range 里带总大小。
-        # 探测带 3 次重试：CDSE/网络偶发 SSL EOF、连接被中断（如
-        # SSLEOFError）时不能一次失败就放弃并发下载。
-        size = 0
-        probe_err = None
-        _tag = f"{progress_label}: " if progress_label else ""
-        for probe_attempt in range(3):
-            try:
-                s0 = _make_session()
-                try:
-                    probe_headers = dict(headers or {})
-                    probe_headers["Range"] = "bytes=0-0"
-                    resp = s0.get(url, headers=probe_headers, timeout=30)
-                    resp.raise_for_status()
-                    size = int(resp.headers.get("Content-Length") or 0)
-                    cr = resp.headers.get("Content-Range") or ""
-                    if "/" in cr:
-                        size = int(cr.rsplit("/", 1)[-1])
-                    if size <= 0:
-                        raise RuntimeError(f"无法获取文件大小 (Content-Length={size})")
-                    break
-                finally:
-                    s0.close()
-            except Exception as e:
-                probe_err = e
-                if log_callback and probe_attempt < 2:
-                    log_callback("WARN", f"  {_tag}并发下载探测失败（第{probe_attempt+1}/3次，将重试）: {str(e)[:100]}")
-                _time.sleep(1 + probe_attempt)
-        if size <= 0:
-            if log_callback:
-                log_callback("WARN", f"  {_tag}并发下载探测最终失败（回退单连接下载）: {str(probe_err)[:120]}")
-            return None
-        if size <= 16 * 1024 * 1024:
-            return DataAcquisitionSkill._fetch_asset(
-                url, log_callback, headers=headers,
-                progress_callback=progress_callback, progress_label=progress_label)
-
-        chunk = chunk_mb * 1024 * 1024
-        n = (size + chunk - 1) // chunk
-        buf = bytearray(size)
-        if log_callback:
-            log_callback("INFO", f"  {_tag}并发下载 {size/1024/1024:.0f}MB（{n} 块 × {workers} 连接）")
-
-        def _dl_block(idx: int):
-            start = idx * chunk
-            end = min(start + chunk - 1, size - 1)
-            req_headers = dict(headers or {})
-            req_headers["Range"] = f"bytes={start}-{end}"
-            last_err = ""
-            for attempt in range(3):
-                s = _make_session()
-                try:
-                    r = s.get(url, headers=req_headers, timeout=180)
-                    if r.status_code in (200, 206) and len(r.content) == end - start + 1:
-                        return idx, r.content
-                    last_err = f"块{idx} status={r.status_code} len={len(r.content)}"
-                except Exception as e:
-                    last_err = f"块{idx}: {e}"
-                finally:
-                    s.close()
-                _time.sleep(1 + attempt)
-            raise RuntimeError(last_err)
-
-        t0 = _time.time()
-        done_bytes = 0
+                              progress_callback=None, progress_label: str = "",
+                              output_path: str = None):
+        """有限在途 Range 请求直接落盘，校验区间及版本并保存续传记录。"""
+        from core.scheduling.transfer import fetch_file, TransferError
+        target = output_path
+        if not target:
+            fd, target = tempfile.mkstemp(prefix="asset_", suffix=".tif")
+            os.close(fd)
         try:
-            with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
-                futs = {ex.submit(_dl_block, i): i for i in range(n)}
-                for fut in concurrent.futures.as_completed(futs):
-                    idx, data = fut.result()
-                    buf[idx * chunk: idx * chunk + len(data)] = data
-                    done_bytes += len(data)
-                    if progress_callback:
-                        progress_callback(done_bytes, size, progress_label)
-        except Exception as e:
+            return fetch_file(url, target, headers=headers,
+                              workers=min(workers, int(os.environ.get("GTAI_NODE_CONNECTIONS", "8"))),
+                              progress=progress_callback, label=progress_label)
+        except TransferError as e:
             if log_callback:
-                log_callback(
-                    "WARN",
-                    f"  并发下载失败（{n} 块，已 {done_bytes/1024/1024:.0f}MB）: {str(e)[:120]}",
-                )
+                log_callback("WARN", str(e))
             return None
-        elapsed = _time.time() - t0
-        if log_callback:
-            log_callback(
-                "INFO",
-                f"  并发下载完成 ({elapsed:.1f}s, {size/1024/1024:.1f}MB, "
-                f"{size/1024/1024/max(elapsed, 0.01):.1f}MB/s)",
-            )
-        return bytes(buf)
 
+    @staticmethod
+    def _scene_calibration(item, **kwargs):
+        frozen = item.properties.get("gtai:calibration")
+        if frozen is not None:
+            # JSON 的对象键为字符串，原 offset_for_band 按整数 band_id 查询。
+            frozen = dict(frozen)
+            frozen["offsets_by_band_id"] = {
+                int(k): v for k, v in frozen.get("offsets_by_band_id", {}).items()}
+            return frozen
+        return s2cal.fetch_scene_calibration(item, **kwargs)
 
     # ── SAS Token 签名 ──────────────────────────────────────────────
 
@@ -2602,6 +2449,9 @@ class DataAcquisitionSkill(BaseSkill):
         清空缓存，强制向 token 服务取全新 token（st=当前时刻，有效期
         24h45m，单次下载内绝不会过期）。
         """
+        if item.properties.get("gtai:local_assets"):
+            return item
+
         try:
             import planetary_computer
             from planetary_computer import sas as pc_sas

@@ -107,6 +107,9 @@ def _validate_params(capability: str, snapshot: Dict[str, Any]) -> None:
                 raise CompileError(
                     f"参数 {key}={value!r} 超出允许范围 [{low}, {high}]"
                 )
+        elif key == "datasets" and isinstance(value, list):
+            if not value or any(v not in domain for v in value):
+                raise CompileError("指定数据集合为空或包含未知数据源")
         elif isinstance(domain, tuple) and value is not None and value not in domain:
             raise CompileError(f"参数 {key}={value!r} 不在允许取值 {domain} 内")
 
@@ -168,7 +171,7 @@ def compile_task_tx(
         conn, run_id=run_id,
         fields={
             "task_id": task_id,
-            "task_version": int(task_row.get("version") or 1),
+            "task_version": int(task_row.get("version") or 1) + 1,
             "template_version": TEMPLATE_VERSION,
             "frozen_inputs": {
                 "snapshot": snapshot,
@@ -241,7 +244,7 @@ def compile_task_tx(
     return {
         "run_id": run_id,
         "task_id": task_id,
-        "task_version": int(task_row.get("version") or 1),
+        "task_version": int(task_row.get("version") or 1) + 1,
         "capability": capability,
         "template_version": TEMPLATE_VERSION,
         "snapshot_hash": snapshot_hash(snapshot),

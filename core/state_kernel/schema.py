@@ -17,7 +17,7 @@ from typing import List, Optional, Tuple
 
 # 当前数据库结构版本：每次结构变更（新增表/字段/约束）必须 +1，
 # 并在 MIGRATIONS 末尾追加对应的迁移条目。
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # 建库时冻结的默认连接参数（§3.3）：
 #   - 默认回滚日志模式（不启用 WAL）
@@ -307,6 +307,28 @@ CREATE INDEX IF NOT EXISTS ix_question_targets_task
 """
 
 
+_DDL_V3 = """
+ALTER TABLE nodes ADD COLUMN wait_reason TEXT;
+ALTER TABLE nodes ADD COLUMN skipped_opportunities INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE nodes ADD COLUMN protected_at TEXT;
+ALTER TABLE nodes ADD COLUMN retry_at REAL;
+ALTER TABLE nodes ADD COLUMN result TEXT;
+ALTER TABLE attempts ADD COLUMN resource_claim TEXT;
+ALTER TABLE attempts ADD COLUMN heartbeat_at TEXT;
+ALTER TABLE attempts ADD COLUMN result_path TEXT;
+ALTER TABLE attempts ADD COLUMN task_version INTEGER;
+ALTER TABLE attempts ADD COLUMN error_kind TEXT;
+CREATE UNIQUE INDEX one_live_authorization ON attempts(node_id)
+    WHERE authorization IS NOT NULL;
+CREATE INDEX ix_nodes_ready ON nodes(status, retry_at);
+CREATE TABLE resource_reservations (
+    attempt_id TEXT PRIMARY KEY REFERENCES attempts(id),
+    claim TEXT NOT NULL,
+    released_at TEXT
+);
+"""
+
+
 def _apply_connection_pragmas(conn: sqlite3.Connection) -> None:
     """按 §3.3 设置连接参数。读/写连接共用（默认回滚日志模式，不用 WAL）。"""
     conn.execute("PRAGMA foreign_keys=ON")
@@ -320,6 +342,7 @@ def migrations() -> List[Tuple[int, str, str]]:
     return [
         (1, "初始表结构（总体技术方案 §3.2 全部必需表）", _DDL_V1),
         (2, "理解层：任务标签/原始消息、问题正文/答案/接替关系与查询索引", _DDL_V2),
+        (3, "调度执行：节点尝试、唯一授权与资源预留", _DDL_V3),
     ]
 
 
