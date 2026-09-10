@@ -8,6 +8,8 @@ data/
 raw/
 _tmp_dl_out/
 *.log
+.e2e_stage2_state.json
+tests/.e2e_stage2_state.json
 
 # 前端依赖
 frontend/node_modules/

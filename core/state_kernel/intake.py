@@ -50,6 +50,8 @@ class CommandReceipt:
     accepted: bool          # True=新接收；False=重复请求（幂等命中）
     duplicate: bool
     message_seq: int
+    # 台账内部对话主键（阶段 2 起，理解层登记任务/问题需要它作外键）
+    conversation_id: str = ""
 
 
 def payload_fingerprint(payload: Dict[str, Any]) -> str:
@@ -59,16 +61,23 @@ def payload_fingerprint(payload: Dict[str, Any]) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
-def _ensure_conversation(conn, user_id: str, project_id: str,
-                         conversation_id: str) -> str:
-    """确保台账里有该对话的控制行；旧对话以 (user, project, legacy_conv_id) 映射。"""
+def conversation_pk(conn, user_id: str, project_id: str,
+                    conversation_id: str) -> Optional[str]:
+    """按 (用户, 项目, 旧对话编号) 查台账内部对话主键；未登记返回 None。"""
     row = conn.execute(
         "SELECT id FROM conversations WHERE user_id = ? AND project_id = ?"
         " AND legacy_conv_id = ?",
         (user_id, project_id, conversation_id),
     ).fetchone()
-    if row is not None:
-        return str(row[0])
+    return str(row[0]) if row is not None else None
+
+
+def _ensure_conversation(conn, user_id: str, project_id: str,
+                         conversation_id: str) -> str:
+    """确保台账里有该对话的控制行；旧对话以 (user, project, legacy_conv_id) 映射。"""
+    existing = conversation_pk(conn, user_id, project_id, conversation_id)
+    if existing is not None:
+        return existing
     conv_id = new_id()
     now = utcnow_iso()
     conn.execute(
@@ -107,7 +116,7 @@ def _receive_command_tx(
                 f"去重键 {dedup_key} 已被不同载荷占用（同键不同载荷报冲突）"
             )
         seq_row = conn.execute(
-            "SELECT seq FROM messages WHERE id = ?", (msg_id,)
+            "SELECT seq, conversation_id FROM messages WHERE id = ?", (msg_id,)
         ).fetchone()
         return CommandReceipt(
             command_id=str(cmd_id),
@@ -116,6 +125,7 @@ def _receive_command_tx(
             accepted=False,
             duplicate=True,
             message_seq=int(seq_row[0]) if seq_row else -1,
+            conversation_id=str(seq_row[1]) if seq_row else "",
         )
 
     # 2) 对话控制行 + 消息编号
@@ -177,6 +187,7 @@ def _receive_command_tx(
         accepted=True,
         duplicate=False,
         message_seq=seq,
+        conversation_id=conv_id,
     )
 
 
@@ -266,6 +277,48 @@ def mark_command_processed(store: StateStore, command_id: str,
             conversation_id=conv_row[0] if conv_row else None,
             object_type="command",
             object_id=command_id,
+        )
+
+    store.submit_write(_tx, timeout=timeout)
+
+
+def mark_command_rejected(store: StateStore, command_id: str, reason: str,
+                          timeout: float = 30.0) -> None:
+    """回写命令被拒绝的终态（如对话已有任务在执行中）。
+
+    拒绝也是一种处理结果：命令已经落库，就必须有终态，
+    不能停在 received（§3.4 的处理闭环要求）。
+    """
+    now = utcnow_iso()
+
+    def _tx(conn):
+        row = conn.execute(
+            "SELECT user_id, message_id, status FROM commands WHERE id = ?",
+            (command_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"命令不存在：{command_id}")
+        user_id, msg_id, status = row
+        if status != COMMAND_STATUS_RECEIVED:
+            return          # 已经有终态的命令不被拒绝态覆盖
+        conn.execute(
+            "UPDATE commands SET status = ?, result = ?, processed_at = ?"
+            " WHERE id = ?",
+            (COMMAND_STATUS_REJECTED,
+             json.dumps({"rejected": reason}, ensure_ascii=False), now,
+             command_id),
+        )
+        conv_row = conn.execute(
+            "SELECT conversation_id FROM messages WHERE id = ?", (msg_id,)
+        ).fetchone()
+        append_event(
+            conn,
+            type="command.rejected",
+            user_id=user_id,
+            conversation_id=conv_row[0] if conv_row else None,
+            object_type="command",
+            object_id=command_id,
+            payload={"reason": reason[:500]},
         )
 
     store.submit_write(_tx, timeout=timeout)

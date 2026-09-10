@@ -239,6 +239,32 @@ def test_serialized_writes(tmp: Path):
     store.close()
 
 
+def test_cross_thread_read(tmp: Path):
+    print("测试组 5b：跨线程读取（Web 线程池与任务线程共用一个读连接）")
+    store = make_store(tmp, "t5b.sqlite3")
+    receive_command(store, user_id="u1", project_id="p1", conversation_id="c1",
+                    message="跨线程读取", dedup_key="req-xthread",
+                    operation_type="chat.command")
+    results: list = []
+    errors: list = []
+
+    def _reader():
+        try:
+            results.append(store.read(
+                lambda c: c.execute("SELECT COUNT(*) FROM commands").fetchone()[0]))
+        except BaseException as e:  # noqa: BLE001
+            errors.append(e)
+
+    threads = [threading.Thread(target=_reader) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30.0)
+    check("其它线程读取台账不报错", not errors, f"errors={errors[:2]}")
+    check("跨线程读到同一份数据", results == [1] * 8, f"实际 {results}")
+    store.close()
+
+
 def test_restart_persistence(tmp: Path):
     print("测试组 6：重启持久化（关闭后重开，记录还在、序号不回退）")
     db = tmp / "t6.sqlite3"
@@ -304,6 +330,55 @@ def test_failed_command_closure(tmp: Path):
     store.close()
 
 
+def test_migration_v1_to_v2(tmp: Path):
+    print("测试组 8：结构迁移（v1 → v2 带备份、保数据）")
+    import sqlite3
+
+    from core.state_kernel import schema as schema_mod
+
+    db = tmp / "t8.sqlite3"
+    # 造一个只有 v1 结构的旧库（模拟第一阶段部署过的现场数据）
+    conn = sqlite3.connect(str(db))
+    try:
+        conn.executescript("BEGIN IMMEDIATE;\n" + schema_mod._DDL_V1 + "\nCOMMIT;")
+        conn.execute("INSERT INTO schema_migrations (version, applied_at,"
+                     " description) VALUES (1, 'seed', 'v1')")
+        conn.execute("PRAGMA user_version=1")
+        conn.commit()
+    finally:
+        conn.close()
+
+    store = StateStore(db)  # 打开即触发迁移
+    check("迁移后结构版本为当前版本",
+          store.read(lambda c: c.execute("PRAGMA user_version").fetchone()[0])
+          == SCHEMA_VERSION)
+
+    def _columns(conn, table):
+        return {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+
+    task_cols = store.read(lambda c: _columns(c, "tasks"))
+    question_cols = store.read(lambda c: _columns(c, "questions"))
+    check("tasks 补齐 v2 新列",
+          {"label", "origin_message_id", "origin_command_id"} <= task_cols,
+          str(sorted(task_cols)))
+    check("questions 补齐 v2 新列",
+          {"prompt", "answer", "answered_at", "superseded_by",
+           "origin_command_id"} <= question_cols, str(sorted(question_cols)))
+    check("迁移登记表记录了 v2",
+          store.read(lambda c: c.execute(
+              "SELECT COUNT(*) FROM schema_migrations WHERE version = 2"
+          ).fetchone()[0]) == 1)
+
+    backups = list(tmp.glob("t8.sqlite3.bak-v2-*"))
+    check("迁移前自动备份数据库文件", len(backups) == 1, str(backups))
+
+    r = receive_command(store, user_id="u1", project_id="p1",
+                        conversation_id="c1", message="迁移后仍可用",
+                        dedup_key="req-migrated", operation_type="chat.command")
+    check("迁移后内核照常接收命令", r.accepted)
+    store.close()
+
+
 def main() -> int:
     tmp = Path(tempfile.mkdtemp(prefix="gtai-kernel-test-"))
     try:
@@ -312,8 +387,10 @@ def main() -> int:
         test_version_guard(tmp)
         test_rollback(tmp)
         test_serialized_writes(tmp)
+        test_cross_thread_read(tmp)
         test_restart_persistence(tmp)
         test_failed_command_closure(tmp)
+        test_migration_v1_to_v2(tmp)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

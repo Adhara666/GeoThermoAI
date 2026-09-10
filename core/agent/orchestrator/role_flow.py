@@ -30,7 +30,8 @@ def run_with_roles(agent, user_input: str, on_token=None, on_log=None,
                    pause_callback=None, project_dir: str = "", workflow_callback=None,
                    settings_path: str = "", study_areas_dir: str = "", conv_id: str = "",
                    project_id: str = "", memory_manager=None, exec_mode: str = "",
-                   prior_messages=None, session_state=None, on_thinking=None) -> str:
+                   prior_messages=None, session_state=None, on_thinking=None,
+                   resolved_task=None) -> str:
     """多角色路径：规划 Agent 出 plan，本方法按 plan 依次调用执行 Agent。
 
     与 `process_command` 的旧路径互不影响；`roles_enabled=False` 时永不进入这里。
@@ -73,6 +74,7 @@ def run_with_roles(agent, user_input: str, on_token=None, on_log=None,
         settings=settings,
         skill_catalog=agent.registry.get_tool_descriptions_for_llm(),
         replan_count=int(state_data.get("replan_count") or 0),
+        resolved=resolved_task,
     )
 
     outcome = planner.run(ctx)
@@ -166,6 +168,17 @@ def ask_acquisition_mode_if_month(plan: dict, pause_callback, run_state, emit,
     用户指令已明确指定获取方式（如「做月度合成」「用配对模式」）时跳过弹窗，
     直接按指定方式写入 composite（不依赖时间范围是否整月）。
     """
+    # 理解层已把产品方式绑定进步骤参数（阶段 2：整月时由持久问题问过了）：
+    # 不再弹第二次窗，也不让执行链推翻已确认的选择（§5.3 参数逐项接到真实调用）
+    for _s in plan.get("steps", []):
+        if _s.get("skill") == "data_acquisition" and (_s.get("params") or {}).get("composite"):
+            run_state.record_approval(
+                approval_proto.Node.ACQUISITION_MODE,
+                (approval_proto.Option.MONTHLY_MODE
+                 if _s["params"]["composite"] == "monthly"
+                 else approval_proto.Option.PAIR_MODE))
+            return ""
+
     # 用户指令直接指定获取方式：跳过弹窗（并记录该「选择」供断点恢复）
     _mode_hint = _detect_acquisition_mode_hint(user_input)
     if _mode_hint:

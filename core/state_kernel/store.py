@@ -77,8 +77,10 @@ class StateStore:
         if self._writer_error is not None:
             raise RuntimeError(f"状态内核写入者线程启动失败：{self._writer_error}")
 
-        # 独立读连接：短事务，带锁串行化（§3.3）
-        self._read_conn = open_connection(self.db_path)
+        # 独立读连接：短事务，带锁串行化（§3.3）。读取方来自多个线程
+        # （Web 请求线程池、聊天任务线程），由 _read_lock 保证任意时刻只有
+        # 一个读事务在用它，因此关闭 sqlite3 的同线程检查。
+        self._read_conn = open_connection(self.db_path, allow_cross_thread=True)
         self._read_lock = threading.Lock()
 
     # ── 写入路径：唯一写连接由写入者线程独占 ────────────────────
