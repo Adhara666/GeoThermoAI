@@ -121,6 +121,32 @@ class ResolutionOutcome:
 # ── 入口 ─────────────────────────────────────────────────────────
 
 
+def turn_negations(batch: ops.CandidateBatch) -> Dict[str, List[Any]]:
+    """收集**本条消息**里被清除掉的字段值。
+
+    模型经常一边照抄上一轮的内容、一边给出用户刚说的否定（真实模型在
+    「不是武汉」那一轮就同时回显了一条武汉的新建）。本轮的清除优先级最高
+    （§4.2「本轮明确值或清除 > 当前任务已确认值 > …」），所以要先把这些值
+    收齐，再去应用任何 set，否则模型的回显会把用户刚否定的东西又立起来。
+    """
+    negated: Dict[str, List[Any]] = {}
+    for op in batch.operations:
+        for patch in op.patches:
+            if patch.action == ops.PATCH_CLEAR and patch.value not in (None, ""):
+                negated.setdefault(patch.field, []).append(patch.value)
+    return negated
+
+
+def _contradicts_turn(patch: ops.FieldPatch,
+                      negated: Dict[str, List[Any]]) -> bool:
+    if patch.action != ops.PATCH_SET:
+        return False
+    probe = SlotBook({"fields": {}, "negations": [
+        {"field": field, "value": value}
+        for field, values in negated.items() for value in values]})
+    return probe.is_negated(patch.field, patch.value)
+
+
 def resolve(batch: ops.CandidateBatch,
             ctx: ResolveContext) -> ResolutionOutcome:
     """把候选批次解析成草稿修改与追问。任何无法确定的地方一律追问，不猜。"""
@@ -129,12 +155,20 @@ def resolve(batch: ops.CandidateBatch,
         outcome.failure = _failure_message(batch)
         return outcome
 
+    negated = turn_negations(batch)
+
     # 本轮内新建的临时目标：让同一条消息里的后续 set 能落到正确的草稿上
     fresh: Dict[str, DraftChange] = {}
 
     for op in batch.operations:
         if op.op == ops.OP_REPLY_ONLY:
             outcome.reply_only = True
+            continue
+        # 用户在这条消息里刚否定的东西，模型又拿它新建一个任务：整条丢弃。
+        # 这不是「少做一件事」，而是不让被否定的地区凭空复活。
+        if op.op == ops.OP_CREATE and negated and \
+                any(_contradicts_turn(p, negated) for p in op.patches):
+            outcome.notes.append("本轮已否定的内容不再新建任务")
             continue
         if op.op == ops.OP_ANSWER:
             question_id = _bind_question(op, ctx)
@@ -153,7 +187,7 @@ def resolve(batch: ops.CandidateBatch,
                 outcome.changes.append(change)
             continue
 
-        change = _resolve_draft_op(op, ctx, fresh)
+        change = _resolve_draft_op(op, ctx, fresh, negated)
         if change is None:
             continue
         if op.label:
@@ -226,17 +260,20 @@ def _resolve_task_command(op: ops.CandidateOperation,
 
 
 def _resolve_draft_op(op: ops.CandidateOperation, ctx: ResolveContext,
-                      fresh: Dict[str, DraftChange]) -> Optional[DraftChange]:
+                      fresh: Dict[str, DraftChange],
+                      negated: Optional[Dict[str, List[Any]]] = None
+                      ) -> Optional[DraftChange]:
     """新建 / 设值 / 清除 / 更正：确定落到哪个草稿，再逐字段处理。"""
     if op.op == ops.OP_CREATE:
         change = DraftChange(action=ACT_CREATE, capability=op.capability,
                              label="", slots=SlotBook().to_bundle())
-        return _apply_and_validate(change, op, ctx)
+        return _apply_and_validate(change, op, ctx, negated=negated)
 
     # set / clear / correct：先看本轮新建的临时目标，再看台账里的任务
     if op.label and op.label in fresh:
         target = fresh[op.label]
-        return _apply_and_validate(target, op, ctx, in_place=True)
+        return _apply_and_validate(target, op, ctx, in_place=True,
+                                   negated=negated)
 
     result = binding.bind_task(op.target_ref, list(ctx.open_tasks))
     if result.kind == binding.BIND_UNIQUE and result.task:
@@ -249,7 +286,7 @@ def _resolve_draft_op(op: ops.CandidateOperation, ctx: ResolveContext,
             task_id=str(task.get("id")),
             expected_version=int(task.get("version") or 1),
         )
-        return _apply_and_validate(change, op, ctx)
+        return _apply_and_validate(change, op, ctx, negated=negated)
 
     if result.kind == binding.BIND_AMBIGUOUS:
         change = DraftChange(action=ACT_UPDATE, capability="", label="", slots={})
@@ -262,7 +299,7 @@ def _resolve_draft_op(op: ops.CandidateOperation, ctx: ResolveContext,
     # （「不是武汉」也要留下否定记录，下一轮才不会被历史填回来）
     change = DraftChange(action=ACT_CREATE, capability=op.capability, label="",
                          slots=SlotBook().to_bundle())
-    return _apply_and_validate(change, op, ctx)
+    return _apply_and_validate(change, op, ctx, negated=negated)
 
 
 # ── 字段处理与校验 ───────────────────────────────────────────────
@@ -270,11 +307,17 @@ def _resolve_draft_op(op: ops.CandidateOperation, ctx: ResolveContext,
 
 def _apply_and_validate(change: DraftChange, op: ops.CandidateOperation,
                         ctx: ResolveContext,
-                        in_place: bool = False) -> DraftChange:
+                        in_place: bool = False,
+                        negated: Optional[Dict[str, List[Any]]] = None
+                        ) -> DraftChange:
     book = SlotBook(change.slots)
     source = SRC_ANSWER if op.op == ops.OP_ANSWER else SRC_USER
 
-    for patch in op.patches:
+    # 先落清除，再落设置：同一条消息里用户的否定优先于模型的回显
+    ordered = sorted(op.patches, key=lambda p: p.action != ops.PATCH_CLEAR)
+    for patch in ordered:
+        if negated and _contradicts_turn(patch, negated):
+            continue
         book, _ = apply_patch(book, patch, ctx.message, source=source)
 
     book, questions, notes = _validate(book, change.capability, ctx)
@@ -341,7 +384,7 @@ def _resolve_region(book: SlotBook, ctx: ResolveContext):
     if result.kind == binding.BIND_UNIQUE:
         # 被否定过的地区不能靠「只剩一个候选」悄悄回来（9.2 第 4 条）
         if book.is_negated(ops.F_REGION, result.display):
-            return book.clear(ops.F_REGION), QuestionSpec(
+            return book.drop(ops.F_REGION), QuestionSpec(
                 field=ops.F_REGION,
                 prompt="这次要处理哪个研究区？",
                 candidates=result.options), ""
@@ -352,22 +395,26 @@ def _resolve_region(book: SlotBook, ctx: ResolveContext):
                          detail=result.to_slot_detail(), override=True),
                 None, note)
 
+    # 绑不到真实文件的地名不是研究区，只是一串没落地的文字：把槽位清空，
+    # 别让它显示在任务卡上、也别让必需信息检查误以为地区已经有了
+    unbound = book.drop(ops.F_REGION)
+
     if result.kind == binding.BIND_EMPTY:
-        return book, QuestionSpec(
+        return unbound, QuestionSpec(
             field=ops.F_REGION,
             prompt="还没有看到你上传的研究区文件，请先上传研究区"
                    "（GeoJSON 或 Shapefile），我再安排流程。"), ""
     if result.kind == binding.BIND_AMBIGUOUS:
         listed = "、".join(o["label"] for o in result.options[:6])
-        return book, QuestionSpec(
+        return unbound, QuestionSpec(
             field=ops.F_REGION,
             prompt=f"「{name}」匹配到多个研究区：{listed}，你要处理哪一个？",
             candidates=result.options), ""
     listed = "、".join(o["label"] for o in result.options[:6])
     prompt = (f"没有找到名为「{name}」的研究区。已上传的有：{listed}，要用哪一个？"
               if name else f"你已上传的研究区有：{listed}。这次要处理哪一个？")
-    return book, QuestionSpec(field=ops.F_REGION, prompt=prompt,
-                              candidates=result.options), ""
+    return unbound, QuestionSpec(field=ops.F_REGION, prompt=prompt,
+                                 candidates=result.options), ""
 
 
 def _resolve_time(book: SlotBook, ctx: ResolveContext):

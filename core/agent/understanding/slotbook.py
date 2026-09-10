@@ -157,6 +157,16 @@ class SlotBook:
                                        == _norm_compare(value))]
         return book
 
+    def drop(self, name: str) -> "SlotBook":
+        """丢掉一个字段的值，**不留否定记录**。
+
+        用于「模型给的地名压根绑不到真实文件」这类情况：那不是用户否定，
+        只是一串没落地的文字，不该变成「以后都不许用它」。
+        """
+        book = self._clone()
+        book._fields.pop(name, None)
+        return book
+
     def clear(self, name: str, *, evidence: str = "",
               negated_value: Any = None) -> "SlotBook":
         """清除一个字段并留下否定记录（「不是武汉」→ 地区空 + 武汉被否定）。"""

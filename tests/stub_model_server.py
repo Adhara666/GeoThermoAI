@@ -1,20 +1,24 @@
 # -*- coding: utf-8 -*-
-"""可复现的「脚本化模型」：一个最小 OpenAI 兼容网关。
+"""端到端验收用的 OpenAI 兼容网关，两种模式。
 
-用途：让阶段 2 的端到端验收可以在**没有真实模型凭据**的机器上原样复跑，
-同时仍然走完整的 HTTP 链路（server → GeoThermoAI_Assistant → requests →
-网关 → 候选理解器 → 台账），而不是在进程内打桩。
+**脚本模式（默认）**：按用户消息里的关键词挑一份预置候选 JSON 返回。
+用途是让阶段 2 的端到端验收在**没有真实模型凭据**的机器上也能原样复跑，
+同时仍然走完整 HTTP 链路（server → GeoThermoAI_Assistant → requests →
+本网关 → 候选理解器 → 台账），而不是在进程内打桩。
 
-它按用户消息里的关键词挑一份预置候选 JSON 返回；返回内容会被端到端脚本
-原样记录为「模型原始输出」。换成真实模型时，把 api_base_url 指回真实网关
-即可用同一份脚本复跑，无需改动被测代码。
+**转发模式（`--forward`）**：把请求原样转给真实模型网关，并把**真实返回的
+原始输出**逐条留档。被测代码一行不用改，只是 api_base_url 指到本地这一跳。
+凭据从环境变量读，不落任何文件、不进日志。
 
 独立运行（供人工排查）：
     python3 tests/stub_model_server.py --port 18000
+    UPSTREAM_API_KEY=... python3 tests/stub_model_server.py --port 18000 \\
+        --forward https://api.deepseek.com --record /tmp/raw.jsonl
 """
 
 import argparse
 import json
+import os
 import re
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -145,17 +149,47 @@ def pick_reply(messages: List[Dict[str, Any]]) -> str:
 
 _RECORD_PATH = ""
 _RECORD_LOCK = threading.Lock()
+_FORWARD_BASE = ""      # 非空 = 转发模式，转给这个真实模型网关
+_UPSTREAM_TIMEOUT = 180
 
 
-def _record(user_message: str, content: str) -> None:
+def _upstream_key() -> str:
+    """真实模型凭据只从环境变量读，绝不写进文件或日志（安全红线）。"""
+    return os.environ.get("UPSTREAM_API_KEY", "").strip()
+
+
+def _record(user_message: str, content: str, mode: str) -> None:
     """把真实经 HTTP 返回的模型输出逐条留档（验收交付物：模型原始输出）。"""
     if not _RECORD_PATH:
         return
-    line = json.dumps({"user_message": user_message, "model_output": content},
-                      ensure_ascii=False)
+    line = json.dumps({"mode": mode, "user_message": user_message,
+                       "model_output": content}, ensure_ascii=False)
     with _RECORD_LOCK:
         with open(_RECORD_PATH, "a", encoding="utf-8") as f:
             f.write(line + "\n")
+
+
+def _last_user_message(messages: List[Dict[str, Any]]) -> str:
+    return next((str(m.get("content") or "") for m in reversed(messages)
+                 if m.get("role") == "user"), "")
+
+
+def _forward(path: str, payload: Dict[str, Any]) -> Tuple[int, bytes, str]:
+    """把请求原样转给真实网关，返回 (状态码, 响应体, 助手正文)。"""
+    import requests
+
+    url = _FORWARD_BASE.rstrip("/") + path
+    headers = {"Content-Type": "application/json",
+               "Authorization": f"Bearer {_upstream_key()}"}
+    resp = requests.post(url, headers=headers, json=payload,
+                         timeout=_UPSTREAM_TIMEOUT)
+    body = resp.content
+    content = ""
+    try:
+        content = (resp.json()["choices"][0]["message"].get("content") or "")
+    except Exception:
+        pass
+    return resp.status_code, body, content
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -163,6 +197,13 @@ class _Handler(BaseHTTPRequestHandler):
 
     def log_message(self, *args):   # 静音访问日志
         pass
+
+    def _send(self, status: int, body: bytes) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def do_POST(self):
         length = int(self.headers.get("Content-Length") or 0)
@@ -172,9 +213,20 @@ class _Handler(BaseHTTPRequestHandler):
         except ValueError:
             payload = {}
         messages = payload.get("messages") or []
+
+        if _FORWARD_BASE:
+            try:
+                status, body, content = _forward(self.path, payload)
+            except Exception as e:                      # 上游不可用要如实回传
+                body = json.dumps({"error": {"message": f"upstream error: {e}"}},
+                                  ensure_ascii=False).encode("utf-8")
+                status, content = 502, ""
+            _record(_last_user_message(messages), content, "forward")
+            self._send(status, body)
+            return
+
         content = pick_reply(messages)
-        _record(next((str(m.get("content") or "") for m in reversed(messages)
-                      if m.get("role") == "user"), ""), content)
+        _record(_last_user_message(messages), content, "scripted")
         body = json.dumps({
             "id": "scripted", "object": "chat.completion",
             "model": payload.get("model") or "scripted",
@@ -183,19 +235,17 @@ class _Handler(BaseHTTPRequestHandler):
             "usage": {"prompt_tokens": 0, "completion_tokens": 0,
                       "total_tokens": 0},
         }, ensure_ascii=False).encode("utf-8")
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        self._send(200, body)
 
 
-def serve(port: int, record_path: str = "") -> ThreadingHTTPServer:
-    global _RECORD_PATH
+def serve(port: int, record_path: str = "",
+          forward_base: str = "") -> ThreadingHTTPServer:
+    global _RECORD_PATH, _FORWARD_BASE
     _RECORD_PATH = record_path
+    _FORWARD_BASE = forward_base
     server = ThreadingHTTPServer(("127.0.0.1", port), _Handler)
     threading.Thread(target=server.serve_forever, daemon=True,
-                     name="stub-model").start()
+                     name="model-gateway").start()
     return server
 
 
@@ -204,9 +254,15 @@ def main():
     parser.add_argument("--port", type=int, default=18000)
     parser.add_argument("--record", default="",
                         help="把每次请求与返回的模型原始输出追加到该 JSONL 文件")
+    parser.add_argument("--forward", default="",
+                        help="转发模式：真实模型网关地址（凭据读环境变量 "
+                             "UPSTREAM_API_KEY）")
     args = parser.parse_args()
-    server = serve(args.port, args.record)
-    print(f"脚本化模型网关已启动：http://127.0.0.1:{args.port}/chat/completions")
+    if args.forward and not _upstream_key():
+        raise SystemExit("转发模式需要环境变量 UPSTREAM_API_KEY，未提供则拒绝启动")
+    server = serve(args.port, args.record, args.forward)
+    mode = f"转发到 {args.forward}" if args.forward else "脚本模式"
+    print(f"模型网关已启动（{mode}）：http://127.0.0.1:{args.port}/chat/completions")
     try:
         threading.Event().wait()
     finally:

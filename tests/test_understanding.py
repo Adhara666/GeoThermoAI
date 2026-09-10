@@ -514,6 +514,59 @@ def test_negation(tmp: Path):
     h.close()
 
 
+def test_negation_with_echo(tmp: Path):
+    """真实模型在否定那一轮会同时回显上一轮的武汉（联机验收实测）。"""
+    print("测试组 6b：否定与模型回显同时出现（真实模型行为）")
+    h = Harness(tmp, "negation_echo")
+    h.send("给武汉做个地表温度", reply([{
+        "op": "create", "label": "A", "capability": "full_lst",
+        "patches": {"region": {"action": "set", "value": "武汉",
+                               "evidence": "给武汉做个地表温度"}}}]))
+    check("第一轮建立了武汉任务", len(h.tasks()) == 1, str(len(h.tasks())))
+
+    # 同一条消息里：一条是照抄上一轮的新建，一条才是用户真正说的否定
+    h.send("不是武汉", reply([
+        {"op": "create", "label": "A", "capability": "full_lst",
+         "patches": {"region": {"action": "set", "value": "武汉",
+                                "evidence": "给武汉做个地表温度"}}},
+        {"op": "clear", "target_ref": "武汉",
+         "patches": {"region": {"action": "clear", "value": "武汉",
+                                "evidence": "不是武汉"}}},
+    ]))
+    tasks = h.tasks()
+    regions = [SlotBook(t["slots"]).value(ops.F_REGION) for t in tasks]
+    check("回显的新建被丢弃，没有多出一个武汉任务",
+          all(r != "武汉市_市" for r in regions), str(regions))
+    check("没有因为回显而凭空多出任务", len(tasks) == 1, str(len(tasks)))
+    check("否定记录仍然落库",
+          any(n for t in tasks
+              for n in SlotBook(t["slots"]).negations(ops.F_REGION)),
+          str([SlotBook(t["slots"]).to_bundle() for t in tasks]))
+    h.close()
+
+
+def test_unbound_region(tmp: Path):
+    """绑不到真实文件的地名不能留在槽位里冒充研究区（联机验收实测）。"""
+    print("测试组 6c：绑不到的地名不冒充研究区")
+    h = Harness(tmp, "unbound_region")
+    result = h.send("那就按 2025 年 8 月来吧", reply([{
+        "op": "create", "label": "A", "capability": "full_lst",
+        "patches": {"region": {"action": "set",
+                               "value": "那就按 2025 年 8 月来吧"},
+                    "time": {"action": "set", "value": "2025 年 8 月"}}}]))
+    tasks = h.tasks()
+    book = SlotBook(tasks[0]["slots"])
+    check("没落地的地名被丢掉，不显示成研究区",
+          not book.has_value(ops.F_REGION), str(book.value(ops.F_REGION)))
+    check("丢弃不留否定记录（不是用户否定）",
+          not book.negations(ops.F_REGION), str(book.negations(ops.F_REGION)))
+    check("地区仍算缺项并追问",
+          result.kind == understanding.KIND_ASK
+          and tasks[0]["summary_status"] == t_store.TASK_AWAITING_INFO,
+          f"{result.kind}/{tasks[0]['summary_status']}")
+    h.close()
+
+
 # ── 组 7：验收③ 相对年份 ────────────────────────────────────────
 
 
@@ -778,6 +831,8 @@ def main() -> int:
         test_binding(tmp)
         test_two_cities(tmp)
         test_negation(tmp)
+        test_negation_with_echo(tmp)
+        test_unbound_region(tmp)
         test_relative_year(tmp)
         test_download_only(tmp)
         test_chat_mode(tmp)
