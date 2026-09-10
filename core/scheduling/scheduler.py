@@ -80,12 +80,20 @@ class Scheduler:
     def start(self):
         if self.thread is not None:
             return
+        # §11.1：数据根上的应用实例锁（重复启动同一任务库应明确失败）
+        from core.artifacts.lock import InstanceLock
+        self._instance_lock = InstanceLock(self.store.db_path.parent)
+        if not self._instance_lock.acquire():
+            raise RuntimeError(
+                f"数据根已被另一个服务实例锁定：{self._instance_lock.path}")
         self._lock_context = file_lock(str(self.store.db_path) + ".scheduler.lock", blocking=False)
         self._lock_context.__enter__()
         try:
             self.reconcile()
+            self._reconcile_commits()
         except BaseException:
             self._lock_context.__exit__(None, None, None)
+            self._instance_lock.release()
             raise
         log.info("调度器生效预算 %s", asdict(self.budget))
         self.thread = threading.Thread(target=self._loop, name="node-scheduler", daemon=True)
@@ -138,6 +146,9 @@ class Scheduler:
         if self._lock_context:
             self._lock_context.__exit__(None, None, None)
             self._lock_context = None
+        if getattr(self, "_instance_lock", None):
+            self._instance_lock.release()
+            self._instance_lock = None
 
     def _loop(self):
         while not self.stopping.is_set() or self.active:
@@ -301,6 +312,17 @@ class Scheduler:
                     missed["protected_at"] = missed["protected_at"] or utcnow_iso()
                 missed["skipped_opportunities"] += 1
             _event(conn, row, "node.dispatched", {"attempt_id": aid, "attempt_no": number, "claim": asdict(claim)})
+            # 第五阶段（§10.4）：领取上游产物活动引用；尝试结束释放，
+            # 运行级 pinned 持久依赖不受影响。
+            conn.execute(
+                "INSERT OR IGNORE INTO artifact_refs (artifact_id, consumer_type,"
+                " consumer_id, usage, pinned) "
+                "SELECT art.id, 'attempt', ?, 'node_input', 0 "
+                "FROM node_edges e JOIN nodes pred ON pred.id = e.predecessor_id "
+                "JOIN attempts pa ON pa.node_id = pred.id AND pa.status = 'succeeded' "
+                "JOIN artifacts art ON art.attempt_id = pa.id "
+                "WHERE e.successor_id = ? AND e.run_id = ?",
+                (aid, row["id"], row["run_id"]))
             return True
         if not self.store.submit_write(tx):
             return
@@ -409,6 +431,14 @@ class Scheduler:
 
     def _finish(self, aid, active, envelope):
         row, spec = active["row"], active["spec"]
+        # ── 第五阶段：有暂存产物的成功节点走两步提交（§10.2）──
+        # 准备 → 发布 → 确认后节点才 succeeded；产物登记血缘。
+        if envelope.get("status") == "succeeded":
+            outputs = self._collect_staged_outputs(spec)
+            if outputs:
+                self._finish_commit(aid, active, envelope, outputs)
+                self.ledger.release(aid)
+                return
         def tx(conn):
             now = utcnow_iso()
             current = self._node_rows(conn, "n.id=?", (row["id"],))[0]
@@ -449,6 +479,188 @@ class Scheduler:
             _event(conn, row, "node." + node_status, {"attempt_id": aid, "status": node_status, "error": error, "error_kind": envelope.get("error_kind"), "peak_memory_bytes": peak, "staged_only": True})
         self.store.submit_write(tx)
         self.ledger.release(aid)
+        self._release_attempt_refs(aid)
+
+    # ── 第五阶段：产物与恢复（§10–11）──────────────────
+
+    def _collect_staged_outputs(self, spec):
+        """从尝试暂存工作区收集本节点真实输出（排除输入映射/兼容清单）。"""
+        from core.artifacts.publisher import collect_outputs
+        work = Path(spec["staging_dir"]) / "work"
+        if not work.is_dir():
+            return []
+        inputs_manifest = {}
+        marker = Path(spec["staging_dir"]) / "inputs.json"
+        if marker.is_file():
+            try:
+                inputs_manifest = json.loads(marker.read_text(encoding="utf-8"))
+            except ValueError:
+                inputs_manifest = {}
+        return collect_outputs(work, inputs_manifest)
+
+    def _finish_commit(self, aid, active, envelope, outputs):
+        """两步提交：准备 → 文件发布 → 数据库确认（§10.2）。
+
+        任一步失败或取消竞态：意向作废/节点如实失败，暂存保留，
+        绝不让半成品进入正式结果（9.5 通过标准）。
+        """
+        from core.artifacts.publisher import (
+            CommitError,
+            abandon_commit_tx,
+            confirm_commit_tx,
+            prepare_commit_tx,
+            publish_outputs,
+        )
+        row, spec = active["row"], active["spec"]
+        staging = Path(spec["staging_dir"])
+        peak = max(active.get("peak", 0), envelope.get("peak_memory_bytes", 0))
+
+        def prepare(conn):
+            current = self._node_rows(conn, "n.id=?", (row["id"],))[0]
+            a = rows(conn, "SELECT * FROM attempts WHERE id=?", (aid,))[0]
+            if not self._valid(current) or a["authorization"] != envelope.get("authorization") \
+                    or envelope.get("batch") != self.batch or envelope.get("task_version") != row["task_version"]:
+                raise CommitError("迟到或失效授权的结果只保留在暂存区")
+            # 恢复场景（§8.4/§11.2）：重启前已登记提交准备的，复用既有意向，
+            # 不扩大输出清单；新提交才登记意向。
+            existing = conn.execute(
+                "SELECT id, outputs FROM commit_intents WHERE attempt_id = ?"
+                " AND status = 'prepared'", (aid,)).fetchone()
+            if existing:
+                conn.execute("UPDATE attempts SET status='committing' WHERE id=?", (aid,))
+                conn.execute("UPDATE nodes SET status='committing' WHERE id=?", (row["id"],))
+                return existing[0], json.loads(existing[1])
+            intent_id = prepare_commit_tx(
+                conn, attempt_id=aid, staging_dir=str(staging), root=self.root,
+                node_key=current["node_key"], attempt_no=a["attempt_no"],
+                outputs=outputs, task_version=row["task_version"])
+            # §8.2：Running → Committing（授权保留到确认前最后核对）
+            conn.execute("UPDATE attempts SET status='committing' WHERE id=?", (aid,))
+            conn.execute("UPDATE nodes SET status='committing' WHERE id=?", (row["id"],))
+            return intent_id, outputs
+
+        intent_id = None
+        try:
+            intent_id, outputs = self.store.submit_write(prepare)
+            intent_dir = self.store.read(lambda c: c.execute(
+                "SELECT target_dir FROM commit_intents WHERE id=?",
+                (intent_id,)).fetchone()[0])
+            published = publish_outputs(str(staging), intent_dir, outputs)
+
+            def confirm(conn):
+                confirm_commit_tx(conn, intent_id=intent_id, published=published)
+                conn.execute(
+                    "UPDATE attempts SET peak_memory_bytes=?, result_path=? WHERE id=?",
+                    (peak, str(staging / "completion.json"), aid))
+
+            self.store.submit_write(confirm)
+            self._release_attempt_refs(aid)
+            return
+        except BaseException as e:
+            # 取消竞态/发布失败：意向作废，节点如实失败，暂存不清理（供对账）
+            def tx(conn):
+                conn.execute(
+                    "UPDATE attempts SET status='failed', authorization=NULL,"
+                    " process_exited=1, error=?, error_kind='commit', finished_at=?"
+                    " WHERE id=?", (str(e)[:1500], utcnow_iso(), aid))
+                conn.execute(
+                    "UPDATE resource_reservations SET released_at=? WHERE attempt_id=?",
+                    (utcnow_iso(), aid))
+                conn.execute(
+                    "UPDATE nodes SET status='failed', wait_reason=? WHERE id=?",
+                    (f"两步提交未完成，产物保留在暂存区：{str(e)[:300]}", row["id"]))
+                _event(conn, row, "node.failed", {
+                    "attempt_id": aid, "error_kind": "commit",
+                    "error": str(e)[:500]})
+                if intent_id:
+                    abandon_commit_tx(conn, intent_id=intent_id, reason=str(e)[:300])
+            self.store.submit_write(tx)
+            self.ledger.release(aid)
+            self._release_attempt_refs(aid)
+
+    def _release_attempt_refs(self, aid):
+        """尝试结束：释放其活动引用（run 级 pinned 持久依赖保留，§10.4）。"""
+        from core.artifacts.refs import release_consumer_tx
+        try:
+            self.store.submit_write(
+                lambda c: release_consumer_tx(c, consumer_type="attempt",
+                                              consumer_id=aid))
+        except Exception as e:  # noqa: BLE001 — 引用释放失败不影响结果
+            log.warning("尝试 %s 活动引用释放失败：%s", aid, e)
+
+    def _reconcile_commits(self):
+        """启动对账补全（§11.2 提交中断处理表）：逐条核对提交意向。"""
+        from core.artifacts.publisher import (
+            CommitError,
+            abandon_commit_tx,
+            confirm_commit_tx,
+            publish_outputs,
+        )
+        from core.artifacts.cleanup import cleanup_stale_intents_tx, sweep_missing_tx
+
+        def _abandon(intent_id, node_id, reason):
+            def tx(conn):
+                abandon_commit_tx(conn, intent_id=intent_id, reason=reason)
+                conn.execute(
+                    "UPDATE nodes SET status='failed', wait_reason=? WHERE id=?",
+                    (f"提交未完成（对账）：{reason[:200]}", node_id))
+            self.store.submit_write(tx)
+
+        intents = self.store.read(lambda c: rows(
+            c,
+            "SELECT ci.id, ci.status, ci.source_dir, ci.target_dir, ci.outputs,"
+            " ci.attempt_id, a.authorization, a.status AS a_status, a.node_id,"
+            " n.run_id, n.status AS node_status, r.cancel_requested,"
+            " r.status AS run_status"
+            " FROM commit_intents ci JOIN attempts a ON a.id = ci.attempt_id"
+            " JOIN nodes n ON n.id = a.node_id JOIN runs r ON r.id = n.run_id"
+            " WHERE ci.status IN ('prepared','abandoned')"))
+        for it in intents:
+            outputs = json.loads(it["outputs"])
+            valid = it["cancel_requested"] in (0, None) and it["run_status"] not in ("cancelled", "superseded")
+            if it["status"] == "abandoned":
+                continue  # 未采用目录由 cleanup_stale_intents_tx 统一清理
+            if not valid:
+                _abandon(it["id"], it["node_id"], "运行已取消或被替代")
+                continue
+            target = Path(it["target_dir"])
+            published_ok = target.exists() and all(
+                (target / o["path"]).is_file() for o in outputs)
+            if published_ok:
+                # 「文件已发布，数据库未确认」→ 校验后原子补确认
+                try:
+                    self.store.submit_write(lambda c: confirm_commit_tx(
+                        c, intent_id=it["id"],
+                        published={"published_dir": str(target)}))
+                except CommitError as e:
+                    _abandon(it["id"], it["node_id"], str(e))
+                continue
+            staging = Path(it["source_dir"])
+            work = staging / "work"
+            if it["a_status"] in ("running", "committing") and it["authorization"] \
+                    and all((work / o["path"]).is_file() for o in outputs):
+                # 「已有提交准备，文件未移动」→ 验证仍有效后继续发布
+                try:
+                    published = publish_outputs(str(staging), str(target), outputs)
+                    self.store.submit_write(lambda c: confirm_commit_tx(
+                        c, intent_id=it["id"], published=published))
+                except (CommitError, OSError) as e:
+                    _abandon(it["id"], it["node_id"], str(e))
+            else:
+                # 暂存输出不完整且未发布：节点未成功；按对账政策标记失败
+                _abandon(it["id"], it["node_id"], "暂存输出不完整且未发布")
+
+        # 已确认产物可用性对账（只查登记过的，不扫全仓库，§11.1 第 4 条）
+        try:
+            self.store.submit_write(lambda c: sweep_missing_tx(c))
+        except Exception as e:  # noqa: BLE001
+            log.warning("产物可用性对账失败：%s", e)
+        # abandoned 意向的未采用目录清理（限于运行根内）
+        try:
+            self.store.submit_write(lambda c: cleanup_stale_intents_tx(
+                c, run_roots=[str(self.root)]))
+        except Exception as e:  # noqa: BLE001
+            log.warning("未采用目录清理失败：%s", e)
 
     def _decision(self, conn, row, result):
         decision = result["decision"]

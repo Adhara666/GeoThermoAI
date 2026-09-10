@@ -24,5 +24,10 @@ def execute(spec, report, cancel):
             raise Cancelled("探针响应取消")
         report("probe", time.monotonic())
         time.sleep(.03)
+    # 第五阶段验收注入：在暂存工作区产出文件，验证两步提交全链路
+    for rel, content in (p.get("emit_files") or {}).items():
+        target = Path(spec["staging_dir"]) / "work" / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
     return {"context": {"pid": os.getpid(), "threads": os.environ["OMP_NUM_THREADS"], "finished": time.time()},
             "message": "探针完成"}

@@ -14,20 +14,43 @@ def _params(spec):
 
 
 def _private_workspace(context, output, node_type):
-    """只读文件使用符号链接，所有原地写入目标使用私有副本。"""
+    """只读文件使用符号链接，所有原地写入目标使用私有副本。
+
+    第五阶段：把输入映射清单写入暂存根（inputs.json），供产物发布时
+    区分「输入别名/只读副本」与「本节点真实输出」（§10.1：提交清单
+    只包含本节点真实输出，不把上游输入再作为新输出复制一次）。
+    ttri 的可写副本（原地改写后的表）标记为 writable_copy——它们是
+    本节点的真实输出，发布时保留。
+    """
+    manifest = {}
     writable = {"for_train/train.parquet", "for_train/validate.parquet", "for_train/test.parquet", "30m_constraint_grid.parquet"} if node_type == "ttri" else set()
     for rel, source in context.get("files", {}).items():
         target = output / rel
         if not target.resolve().is_relative_to(output.resolve()):
             raise ValueError("输入相对路径越界")
         target.parent.mkdir(parents=True, exist_ok=True)
-        if rel in writable or rel == "run_manifest.json":
+        if rel in writable:
             shutil.copyfile(source, target)
+            manifest[rel] = {"kind": "writable_copy"}
+        elif rel == "run_manifest.json":
+            shutil.copyfile(source, target)
+            manifest[rel] = {"kind": "compat_alias"}
         else:
             try:
                 target.symlink_to(Path(source).resolve())
+                manifest[rel] = {"kind": "symlink"}
             except OSError:
                 shutil.copyfile(source, target)
+                manifest[rel] = {"kind": "copy"}
+    try:
+        (output.parent / "inputs.json").write_text(
+            json.dumps(manifest, ensure_ascii=False, sort_keys=True),
+            encoding="utf-8")
+    except OSError:
+        # 清单写失败：发布侧仍有内建排除（符号链接、run_manifest.json、
+        # .writing 临时文件），仅普通输入副本无法区分的极端情况不发布
+        pass
+    return manifest
 
 
 def _files(root):

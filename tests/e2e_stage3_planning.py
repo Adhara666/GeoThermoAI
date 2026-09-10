@@ -114,19 +114,23 @@ def main() -> int:
           == "default",
           str(snap1["params"].get("cloud_threshold"))[:120])
 
-    # 排队期间改设置（模型参数 n_estimators 200 → 500；走真实设置端点，
-    # 云量、模型参数等任一均可，9.3 验收原文）
+    # 排队期间改设置（模型参数改为不同的值；走真实设置端点）。
+    # 不假设编译时具体值：记录编译值 rf_before，改为 rf_before + 300，
+    # 断言快照仍是编译时的 rf_before（与持久卷遗留值无关，可重复执行）。
+    rf_before = (((snap1["params"].get("rf_params") or {}).get("value") or {})
+                 .get("n_estimators"))
+    rf_after_change = (rf_before or 200) + 300
     r_set = call("POST", "/api/model-params",
-                 {"n_estimators": 500, "max_depth": 25,
+                 {"n_estimators": rf_after_change, "max_depth": 25,
                   "min_samples_split": 16, "min_samples_leaf": 8},
                  token=token)
     check("排队期间修改设置被接受", _settings_ok(r_set), str(r_set)[:200])
 
     detail2 = call("GET", f"/api/planning/run/{run_id}", token=token)
-    rf_after = ((detail2.get("snapshot") or {}).get("params") or {}
-                ).get("rf_params", {}).get("value", {})
-    check("改设置后冻结快照仍是编译时的值（200，而非 500）",
-          rf_after.get("n_estimators") == 200, f"实际 {rf_after}")
+    rf_after = (((detail2.get("snapshot") or {}).get("params") or {})
+                .get("rf_params", {}).get("value", {})).get("n_estimators")
+    check("改设置后冻结快照仍是编译时的值（快照不可变）",
+          rf_after == rf_before, f"编译时 {rf_before}，实际 {rf_after}")
 
     # ── 验收 2：节点清单与依赖顺序 ──
     nodes = detail1.get("nodes") or []
