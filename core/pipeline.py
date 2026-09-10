@@ -372,6 +372,7 @@ class EasyLSTPipeline:
             val_csv=paths["val_split"],
             output_dir=paths["train_results_dir"],
             params=self.config.get("rf_params", None),
+            execution_budget=self.config.get("execution_budget"),
             progress_callback=progress_callback,
         )
         self.config["_model_path"] = result.get("model_path", "")

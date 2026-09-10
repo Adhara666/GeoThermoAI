@@ -33,11 +33,26 @@ DEFAULT_PARAM_PATHS = {
     "val_ratio": "processing.val_ratio",
     "test_ratio": "processing.test_ratio",
     "block_size_px": "processing.block_size_px",
+    "guard_buffer_m": "processing.guard_buffer_m",
+    "seed": "processing.seed",
+    "step2_min_valid_samples": "processing.step2_min_valid_samples",
+    "tcr_mode": "processing.tcr_mode",
+    "exec_mode": "agent.default_exec_mode",
     "batch_size": "processing.batch_size",
     "chunk_size": "processing.chunk_size",
     "tuning_max_rounds": "agent.tuning_max_rounds",
     "replan_max": "agent.replan_max",
     "rf_params": "model",
+}
+
+EXECUTION_DEFAULTS = {
+    "cloud_threshold": 30, "dem_source": "copernicus", "train_ratio": .6,
+    "val_ratio": .2, "test_ratio": .2, "block_size_px": 30, "guard_buffer_m": 100.0,
+    "seed": 42, "step2_min_valid_samples": 750000, "tcr_mode": "block_constant",
+    "batch_size": 500000, "chunk_size": 500000, "exec_mode": "approval",
+    "tuning_max_rounds": 5, "replan_max": 3,
+    "rf_params": {"n_estimators": 200, "max_depth": 25, "min_samples_split": 16,
+                  "min_samples_leaf": 8, "max_features": .5, "random_state": 42},
 }
 
 # 槽位字段 → 快照参数键
@@ -106,9 +121,15 @@ def build_snapshot(task_row: Dict[str, Any],
             params[key] = {"value": copy.deepcopy(node), "source": "default",
                            "evidence": ""}
 
+    for key, value in EXECUTION_DEFAULTS.items():
+        if key not in params:
+            params[key] = {"value": copy.deepcopy(value), "source": "default", "evidence": ""}
+    params["rf_params"]["value"] = {**EXECUTION_DEFAULTS["rf_params"], **params["rf_params"]["value"]}
     return {
         "params": params,
         "slot_values": copy.deepcopy(task_row.get("slots") or {}),
+        # 只保存程序绑定的文件引用，不保存凭据，也不接受模型路径。
+        "execution": copy.deepcopy(settings.get("_execution") or {}),
         "taken_at": utcnow_iso(),
     }
 

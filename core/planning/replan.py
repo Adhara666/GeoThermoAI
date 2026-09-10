@@ -170,7 +170,7 @@ def start_superseding_run_tx(conn, *, task_id: str,
         conn, run_id=new_run_id,
         fields={
             "task_id": task_id,
-            "task_version": int(task_row.get("version") or 1),
+            "task_version": int(task_row.get("version") or 1) + 1,
             "template_version": "plan-catalog-v1",
             "frozen_inputs": {
                 "snapshot": snapshot,
@@ -182,6 +182,18 @@ def start_superseding_run_tx(conn, *, task_id: str,
             "status": "queued",
         },
     )
+
+    # 替代运行同样必须有可执行节点图，不能只有一条 queued 运行记录。
+    from core.planning.catalog import CAPABILITY_TEMPLATES
+    last = {}
+    chain = CAPABILITY_TEMPLATES[task_row["capability"]]["chain"] or []
+    for order, (kind, predecessors) in enumerate(chain, 1):
+        nid = new_id()
+        conn.execute("INSERT INTO nodes(id,run_id,node_key,node_type,params,status,exec_order) VALUES(?,?,?,?,?,'pending',?)",
+                     (nid, new_run_id, kind, kind, json.dumps({"from_snapshot": True}), order))
+        for predecessor in predecessors:
+            conn.execute("INSERT INTO node_edges VALUES(?,?,?)", (new_run_id, last[predecessor], nid))
+        last[kind] = nid
 
     if old_run is not None:
         _patch_run(conn, old_run_id,

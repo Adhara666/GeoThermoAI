@@ -87,6 +87,7 @@ class RFModelSkill(BaseSkill):
         params: Dict[str, Any],
         progress_callback=None,
         log_callback=None,
+        execution_budget=None,
     ) -> SkillResult:
         """执行随机森林训练和测试集预测。"""
         train_csv = params.get("train_csv", "")
@@ -136,6 +137,7 @@ class RFModelSkill(BaseSkill):
                 train_csv=train_csv, val_csv=val_csv,
                 output_dir=train_results_dir,
                 params=rf_params if rf_params else None,
+                execution_budget=execution_budget,
                 progress_callback=lambda sn, pct, msg: (
                     progress_callback(sn, pct * 0.4, f"[训练] {msg}") if progress_callback else None
                 ),

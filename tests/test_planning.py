@@ -70,6 +70,8 @@ def check(name, cond, detail=""):
     print(f"  [{'PASS' if cond else 'FAIL'}] {name}" + (f"  {detail}" if not cond else ""))
     if not cond:
         FAIL.append((name, detail))
+    else:
+        PASS.append(name)
 
 
 def expect_raises(name, exc_type, fn):

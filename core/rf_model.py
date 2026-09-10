@@ -106,7 +106,7 @@ def resolve_n_jobs(requested: Optional[int]) -> int:
     return max(1, min(int(requested), quota))
 
 
-def merge_rf_params(user_params: Optional[Dict]) -> Dict:
+def merge_rf_params(user_params: Optional[Dict], execution_budget: Optional[Dict] = None) -> Dict:
     """先拷贝 DEFAULT_RF_PARAMS，再用白名单校验过的用户参数覆盖。
 
     无论用户传入多少字段，random_state/max_features 等未被用户覆盖的参数都保留
@@ -118,6 +118,8 @@ def merge_rf_params(user_params: Optional[Dict]) -> Dict:
             if k in RF_PARAM_WHITELIST and v is not None:
                 params[k] = v
     params["n_jobs"] = resolve_n_jobs(params.get("n_jobs", -1))
+    if execution_budget is not None:
+        params["n_jobs"] = resolve_n_jobs(int(execution_budget["threads"]))
     params["verbose"] = 0
     return params
 
@@ -151,6 +153,8 @@ def load_model_and_features(model_path: str) -> Tuple[Any, List[str], Dict]:
     避免"加载模型找同名 metrics.json"这段逻辑在多个模块里重复实现。
     """
     model = joblib.load(model_path)
+    if os.environ.get("GTAI_NODE_THREADS") and hasattr(model, "n_jobs"):
+        model.n_jobs = resolve_n_jobs(int(os.environ["GTAI_NODE_THREADS"]))
     metrics_path = model_path.replace("_model_", "_metrics_").replace(".pkl", ".json")
     meta: Dict = {}
     if os.path.exists(metrics_path):
@@ -171,6 +175,7 @@ def train_random_forest(
     output_dir: str,
     params: Optional[Dict] = None,
     progress_callback=None,
+    execution_budget: Optional[Dict] = None,
 ) -> Dict:
     """
     训练随机森林回归模型（含TTRI特征）。
@@ -199,7 +204,7 @@ def train_random_forest(
             - features: 特征列列表
             - params: 实际生效的超参数（含 random_state/max_features/n_jobs）
     """
-    params = merge_rf_params(params)
+    params = merge_rf_params(params, execution_budget=execution_budget)
 
     if progress_callback:
         progress_callback("rf_train", 0, "开始加载数据...")
