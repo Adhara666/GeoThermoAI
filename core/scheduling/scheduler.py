@@ -403,7 +403,12 @@ class Scheduler:
             if ok:
                 eligible.append((row, claim, context))
             else:
-                self._wait_resource(row, reason)
+                # 静态上限不满足（预估需求本身超过部署预算）：等待无意义，
+                # 直接判失败并给出处置建议；其余情况排队等待
+                if self.ledger.static_block(claim):
+                    self._fail_static(row, reason)
+                else:
+                    self._wait_resource(row, reason)
         # 逐个派发并立即更新账本，每个计算机会只统计当时确实能执行的同优先级任务。
         while eligible:
             def key(item):
@@ -416,7 +421,10 @@ class Scheduler:
             row, claim, context = eligible.pop(0)
             ok, reason = self.ledger.can_fit(claim)
             if not ok:
-                self._wait_resource(row, reason)
+                if self.ledger.static_block(claim):
+                    self._fail_static(row, reason)
+                else:
+                    self._wait_resource(row, reason)
                 continue
             skipped = [other[0] for other in eligible if claim.kind == other[1].kind == "compute"
                        and other[0]["priority"] == row["priority"] and self.ledger.can_fit(other[1])[0]]
@@ -432,6 +440,38 @@ class Scheduler:
         def tx(conn):
             conn.execute("UPDATE nodes SET status='waiting_resource',wait_reason=? WHERE id=?", (reason, row["id"]))
             _event(conn, row, "node.waiting_resource", {"reason": reason})
+        self.store.submit_write(tx)
+
+    def _fail_static(self, row, reason):
+        """静态资源上限不满足：直接判失败（不再无限排队）。
+
+        与 _wait_resource 的区别：该原因与当前系统状态无关（预估需求本身
+        超过部署预算），等待/重试永远不会满足——显式失败并附处置建议，
+        用户修正部署内存后可用重试继续。
+        """
+        aid = new_id()
+
+        def tx(conn):
+            current = self._node_rows(conn, "n.id=?", (row["id"],))[0]
+            if current["status"] not in ("ready", "waiting_resource") \
+                    or not self._valid(current):
+                return
+            if conn.execute("SELECT 1 FROM attempts WHERE node_id=?"
+                            " AND process_exited=0", (row["id"],)).fetchone():
+                return
+            number = conn.execute(
+                "SELECT COALESCE(MAX(attempt_no),0)+1 FROM attempts"
+                " WHERE node_id=?", (row["id"],)).fetchone()[0]
+            conn.execute(
+                "INSERT INTO attempts(id,node_id,attempt_no,status,started_at,"
+                " finished_at,error,error_kind,process_exited)"
+                " VALUES(?,?,?,'failed',?,?,?,'resource',1)",
+                (aid, row["id"], number, utcnow_iso(), utcnow_iso(), reason))
+            conn.execute("UPDATE nodes SET status='failed', wait_reason=?"
+                         " WHERE id=?", (reason, row["id"]))
+            _event(conn, row, "node.failed", {
+                "attempt_id": aid, "error_kind": "resource",
+                "error": reason})
         self.store.submit_write(tx)
 
     def _launch(self, row, claim, context, skipped):
@@ -1006,6 +1046,28 @@ class Scheduler:
             time.sleep(.1)
 
     def retry(self, node_id, user_id):
+        # 预检：静态上限不满足（预估需求本身超过部署预算）时直接给出原因，
+        # 避免"点击重试 → 瞬间再次失败"的困惑；修正部署内存或模型规模后才可通过。
+        pre = self.store.read(lambda c: self._node_rows(
+            c, "n.id=? AND t.user_id=?", (node_id, user_id)))
+        if pre and pre[0]["status"] == "failed" and self._valid(pre[0]):
+            try:
+                node = pre[0]
+                peak = self.store.read(lambda c: c.execute(
+                    "SELECT MAX(a.peak_memory_bytes) FROM attempts a"
+                    " JOIN nodes n ON n.id=a.node_id WHERE n.node_type=?"
+                    " AND a.status='succeeded'",
+                    (node["node_type"],)).fetchone()[0]) or 0
+                claim = estimate(node["node_type"],
+                                 decode(node["frozen_inputs"])["snapshot"],
+                                 self._context(node), self.budget, peak)
+                ok, reason = self.ledger.can_fit(claim)
+                if not ok and self.ledger.static_block(claim):
+                    raise ValueError(reason)
+            except ValueError:
+                raise
+            except Exception:
+                pass  # 预检自身异常不阻塞正常重试
         def tx(conn):
             found = self._node_rows(conn, "n.id=? AND t.user_id=?", (node_id, user_id))
             if not found:

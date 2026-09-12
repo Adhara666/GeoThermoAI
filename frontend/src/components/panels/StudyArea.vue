@@ -33,10 +33,21 @@ function onUpload(e) {
   e.target.value = ''
 }
 
-// 点击行切换当前研究区
-async function onSetCurrent(name) {
-  if (name === project.currentStudyArea) return
-  await project.setCurrentStudyArea(name)
+// 启用集（多选）：勾选 = 启用；任务未指名地区时按启用集解析。
+// 任务创建后其研究区即冻结，不受后续启用变化影响（多任务互不干扰）。
+function isActive(name) {
+  return project.activeStudyAreas.includes(name)
+}
+
+async function onToggleRow(name, e) {
+  const checked = !!(e && e.target && e.target.checked)
+  if (checked === isActive(name)) return
+  await project.toggleStudyArea(name)
+}
+
+async function onOnlyThis(name) {
+  if (isActive(name) && project.activeStudyAreas.length === 1) return
+  await project.setOnlyStudyArea(name)
 }
 
 function onAskDelete(name) {
@@ -73,25 +84,41 @@ onBeforeUnmount(() => clearTimeout(validationTimer))
     <StatusResult v-if="validationText" :text="validationText" />
 
     <div v-if="project.studyAreas.length" class="study-area__uploaded">
-      <span class="field-label">{{ t('sa.uploaded') }}</span>
+      <div class="study-area__head">
+        <span class="field-label">{{ t('sa.uploaded') }}</span>
+        <span v-if="project.activeStudyAreas.length" class="tag tag--success">
+          {{ t('sa.activeCount', { n: project.activeStudyAreas.length }) }}
+        </span>
+      </div>
       <div class="layer-list">
         <div
           v-for="f in project.studyAreas"
           :key="f"
           class="layer-item"
-          :class="{ 'layer-item--active': f === project.currentStudyArea }"
+          :class="{ 'layer-item--active': isActive(f) }"
           :title="f"
-          @click="onSetCurrent(f)"
         >
-          <span class="dot" :class="f === project.currentStudyArea ? 'dot--yes' : 'dot--no'"></span>
-          <span class="layer-item__name" :style="{ fontWeight: f === project.currentStudyArea ? 600 : 'normal' }">{{ f }}</span>
-          <span v-if="f === project.currentStudyArea" class="tag tag--success" style="margin-left:auto">{{ t('sa.current') }}</span>
-          <span v-else class="tag tag--muted" style="margin-left:auto">{{ t('sa.setCurrent') }}</span>
+          <label class="layer-item__check">
+            <input
+              type="checkbox"
+              :checked="isActive(f)"
+              @change="onToggleRow(f, $event)"
+            />
+          </label>
+          <span class="layer-item__name" :style="{ fontWeight: isActive(f) ? 600 : 'normal' }">{{ f }}</span>
+          <span v-if="isActive(f)" class="tag tag--success" style="margin-left:auto">{{ t('sa.current') }}</span>
+          <button
+            v-if="isActive(f) && project.activeStudyAreas.length > 1"
+            class="layer-item__only"
+            :title="t('sa.onlyThis')"
+            @click.stop="onOnlyThis(f)"
+          >{{ t('sa.onlyThis') }}</button>
           <button class="layer-item__del" :title="t('sa.delTitle')" @click.stop="onAskDelete(f)">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
           </button>
         </div>
       </div>
+      <p class="form-hint study-area__note">{{ t('sa.multiNote') }}</p>
     </div>
 
     <!-- 删除研究区确认弹窗（页面内弹窗，替代浏览器 confirm） -->
@@ -109,10 +136,20 @@ onBeforeUnmount(() => clearTimeout(validationTimer))
 </template>
 
 <style scoped>
-/* 当前使用行：浅蓝底高亮 */
-.layer-item { cursor: pointer; border-radius: var(--radius-sm); }
+.study-area__head { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+.study-area__note { margin-top: 8px; }
+/* 启用行：浅蓝底高亮 */
+.layer-item { display: flex; align-items: center; gap: 6px; cursor: default; border-radius: var(--radius-sm); }
 .layer-item--active { background: var(--primary-soft); }
+.layer-item__check { display: inline-flex; align-items: center; flex-shrink: 0; cursor: pointer; }
+.layer-item__check input { accent-color: var(--primary); margin: 0; }
 .layer-item__name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.layer-item__only {
+  flex-shrink: 0; margin-left: 4px; border: 1px solid var(--border); background: var(--bg);
+  color: var(--text-secondary); font-size: 11px; padding: 2px 8px; border-radius: 6px;
+  cursor: pointer; white-space: nowrap; transition: all 0.15s;
+}
+.layer-item__only:hover { border-color: var(--primary); color: var(--primary); }
 .layer-item__del {
   flex-shrink: 0; display: inline-flex; align-items: center; justify-content: center;
   width: 24px; height: 24px; margin-left: 2px; border: none; border-radius: var(--radius-sm);

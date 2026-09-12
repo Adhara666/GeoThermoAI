@@ -96,6 +96,7 @@ class ResolveContext:
     tz_offset: float = 0.0
     chat_mode: str = "work"
     study_area_paths: Sequence[Path] = ()
+    active_study_area_paths: Sequence[Path] = ()
     open_tasks: Sequence[Dict[str, Any]] = ()
     open_questions: Sequence[Dict[str, Any]] = ()
     default_product: str = "lst_10m"
@@ -384,6 +385,16 @@ def _validate(book: SlotBook, capability: str, ctx: ResolveContext):
     return book, questions, notes
 
 
+def _active_first(options, ctx) -> list:
+    """启用集内的候选排到最前（其余保持原顺序）；无启用时原样返回。"""
+    stems = {p.stem for p in ctx.active_study_area_paths}
+    if not stems:
+        return list(options)
+    head = [o for o in options if o.get("label") in stems]
+    tail = [o for o in options if o.get("label") not in stems]
+    return head + tail
+
+
 def _resolve_region(book: SlotBook, ctx: ResolveContext, lang: str = "zh"):
     raw = book.value(ops.F_REGION)
     detail = book.get(ops.F_REGION).get("detail") or {}
@@ -394,6 +405,38 @@ def _resolve_region(book: SlotBook, ctx: ResolveContext, lang: str = "zh"):
     if isinstance(raw, dict):
         name = str(raw.get("display") or raw.get("value") or "").strip()
 
+    # 无名提问：优先按面板启用集解析（P1 多选语义）——唯一启用直接采用；
+    # 多个启用则追问且候选置顶；未启用任何研究区时才回退全库逻辑
+    if not name and ctx.active_study_area_paths:
+        act = [Path(p) for p in ctx.active_study_area_paths]
+        if len(act) == 1:
+            one = binding.bind_region(act[0].stem, act)
+            if one.kind == binding.BIND_UNIQUE:
+                if book.is_negated(ops.F_REGION, one.display):
+                    return book.drop(ops.F_REGION), QuestionSpec(
+                        field=ops.F_REGION,
+                        prompt=("这次要处理哪个研究区？" if lang == "zh"
+                                else "Which study area should be processed this time?"),
+                        candidates=one.options), ""
+                note = (f"本次使用已启用的研究区：{one.display}" if lang == "zh"
+                        else f"Using the enabled study area: {one.display}")
+                return (book.set(ops.F_REGION, one.display,
+                                 book.source(ops.F_REGION) or SRC_DEFAULT,
+                                 detail=one.to_slot_detail(), override=True),
+                        None, note)
+        else:
+            options = [{"id": str(i + 1), "label": p.stem, "value": str(p.resolve())}
+                       for i, p in enumerate(act)]
+            listed = ("、".join(o["label"] for o in options[:6]) if lang == "zh"
+                      else ", ".join(o["label"] for o in options[:6]))
+            prompt = (f"你启用了多个研究区：{listed}。这次要处理哪一个？"
+                      "（也可以直接说某个地名）" if lang == "zh" else
+                      f"You have multiple study areas enabled: {listed}. "
+                      "Which one should be processed this time? "
+                      "(You can also name a region directly.)")
+            return book.drop(ops.F_REGION), QuestionSpec(
+                field=ops.F_REGION, prompt=prompt, candidates=options), ""
+
     result = binding.bind_region(name, ctx.study_area_paths)
     if result.kind == binding.BIND_UNIQUE:
         # 被否定过的地区不得因「只剩一个候选」而重新入选（9.2 第 4 条）
@@ -402,7 +445,7 @@ def _resolve_region(book: SlotBook, ctx: ResolveContext, lang: str = "zh"):
                 field=ops.F_REGION,
                 prompt=("这次要处理哪个研究区？" if lang == "zh"
                         else "Which study area should be processed this time?"),
-                candidates=result.options), ""
+                candidates=_active_first(result.options, ctx)), ""
         note = (("只有一个可用研究区，本次采用它" if lang == "zh"
                  else "Only one study area is available; it will be used this time.")
                 if not name else "")
@@ -426,17 +469,19 @@ def _resolve_region(book: SlotBook, ctx: ResolveContext, lang: str = "zh"):
                     "study area (GeoJSON or Shapefile) first, then I will "
                     "arrange the workflow.")), ""
     if result.kind == binding.BIND_AMBIGUOUS:
-        listed = ("、".join(o["label"] for o in result.options[:6]) if lang == "zh"
-                  else ", ".join(o["label"] for o in result.options[:6]))
+        options = _active_first(result.options, ctx)
+        listed = ("、".join(o["label"] for o in options[:6]) if lang == "zh"
+                  else ", ".join(o["label"] for o in options[:6]))
         prompt = (f"「{name}」匹配到多个研究区：{listed}，你要处理哪一个？"
                   if lang == "zh" else
                   f'"{name}" matches multiple study areas: {listed}. '
                   f"Which one do you want to process?")
         return unbound, QuestionSpec(
             field=ops.F_REGION, prompt=prompt,
-            candidates=result.options), ""
-    listed = ("、".join(o["label"] for o in result.options[:6]) if lang == "zh"
-              else ", ".join(o["label"] for o in result.options[:6]))
+            candidates=options), ""
+    options = _active_first(result.options, ctx)
+    listed = ("、".join(o["label"] for o in options[:6]) if lang == "zh"
+              else ", ".join(o["label"] for o in options[:6]))
     if lang == "zh":
         prompt = (f"没有找到名为「{name}」的研究区。已上传的有：{listed}，要用哪一个？"
                   if name else f"你已上传的研究区有：{listed}。这次要处理哪一个？")
@@ -446,7 +491,7 @@ def _resolve_region(book: SlotBook, ctx: ResolveContext, lang: str = "zh"):
                   f"You have these study areas uploaded: {listed}. "
                   f"Which one should be processed?")
     return unbound, QuestionSpec(field=ops.F_REGION, prompt=prompt,
-                                 candidates=result.options), ""
+                                 candidates=options), ""
 
 
 def _resolve_time(book: SlotBook, ctx: ResolveContext, lang: str = "zh"):

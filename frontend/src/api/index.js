@@ -87,6 +87,9 @@ export const api = {
   },
 
   setCurrentStudyArea: (name) => req('POST', '/api/study-area/current', { name }),
+  setActiveStudyAreas: (names) => req('POST', '/api/study-area/active', { names }),
+  studyAreaOutlines: (names) => req('GET', '/api/study-areas/outlines'
+    + (names && names.length ? `?names=${encodeURIComponent(names.join(','))}` : '')),
   deleteStudyArea: (name) => req('DELETE', `/api/study-area?name=${encodeURIComponent(name)}`),
 
   /** 建立 SSE 连接；onEvent(type, data)；返回 { close }（切换对话时主动关闭旧连接） */

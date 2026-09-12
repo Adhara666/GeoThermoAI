@@ -78,6 +78,7 @@ def load_ledger_context(store, *, user_id: str,
 def build_resolve_context(*, message: str, received_at: datetime.datetime,
                           tz_offset: float, chat_mode: str,
                           study_area_paths: Sequence[Path],
+                          active_study_area_paths: Sequence[Path] = (),
                           ledger: Dict[str, List[Dict[str, Any]]],
                           default_product: str = "lst_10m",
                           default_model: str = "rf") -> res.ResolveContext:
@@ -87,6 +88,7 @@ def build_resolve_context(*, message: str, received_at: datetime.datetime,
         tz_offset=tz_offset,
         chat_mode=chat_mode,
         study_area_paths=list(study_area_paths),
+        active_study_area_paths=list(active_study_area_paths),
         open_tasks=list(ledger.get("tasks") or []),
         open_questions=list(ledger.get("questions") or []),
         default_product=default_product,
@@ -332,13 +334,21 @@ def _compose_ask(open_questions: List[Dict[str, Any]],
             lines.append(f"{item.get('id')}. {item.get('label')}")
         blocks.append("\n".join(lines))
     text = "\n\n".join(blocks)
-    if not single and any(q.get("candidates") for q in open_questions):
-        text += (("\n\n直接回复选项编号即可（编号在各任务间连续，"
-                  "如\"1、3\"），或直接告诉我选项名称。")
-                 if lang == "zh" else
-                 ("\n\nReply with the option number (numbering continues "
-                  "across tasks, e.g. \"1, 3\"), or just tell me the option "
-                  "name."))
+    if any(q.get("candidates") for q in open_questions):
+        if single:
+            # 单问题也要给出“怎么选”的说明（用户反馈：缺了这类提示）
+            text += (("\n\n可直接点击下方卡片选择，或回复选项编号、"
+                      "直接告诉我选项名称。")
+                     if lang == "zh" else
+                     ("\n\nClick the card below, or reply with the option "
+                      "number or the option name."))
+        else:
+            text += (("\n\n直接回复选项编号即可（编号在各任务间连续，"
+                      "如\"1、3\"），或直接告诉我选项名称。")
+                     if lang == "zh" else
+                     ("\n\nReply with the option number (numbering continues "
+                      "across tasks, e.g. \"1, 3\"), or just tell me the option "
+                      "name."))
     return text
 
 

@@ -3,8 +3,34 @@ import { api, getToken } from '../api'
 import { useToast } from '../composables/useToast'
 import { t, trServer } from '../i18n'
 
-const EXEC_MODE_KEY = 'gtai_exec_mode'
-const CHAT_MODE_KEY = 'gtai_chat_mode'
+const EXEC_MODE_KEY = 'gtai_exec_mode'             // 默认值：新对话未设置时使用
+const EXEC_MODE_BY_CONV = 'gtai_exec_mode_by_conv' // 执行模式按对话独立保存
+const CHAT_MODE_KEY = 'gtai_chat_mode'             // 默认值：新对话未设置时使用
+const CHAT_MODE_BY_CONV = 'gtai_chat_mode_by_conv' // Chat/Work 按对话独立保存
+
+function _readModeMap(key) {
+  try {
+    const m = JSON.parse(localStorage.getItem(key) || '{}')
+    return m && typeof m === 'object' ? m : {}
+  } catch (_) {
+    return {}
+  }
+}
+
+function _readConvMode(key, conv) {
+  if (!conv) return ''
+  const v = _readModeMap(key)[conv]
+  return typeof v === 'string' ? v : ''
+}
+
+function _writeConvMode(key, conv, val) {
+  if (!conv || !val) return
+  try {
+    const m = _readModeMap(key)
+    m[conv] = val
+    localStorage.setItem(key, JSON.stringify(m))
+  } catch (_) {}
+}
 
 // 模块级：当前激活的 SSE 流（切换对话/项目时主动关闭旧连接，
 // 避免旧对话的流式回调继续串写全局 store）
@@ -99,6 +125,7 @@ export const useChatStore = defineStore('chat', {
     kernelQuestions: {}, // question_id -> 问题卡（含固定目标列表与版本）
     kernelArtifacts: [], // 本对话正式产物（按产物编号，地图/精度/下载绑定）
     kernelQuestionsOrder: [],
+    questionAnchors: {}, // question_id -> 问题卡插入锚点（消息下标）：卡片停在其提问气泡之后，后续气泡排在其下面
     kernelTasksOrder: [],
     eventCursor: 0, // 已消费事件游标（断线重连后从此处补发）
     kernelActive: false,
@@ -131,6 +158,8 @@ export const useChatStore = defineStore('chat', {
       const next = mode === 'auto' ? 'auto' : 'approval'
       this.execMode = next
       try { localStorage.setItem(EXEC_MODE_KEY, next) } catch (_) {}
+      // 按对话独立存档（修复：全局值会串对话，并在下一条消息写回服务端）
+      _writeConvMode(EXEC_MODE_BY_CONV, useProjectStore().currentConv, next)
       // 立即通知后端（不改变已编译运行的科学参数）：切到“完全执行”时，
       // 等待中的配对选择自动代选，任务无需重发消息即继续
       const project = useProjectStore()
@@ -151,6 +180,8 @@ export const useChatStore = defineStore('chat', {
       const next = mode === 'chat' ? 'chat' : 'work'
       this.chatMode = next
       try { localStorage.setItem(CHAT_MODE_KEY, next) } catch (_) {}
+      // 按对话独立存档（与执行模式同规则）
+      _writeConvMode(CHAT_MODE_BY_CONV, useProjectStore().currentConv, next)
     },
 
     async loadMessages(pid, cid) {
@@ -181,6 +212,23 @@ export const useChatStore = defineStore('chat', {
       this.workflowSteps = []
       const data = await api.get(`/api/messages?project=${encodeURIComponent(pid)}&conv=${encodeURIComponent(cid)}`)
       this.messages = normalizeMessages(data.messages || [])
+      this.questionAnchors = {}
+      // 模式按对话隔离：有本机存档用存档，没有则用标准默认值
+      // （由我批准 / Work）。绝不能回退“全局最近选择”——那正是
+      // 修完仍串对话的原因：未设置过的对话会借到别的对话刚选的值；
+      // 执行模式随后会尝试向软件端读取该对话自己的存档补档。
+      this.execMode = _readConvMode(EXEC_MODE_BY_CONV, cid) || 'approval'
+      this.chatMode = _readConvMode(CHAT_MODE_BY_CONV, cid) || 'work'
+      if (!_readConvMode(EXEC_MODE_BY_CONV, cid)) {
+        try {
+          const em = await api.get(`/api/exec-mode?conv=${encodeURIComponent(cid)}`)
+          if (cid === useProjectStore().currentConv && em
+              && (em.exec_mode === 'auto' || em.exec_mode === 'approval')) {
+            this.execMode = em.exec_mode
+            _writeConvMode(EXEC_MODE_BY_CONV, cid, em.exec_mode)
+          }
+        } catch (_) { /* 读取失败：保持本地默认值 */ }
+      }
       // 第六阶段：拉取台账会话快照并订阅对话事件流（多任务复用一条连接）
       await this.refreshKernelSnapshot(cid)
       // 日志历史先于 SSE 订阅加载（订阅以 logMaxId 为起点补发，不重不漏）
@@ -409,8 +457,12 @@ export const useChatStore = defineStore('chat', {
       if (!cid || this.streaming) return
       try {
         const cur = await api.get(`/api/chat/current?conv=${encodeURIComponent(cid)}`)
-        // 直接显示最新累积内容，避免先显示会话文件旧快照、等 SSE 慢慢同步
-        if (cur && cur.content) {
+        // 直接显示最新累积内容，避免先显示会话文件旧快照、等 SSE 慢慢同步。
+        // 仅在流真正活跃时可用服务端内容回填气泡：已结束的旧流程会保留
+        // 上一条流的残留内容（服务端供重连补齐用），若不过滤，刷新时会把
+        // 最后一条助手消息（如“答案已接收”）错写成上一条流的正文（用户实测：
+        // 刷新后出现第二次提问气泡）。历史消息才是结束态的权威。
+        if (cur && cur.content && cur.active) {
           const last = this.messages[this.messages.length - 1]
           if (last && last.role === 'assistant') {
             last.content = cur.content
@@ -617,6 +669,7 @@ export const useChatStore = defineStore('chat', {
       if (_activeConvId) delete _convLogCache[_activeConvId]
       _activeConvId = ''
       this.messages = []
+      this.questionAnchors = {}
       this.streaming = false
       this.paused = false
       this.pairs = []

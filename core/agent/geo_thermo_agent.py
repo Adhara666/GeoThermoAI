@@ -555,13 +555,14 @@ class GeoThermoAgent:
 
     def _find_study_area_file(self, study_areas_dir: str = "",
                               preferred_name: str = "") -> Optional[str]:
-        """查找研究区文件，返回绝对路径；未找到返回 None
+        """查找研究区文件，返回绝对路径；未找到返回 None（不再猜测）。
+
+        解析顺序：用户点名（精确/包含匹配）> 启用集（唯一启用）> 全库唯一文件；
+        多个启用/多个文件且未点名时返回 None，由上层追问，杜绝「取最新上传」兜底。
 
         Args:
             study_areas_dir: 每用户研究区目录；空则用全局 config/study_areas
-            preferred_name:  用户说的地名/文件名。给定时按「精确匹配 → 包含匹配」
-                             找对应文件；都匹配不上再退回「取最新上传」。
-                             不传时行为与改造前完全一致。
+            preferred_name:  用户说的地名/文件名（优先于启用集）
         """
         _study_areas_dir = (
             pathlib.Path(study_areas_dir) if study_areas_dir
@@ -570,20 +571,37 @@ class GeoThermoAgent:
         uploaded = list(_study_areas_dir.glob("*.geojson")) if _study_areas_dir.exists() else []
         if not uploaded:
             return None
-        # 用户手动指定了当前研究区（研究区面板「切换」写入 .current.txt 标记）→ 优先使用
-        _mark = _study_areas_dir / ".current.txt"
-        if _mark.exists():
-            _cur = _mark.read_text(encoding="utf-8").strip()
-            if _cur:
-                _p = _study_areas_dir / _cur
-                if _p.is_file():
-                    return str(_p.resolve())
         if preferred_name:
             matched = match_study_area(uploaded, preferred_name)
             if matched is not None:
                 return str(matched.resolve())
-        latest = sorted(uploaded, key=lambda p: p.stat().st_mtime, reverse=True)[0]
-        return str(latest.resolve())
+        active = self._active_study_area_files(_study_areas_dir, uploaded)
+        if len(active) == 1:
+            return str(active[0].resolve())
+        if len(active) >= 2:
+            return None
+        if len(uploaded) == 1:
+            return str(uploaded[0].resolve())
+        return None
+
+    @staticmethod
+    def _active_study_area_files(study_areas_dir: pathlib.Path,
+                                 uploaded: list) -> list:
+        """启用集文件（.active.json 多选标记；兼容旧 .current.txt 单值）。"""
+        names: list = []
+        p = study_areas_dir / ".active.json"
+        if p.exists():
+            try:
+                names = [str(x) for x in json.loads(p.read_text(encoding="utf-8"))]
+            except Exception:
+                names = []
+        if not names:
+            m = study_areas_dir / ".current.txt"
+            if m.exists():
+                names = [(m.read_text(encoding="utf-8") or "").strip()]
+        by_name = {f.name: f for f in uploaded}
+        return [by_name[os.path.basename(n)] for n in names
+                if os.path.basename(n) in by_name]
 
     def _load_config(self, settings_path: str = "") -> dict:
         """读取设置（每用户 settings_path 优先；空则全局 config/settings.json）"""

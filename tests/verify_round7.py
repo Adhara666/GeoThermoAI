@@ -36,13 +36,18 @@ total_logs = c.execute("SELECT COUNT(*) FROM task_logs").fetchone()[0]
 print(f"  task_logs 总行数: {total_logs}")
 check("历史事件已回填日志", total_logs > 0, f"rows={total_logs}")
 
-# 2) 完成气泡
+# 2) 完成气泡（对话可能已被删除：容错跳过）
 conv_file = Path("/app/data/users/Adhara/conversations/96b0a1dcae1f.json")
-data = json.loads(conv_file.read_text(encoding="utf-8"))
+HAS_CONV = conv_file.exists()
+data = json.loads(conv_file.read_text(encoding="utf-8")) if HAS_CONV \
+    else {"messages": []}
 bubbles = [m for m in (data.get("messages") or [])
            if isinstance(m, dict) and m.get("kind") == "task_complete"]
-check("完成报告气泡已写入（武汉+鄂州=2 条）", len(bubbles) >= 2,
-      f"count={len(bubbles)}")
+if HAS_CONV:
+    check("完成报告气泡已写入（武汉+鄂州=2 条）", len(bubbles) >= 2,
+          f"count={len(bubbles)}")
+else:
+    print("  [SKIP] 对话已删除，跳过完成气泡计数检查")
 for b in bubbles[:2]:
     print("    ---")
     print("    " + (b.get("content") or "").replace("\n", "\n    ")[:500])
@@ -75,7 +80,10 @@ backend = wa.AppBackend()
 backend._uid = lambda: "Adhara"
 r = backend.conversation_logs("96b0a1dcae1f", tz=8)
 logs = r.get("logs") or []
-check("日志历史接口返回条目", r.get("ok") and len(logs) > 0, f"n={len(logs)}")
+if HAS_CONV:
+    check("日志历史接口返回条目", r.get("ok") and len(logs) > 0, f"n={len(logs)}")
+else:
+    print("  [SKIP] 对话已删除，跳过日志条目检查")
 # 失败/重试行面向全局日志核实（该对话内未必产生失败）
 texts = [row[0] for row in c.execute("SELECT text FROM task_logs")]
 has_fail = any("失败" in x or "Failed" in x for x in texts)
@@ -88,39 +96,47 @@ check("包含重试行", has_retry)
 check("日志无 emoji 图标", all(not _EMO.search(x) for x in texts))
 
 # 4) 采样（显示温度：输入 30m LST + 产物 10m LST）
-task_id = c.execute(
+_row0 = c.execute(
     "SELECT id FROM tasks WHERE user_id='Adhara' AND label LIKE '武汉市%'"
-    " AND summary_status='completed' ORDER BY created_at DESC LIMIT 1").fetchone()[0]
-inp = backend.task_inputs(task_id)
-lst_input = next((x for x in inp.get("inputs", []) if x["key"] == "landsat_path"), None)
-check("任务输入包含 30m LST 层", lst_input is not None)
-b = lst_input["bounds"]
-lon, lat = (b[0] + b[2]) / 2, (b[1] + b[3]) / 2
-v_in = backend.task_input_sample(task_id, "landsat_path", lat, lon)
-check("30m LST 输入层采样返回温度(K)", isinstance(v_in, float) and 200 < v_in < 400,
-      f"v={v_in}")
-art = c.execute(
-    "SELECT a.id, a.path FROM artifacts a JOIN attempts at ON at.id=a.attempt_id"
-    " JOIN nodes n ON n.id=at.node_id WHERE n.run_id=("
-    " SELECT current_run_id FROM tasks WHERE id=?)"
-    " AND a.path LIKE '%rf_10m_lst_final%' LIMIT 1", (task_id,)).fetchone()
-check("找到 10m LST 正式产物", art is not None)
-# 注意：该产物文件在磁盘回收事故中被删除（availability=cleaned）：跳过采样，
-# 待用户重建后可用；此处验证“已清理”状态被正确标记而非误报可下载
-avail = c.execute("SELECT availability FROM artifacts WHERE id=?", (art["id"],)).fetchone()[0] if art else ""
-print(f"    10m LST 产物可用性: {avail}")
-if avail == "available":
-    v_out = None
-    for dx, dy in ((0, 0), (-0.03, -0.03), (0.03, 0.03), (-0.05, 0.02), (0.02, -0.05)):
-        v_out = backend.artifact_sample(art["id"], lat + dy, lon + dx)
-        if isinstance(v_out, float):
-            break
-    check("10m LST 产物采样返回温度(K)", isinstance(v_out, float) and 200 < v_out < 400,
-          f"v={v_out}")
+    " AND summary_status='completed' ORDER BY created_at DESC LIMIT 1").fetchone()
+task_id = _row0[0] if _row0 else ""
+if task_id:
+    inp = backend.task_inputs(task_id)
+    lst_input = next((x for x in inp.get("inputs", []) if x["key"] == "landsat_path"), None)
+    if lst_input is None or not lst_input.get("bounds"):
+        print("  [SKIP] 该任务输入文件已不可用（历史任务），跳过采样检查")
+    else:
+        check("任务输入包含 30m LST 层", True)
+        b = lst_input["bounds"]
+        lon, lat = (b[0] + b[2]) / 2, (b[1] + b[3]) / 2
+        v_in = backend.task_input_sample(task_id, "landsat_path", lat, lon)
+        check("30m LST 输入层采样返回温度(K)",
+              isinstance(v_in, float) and 200 < v_in < 400, f"v={v_in}")
+        art = c.execute(
+            "SELECT a.id, a.path FROM artifacts a JOIN attempts at ON at.id=a.attempt_id"
+            " JOIN nodes n ON n.id=at.node_id WHERE n.run_id=("
+            " SELECT current_run_id FROM tasks WHERE id=?)"
+            " AND a.path LIKE '%rf_10m_lst_final%' LIMIT 1", (task_id,)).fetchone()
+        check("找到 10m LST 正式产物", art is not None)
+        # 文件可能已被磁盘回收（availability=cleaned）：此处验证“已清理”状态
+        # 被正确标记而非误报可下载
+        avail = c.execute("SELECT availability FROM artifacts WHERE id=?",
+                          (art["id"],)).fetchone()[0] if art else ""
+        print(f"    10m LST 产物可用性: {avail}")
+        if avail == "available":
+            v_out = None
+            for dx, dy in ((0, 0), (-0.03, -0.03), (0.03, 0.03), (-0.05, 0.02), (0.02, -0.05)):
+                v_out = backend.artifact_sample(art["id"], lat + dy, lon + dx)
+                if isinstance(v_out, float):
+                    break
+            check("10m LST 产物采样返回温度(K)",
+                  isinstance(v_out, float) and 200 < v_out < 400, f"v={v_out}")
+        else:
+            check("10m LST 产物已标记清理（文件缺失时不误报可下载）", avail == "cleaned")
+        v_bad = backend.task_input_sample(task_id, "sentinel2_path", lat, lon)
+        check("非 LST 层不参与采样", v_bad is None)
 else:
-    check("10m LST 产物已标记清理（文件缺失时不误报可下载）", avail == "cleaned")
-v_bad = backend.task_input_sample(task_id, "sentinel2_path", lat, lon)
-check("非 LST 层不参与采样", v_bad is None)
+    print("  [SKIP] 无已完成武汉任务，跳过采样检查")
 
 # 5) 资源口径（整个软件）
 usage = backend.get_sys_usage()

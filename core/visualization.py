@@ -32,6 +32,7 @@ except ImportError:
 
 try:
     import rasterio
+    from rasterio.enums import Resampling as _Resampling
     from rasterio.warp import transform as warp_transform
     HAS_RASTERIO = True
 except ImportError:
@@ -76,52 +77,88 @@ def _open_cached(path: str):
 
 # ── 大地图瓦片加速：低分辨率概览副本 ────────────────────
 # 10m LST 等大地图（数千万像素）逐瓦片从原图解码较慢；首次渲染时
-# 懒构建一份 ≤4096 像素边长的概览副本（存 /tmp，带 mtime 失效），
-# 常规缩放级别（z≤15）的瓦片与全局统计都从副本计算——显示级够清晰，
-# 渲染显著加快；高缩放（z>15）仍从原图读取保清晰。
+# 懒构建一份 ≤8192 像素边长的概览副本（存 /tmp，带 mtime 失效）。
+# 副本只在请求缩放低于其自身原生级别时使用（否则回原图）——修复：
+# 此前固定 z≤15 都读 4096 像素副本，10m 影像被等效降到 ~30m（用户实测模糊）。
 _OVERVIEW_LOCK = threading.Lock()
-_OVERVIEW_READY = {}  # (file_path, mtime) → 副本路径 or ""（无需/失败）
-_OVERVIEW_MAX_DIM = 4096
+_OVERVIEW_READY = {}  # (file_path, mtime) → (副本路径, 副本原生级别) or ""
+_OVERVIEW_MAX_DIM = 8192
 _OVERVIEW_MAX_PIXELS = 12_000_000  # 超过才值得建副本
-_OVERVIEW_MAX_Z = 15
 
 
-def _overview_or_self(file_path: str, mtime: float, z: int) -> str:
-    """返回瓦片/统计应读取的文件路径（大地图为概览副本，否则原图）。"""
-    if z > _OVERVIEW_MAX_Z or not HAS_RASTERIO:
-        return file_path
+def _overview_or_self(file_path: str, mtime: float, z: int):
+    """返回渲染应读取的 (文件路径, 该文件的原生缩放级别)。
+
+    大地图为加速构建低分辨率概览副本，但仅当请求的 z 低于副本原生级别
+    时才读副本，且副本**按需构建**（高缩放请求直接读原图，不触发构建）——
+    此前固定 z≤15 都读 4096 像素副本，10m 影像被等效降到 ~30m（用户实测）。
+    """
+    if not HAS_RASTERIO:
+        return file_path, None
     key = (file_path, mtime)
-    if key in _OVERVIEW_READY:
-        return _OVERVIEW_READY[key] or file_path
-    with _OVERVIEW_LOCK:
-        if key in _OVERVIEW_READY:
-            return _OVERVIEW_READY[key] or file_path
+    cached = _OVERVIEW_READY.get(key)
+    if cached is None:
+        # 只做廉价探测（打开读尺寸）：大图记录预计副本级别，等低缩放请求再构建
+        cached = ""
         try:
             with rasterio.open(file_path) as src:
-                if (src.width * src.height <= _OVERVIEW_MAX_PIXELS
-                        or max(src.width, src.height) <= _OVERVIEW_MAX_DIM):
-                    _OVERVIEW_READY[key] = ""
-                    return file_path
-                scale = _OVERVIEW_MAX_DIM / max(src.width, src.height)
-                ow = max(1, int(src.width * scale))
-                oh = max(1, int(src.height * scale))
-                data = src.read(out_shape=(src.count, oh, ow))
-                prof = src.profile.copy()
-                prof.update(width=ow, height=oh, count=src.count,
-                            transform=src.transform * src.transform.scale(
-                                src.width / ow, src.height / oh))
-            out_dir = os.path.join(tempfile.gettempdir(), "gtai_overview")
-            os.makedirs(out_dir, exist_ok=True)
-            digest = hashlib.md5(
-                f"{file_path}:{mtime}".encode()).hexdigest()[:16]
-            out = os.path.join(out_dir, f"ov_{digest}.tif")
-            with rasterio.open(out, "w", **prof) as dst:
-                dst.write(data)
-            _OVERVIEW_READY[key] = out
-            return out
+                big = (src.width * src.height > _OVERVIEW_MAX_PIXELS
+                       and max(src.width, src.height) > _OVERVIEW_MAX_DIM)
+                if big:
+                    scale = _OVERVIEW_MAX_DIM / max(src.width, src.height)
+                    ov_z = int(round(LayerVisualizer._native_zoom(src)
+                                     + math.log2(scale)))
+                    cached = ("", ov_z)
         except Exception:
-            _OVERVIEW_READY[key] = ""
-            return file_path
+            cached = ""
+        _OVERVIEW_READY[key] = cached
+    if not cached:
+        return file_path, None
+    out, ov_z = cached
+    if z >= ov_z:
+        return file_path, None   # 达到/超出副本原生级别：读原图，不建副本
+    if not out:
+        # 低缩放：惰性构建概览副本（一次，构建期间后续请求已可回原图）
+        with _OVERVIEW_LOCK:
+            cur = _OVERVIEW_READY.get(key)
+            out, ov_z = cur if isinstance(cur, tuple) else ("", ov_z)
+            if not out:
+                try:
+                    with rasterio.open(file_path) as src:
+                        scale = _OVERVIEW_MAX_DIM / max(src.width, src.height)
+                        ow = max(1, int(src.width * scale))
+                        oh = max(1, int(src.height * scale))
+                        data = src.read(
+                            out_shape=(src.count, oh, ow),
+                            resampling=_Resampling.bilinear)
+                        prof = src.profile.copy()
+                        prof.update(width=ow, height=oh, count=src.count,
+                                    transform=src.transform * src.transform.scale(
+                                        src.width / ow, src.height / oh))
+                    out_dir = os.path.join(tempfile.gettempdir(), "gtai_overview")
+                    os.makedirs(out_dir, exist_ok=True)
+                    digest = hashlib.md5(
+                        f"{file_path}:{mtime}".encode()).hexdigest()[:16]
+                    out_path = os.path.join(out_dir, f"ov_{digest}.tif")
+                    with rasterio.open(out_path, "w", **prof) as dst:
+                        dst.write(data)
+                    del data
+                    with rasterio.open(out_path) as osrc:
+                        ov_z = LayerVisualizer._native_zoom(osrc)
+                    out = out_path
+                    # 概览构建是整幅影像的大块分配（数百 MB~GB 级）：完成后
+                    # 立即把空闲堆归还系统，避免高水位 RSS 长期留存
+                    try:
+                        from core.memtrim import release_rss_memory
+                        release_rss_memory()
+                    except Exception:  # noqa: BLE001 — 归还失败不影响构建
+                        pass
+                except Exception:
+                    out = ""
+                _OVERVIEW_READY[key] = (out, ov_z)
+    if not out or z >= ov_z:
+        return file_path, None
+    return out, ov_z
 
 
 # 默认地图中心（武汉），未指定项目目录或无法读取时使用
@@ -418,8 +455,8 @@ class LayerVisualizer:
         elif kind == "range":
             result = (float(valid.min()), float(valid.max()))
         elif kind == "rgb":
-            # 真彩色专用拉伸（较 2/98 更亮，S2 RGB 默认偏暗）
-            result = (float(np.percentile(valid, 1)), float(np.percentile(valid, 88)))
+            # 真彩色拉伸：兼顾暗部可见与不过曝（1/88 偏亮、2/98 偏暗，取折中）
+            result = (float(np.percentile(valid, 2)), float(np.percentile(valid, 94)))
         else:
             result = (float(np.percentile(valid, 2)), float(np.percentile(valid, 98)))
         LayerVisualizer._STATS_CACHE[key] = result
@@ -520,8 +557,8 @@ class LayerVisualizer:
         try:
             from rasterio.windows import Window, from_bounds as win_from_bounds
             import rasterio.warp
-            # 大地图加速：z≤15 从低分辨率概览副本渲染/统计（首次调用时懒构建）
-            render_path = _overview_or_self(file_path, mtime, z)
+            # 大地图加速：低分辨率概览副本仅在不超过其原生级别时使用（否则原图）
+            render_path, _ov_native_z = _overview_or_self(file_path, mtime, z)
             minx, miny, maxx, maxy = LayerVisualizer._tile_merc_bounds(z, x, y)
             # 句柄缓存：避免每瓦片重开大文件（nullcontext 保持不关闭语义）
             with contextlib.nullcontext(_open_cached(render_path)) as src:
@@ -544,7 +581,7 @@ class LayerVisualizer:
                 nodata = src.nodata
 
                 if "bands" in layer_def:
-                    # RGB 真彩色：全局 2%/98% 分位数拉伸
+                    # RGB 真彩色：全局分位拉伸（具体分位见 _cached_stats 的 rgb 参数）
                     rgb = [None, None, None]
                     for i, b in enumerate(layer_def["bands"]):
                         if b < 1 or b > src.count:

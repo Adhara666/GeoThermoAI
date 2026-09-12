@@ -104,7 +104,10 @@ async function copyLog() {
       <span class="log-panel__count">{{ t('log.count', { n: chat.logAll.length || chat.logLines.length }) }}</span>
       <button class="log-panel__clear" :disabled="!chat.logAll.length && !chat.logLines.length" @click="copyLog">{{ copied ? t('log.copied') : t('log.copy') }}</button>
       <button class="log-panel__clear" :disabled="!chat.logAll.length && !chat.logLines.length" @click="clearLog">{{ t('log.clear') }}</button>
-      <span v-if="usage" class="log-panel__usage" :title="t('log.usageTitle')">{{ t('log.usage', { m: usage.mem_gb.toFixed(2), d: usage.disk_gb.toFixed(2) }) }}</span>
+      <span v-if="usage" class="log-panel__usage">
+        {{ t('log.usage', { m: usage.mem_gb.toFixed(2), d: usage.disk_gb.toFixed(2) }) }}
+        <span class="log-panel__usage-tip">{{ t('log.usageTitle') }}</span>
+      </span>
     </div>
     <!-- 任务过滤 chips：在日志框上方（用户反馈：不能嵌在日志框里面） -->
     <div v-if="taskChips.length" class="log-filter">
@@ -140,9 +143,24 @@ async function copyLog() {
 .log-panel__title { font-size: 12px; font-weight: 600; color: var(--text); }
 .log-panel__count { font-size: 11px; color: var(--text-muted); }
 .log-panel__usage {
+  position: relative; cursor: default;
   font-size: 11px; color: var(--text-secondary); background: var(--bg-panel);
   border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 1px 8px;
   white-space: nowrap; margin-left: auto;
+}
+/* 悬浮说明：自定义卡片提示（替代浏览器原生黑底 title，与整体 UI 风格一致） */
+.log-panel__usage-tip {
+  position: absolute; right: 0; top: calc(100% + 8px); z-index: 700;
+  background: rgba(255, 255, 255, 0.98); color: var(--text-secondary);
+  border: 1px solid var(--border); border-radius: 8px;
+  box-shadow: var(--shadow); padding: 6px 10px; font-size: 12px;
+  white-space: nowrap; opacity: 0; visibility: hidden;
+  transform: translateY(-2px);
+  transition: opacity 0.15s, transform 0.15s, visibility 0.15s;
+  pointer-events: none;
+}
+.log-panel__usage:hover .log-panel__usage-tip {
+  opacity: 1; visibility: visible; transform: translateY(0);
 }
 .log-panel__clear {
   border: 1px solid var(--border-strong); background: var(--bg-panel);

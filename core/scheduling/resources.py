@@ -11,6 +11,10 @@ MIB = 1024 ** 2
 GIB = 1024 ** 3
 
 
+def _gib(n) -> str:
+    return f"{int(n) / GIB:.2f}"
+
+
 def _read(path):
     try:
         return Path(path).read_text().strip()
@@ -243,8 +247,16 @@ class ResourceLedger:
             return False, "等待全局连接额度"
         if p["over_reserved"] or p["memory_pressure"]:
             return False, "实测内存超过预留或总压力过高，停止新派发和预取"
+        if claim.memory > b.memory:
+            # 静态不可满足：预估需求本身就超过部署预算上限，与当前空闲无关——
+            # 等待/重试都不会通过，必须显式失败并给出处置建议
+            return False, (f"预估内存 {_gib(claim.memory)} GiB 超过应用内存预算 "
+                           f"{_gib(b.memory)} GiB（部署上限问题，与当前空闲无关，"
+                           f"重试不会通过）；请提高部署内存上限（如 Docker 内存设置）"
+                           f"或降低模型规模后重试")
         if p["resident"] + p["reserved_active"] + claim.memory > b.memory:
-            return False, f"内存不足，需要 {claim.memory} 字节，应用预算 {b.memory} 字节"
+            return False, f"内存暂时不足：需要 {_gib(claim.memory)} GiB 余量，" \
+                           f"当前已占 {_gib(p['resident'] + p['reserved_active'])} GiB"
         if p["available"] - p["future_growth"] < claim.memory:
             return False, "当前容器或共享主机可用内存不足"
         remaining = sum(max(0, c.disk - self.written.get(a, 0)) for a, c in self.claims.items())
@@ -257,6 +269,14 @@ class ResourceLedger:
         if not ok:
             raise RuntimeError(reason)
         self.claims[attempt] = claim
+
+    def static_block(self, claim) -> bool:
+        """预估需求本身就超过部署预算上限（静态不可满足）。
+
+        区别于临时资源压力：等待/重试永远无法满足，调度器应直接判失败。
+        """
+        return (claim.kind in ("compute", "download")
+                and claim.memory > self.budget.memory)
 
     def release(self, attempt):
         self.claims.pop(attempt, None)

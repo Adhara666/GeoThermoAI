@@ -186,13 +186,16 @@ _STREAM_MAX_CHARS = 3000  # 单条流式文本硬上限（正文与思考共用�
 # 模型异常复读（含数字/标点微变的“变体复读”）难以 100% 识别，
 # 硬上限是最可靠的刷屏兜底（正常结论类回答远短于此）。
 
+# 内存归还节流：读数前每隔一段时间把空闲堆交还系统（见 get_sys_usage）
+_LAST_TRIM = [0.0]
+
 # 调度节点中文名（与前端 NODE_LABELS 保持同一套措辞，供问答上下文注入）
 _NODE_LABELS = {
     "search_scene": "检索场景候选", "select_scene": "配对选择或场景确定",
     "acquire_asset": "网络资产获取", "prepare_local": "本地定标对齐准备",
     "data_check": "原始包数据检查", "preprocess_split": "预处理与空间划分",
     "prep_check": "预处理数据检查", "ttri": "TTRI 拟合与应用",
-    "ttri_check": "TTRI 数据检查", "rf_round": "RF 轮训练与测试预测",
+    "ttri_check": "TTRI 数据检查", "rf_round": "RF 模型训练与测试预测",
     "train_decision": "训练决定", "promote_best": "登记最佳模型引用",
     "tcr": "TCR 与最终温度", "export": "导出 GeoTIFF",
     "closure_eval": "闭合评价", "gapfill": "独立填洞产品",
@@ -736,6 +739,28 @@ class AppBackend:
         except Exception:
             return ""
 
+    def _run_region_display(self, run_id: str) -> str:
+        """该运行使用的研究区显示名（完成报告用；来自任务槽位冻结值）。"""
+        if not run_id:
+            return ""
+        try:
+            row = self._get_state_store().read(lambda c: c.execute(
+                "SELECT slots FROM tasks WHERE current_run_id = ?",
+                (run_id,)).fetchone())
+            if not row:
+                return ""
+            slots = row[0]
+            if isinstance(slots, str):
+                slots = json.loads(slots or "{}")
+            reg = ((slots or {}).get("fields") or {}).get("region") or {}
+            detail = reg.get("detail") or {}
+            val = reg.get("value")
+            if isinstance(val, dict):
+                val = val.get("display") or val.get("value")
+            return str(detail.get("display") or val or "")
+        except Exception:
+            return ""
+
     def _compose_completion_report(self, uid: str, label: str, run_id: str) -> str:
         """组装完成报告正文：任务名 + 影像配对 + 测试区精度 + 与 30m 对照 +
         正式产物数 + 结果解读段；不使用 emoji 图标。"""
@@ -744,6 +769,11 @@ class AppBackend:
             return ""
         lang = self._user_lang(uid)
         lines = [f"任务完成：{label}" if lang == "zh" else f"Task completed: {label}"]
+        # 使用的研区（任务创建时冻结，来自任务槽位；旧任务可能缺此值）
+        region = self._run_region_display(run_id)
+        if region:
+            lines.append(f"- 使用研究区：{region}" if lang == "zh"
+                         else f"- Study area: {region}")
         # 使用的影像配对（哪天、哪颗 Landsat、Sentinel-2、云量与时差）
         pair = self._selected_pair_for_task(run_id, lang)
         if pair:
@@ -1039,12 +1069,15 @@ class AppBackend:
         paths = sorted(study_dir.glob("*.geojson"),
                        key=lambda p: p.stat().st_mtime, reverse=True) \
             if study_dir.exists() else []
+        active_paths = [study_dir / n for n in self.get_active_study_areas()
+                        if (study_dir / n).is_file()]
         return conv_pk, understanding.build_resolve_context(
             message=message,
             received_at=datetime.now(timezone.utc),
             tz_offset=tz_offset,
             chat_mode=chat_mode,
             study_area_paths=paths,
+            active_study_area_paths=active_paths,
             ledger=ledger,
         )
 
@@ -1060,12 +1093,42 @@ class AppBackend:
         agent = understanding.CandidateUnderstander(
             self._assistant_for(), on_log=on_log)
         with self._scheduler.model_request():
-            return understanding.handle_message(
+            result = understanding.handle_message(
                 store, agent,
                 user_id=self._uid(), project_id=pid, conversation_id=conv_pk,
                 message=message, ctx=ctx, command_id=command_id,
                 message_id=message_id, history=prior_messages or [],
             )
+        self._auto_activate_bound_regions(result)
+        return result
+
+    def _auto_activate_bound_regions(self, result) -> None:
+        """绑定到真实文件的研究区自动并入启用集（指定未启用 → 自动启用）。
+
+        只处理本次理解产出的任务槽位；文件必须存在。失败仅告警，不影响主流程。
+        """
+        try:
+            names = set()
+            for tk in (getattr(result, "tasks", None) or []):
+                slots = tk.get("slots") if isinstance(tk, dict) else None
+                if isinstance(slots, str):
+                    try:
+                        slots = json.loads(slots)
+                    except Exception:
+                        slots = {}
+                fields = (slots or {}).get("fields") or {}
+                detail = ((fields.get("region") or {}).get("detail") or {})
+                p = str(detail.get("path") or "")
+                if p and Path(p).is_file():
+                    names.add(Path(p).name)
+            if not names:
+                return
+            act = self.get_active_study_areas()
+            add = sorted(n for n in names if n not in act)
+            if add:
+                self.set_active_study_areas(act + add)
+        except Exception as e:  # noqa: BLE001
+            logging.warning(f"[study-area] 自动启用失败: {e}")
 
     def _selected_pair_for_task(self, run_id: str, lang: str = "zh") -> str:
         """已选定配对的摘要（select_scene 的 selection.json）；无则空串。
@@ -1584,6 +1647,7 @@ class AppBackend:
                 continue
             p2_name = path.name
             bounds = None
+            nz = None
             try:
                 import rasterio
                 from rasterio.warp import transform_bounds
@@ -1594,12 +1658,14 @@ class AppBackend:
                                              b.left, b.bottom, b.right, b.top,
                                              densify_pts=8)
                     bounds = [b[0], b[1], b[2], b[3]]
+                    nz = LayerVisualizer._native_zoom(src)
             except Exception:  # noqa: BLE001
                 continue
             inputs.append({"key": key, "style_id": style,
                            "label": (f"{label}（{_date_from_name(p2_name)}）"
                                      if _date_from_name(p2_name) else label),
                            "group": "acquire",
+                           "max_native_zoom": nz,
                            "bounds": bounds})
         return {"ok": True, "inputs": inputs}
 
@@ -1845,6 +1911,24 @@ class AppBackend:
         return ("答案已接收，任务从对应节点继续。"
                 if self._user_lang(self._uid()) == "zh" else
                 "Answer received; the task will continue from the corresponding node.")
+
+    def conversation_exec_mode(self, cid: str) -> str:
+        """对话执行模式存档读取（与软件内状态同源）：内存态 → 对话文件 → 空串。
+
+        前端切对话时据此恢复该对话自己的模式，避免全局值串对话。
+        """
+        if not cid:
+            return ""
+        mode = str(self._get_conv_state(cid).get("exec_mode") or "")
+        if not mode:
+            path = self._conv_dir() / f"{cid}.json"
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+                mode = str(data.get("exec_mode") or "")
+            except Exception:  # noqa: BLE001 — 文件缺失/损坏按无存档处理
+                mode = ""
+        from core.agent.orchestrator.exec_mode import normalize as _normalize
+        return _normalize(mode) if mode else ""
 
     def set_exec_mode(self, pid: str, cid: str, mode: str) -> dict:
         """切换交互模式（立即生效，不改变已编译运行的任何科学参数）。
@@ -2482,10 +2566,28 @@ class AppBackend:
         每个对话使用 {项目根}/convs/{对话id} 作为自己的 project_dir，
         所有影像/产物/清单都写在该子目录内，对话之间不共享文件、可并行执行。
         项目根未设置时返回空串（沿用旧行为：先设置项目目录才能执行）。
+
+        软件目录保护：项目名为历史相对名（如“测试阶段6”）时会拼到仓库
+        挂载点 /app 下，曾在软件目录里生成会话文件夹与符号链接视图；
+        运行数据只允许落在数据卷（/app/data）等其他位置，命中软件目录时
+        直接返回空串（不创建、不桥接）。
         """
         root = (project_root or "").strip()
         if not root:
             return ""
+        try:
+            base = Path(root)
+            resolved = (base if base.is_absolute()
+                        else Path("/app") / base).resolve()
+            app_root = Path("/app")
+            data_root = Path("/app/data").resolve()
+            inside_app = resolved == app_root or app_root in resolved.parents
+            inside_data = (resolved == data_root
+                           or data_root in resolved.parents)
+            if inside_app and not inside_data:
+                return ""
+        except Exception:  # noqa: BLE001 — 路径探测失败不阻断（按原行为）
+            pass
         conv_dir = os.path.join(root, "convs", conv_id).replace("\\", "/")
         try:
             os.makedirs(conv_dir, exist_ok=True)
@@ -2929,37 +3031,119 @@ class AppBackend:
         files = sorted(self._study_dir().glob("*.geojson"), key=lambda p: p.stat().st_mtime, reverse=True)
         return [f.name for f in files]
 
-    # 当前研究区：以 study_areas 目录下的隐藏标记文件持久化（多用户目录天然隔离，
-    # core/agent 层的 _find_study_area_file 直接读取该标记，无需跨层传递 settings）
+    # 启用集（多选）：以 study_areas 目录下的隐藏标记文件持久化（多用户目录天然隔离）。
+    # 旧版单选 .current.txt 自动迁移为单元素启用集；.current.txt 同步维护
+    # （仅当启用集恰好一个时写入）供旧链路读取过渡。
+    def _active_study_areas_path(self) -> Path:
+        return self._study_dir() / ".active.json"
+
     def _current_study_area_path(self) -> Path:
         return self._study_dir() / ".current.txt"
 
-    def get_current_study_area(self) -> str:
-        """返回当前选中的研究区文件名；未设置或文件已被删除时返回空串"""
-        p = self._current_study_area_path()
+    def get_active_study_areas(self) -> list:
+        """启用的研究区文件名列表（保持启用顺序；已失效的文件自动剔除）。"""
+        d = self._study_dir()
+        names: list = []
+        p = self._active_study_areas_path()
         if p.exists():
-            # basename 归一：防标记文件被篡改为绝对路径后逃逸到目录外探测
-            name = os.path.basename((p.read_text(encoding="utf-8") or "").strip())
-            if name and (self._study_dir() / name).is_file():
-                return name
-        return ""
+            try:
+                raw = json.loads(p.read_text(encoding="utf-8") or "[]")
+                names = [os.path.basename(str(x))
+                         for x in raw if str(x or "").strip()]
+            except Exception:
+                names = []
+        if not names:
+            # 兼容迁移：旧单选标记视为单元素启用集
+            cur = ""
+            cp = self._current_study_area_path()
+            if cp.exists():
+                cur = os.path.basename((cp.read_text(encoding="utf-8") or "").strip())
+            names = [cur] if cur else []
+        return [n for n in names if (d / n).is_file()]
+
+    def set_active_study_areas(self, names: list) -> dict:
+        """整体设置启用集；所有名字必须对应真实文件，否则整体拒绝。"""
+        d = self._study_dir()
+        clean: list = []
+        seen = set()
+        for x in names or []:
+            n = os.path.basename(str(x or "").strip())
+            if not n or n in seen:
+                continue
+            if not (d / n).is_file():
+                return {"ok": False, "message": f"研究区文件不存在：{n}"}
+            seen.add(n)
+            clean.append(n)
+        self._active_study_areas_path().write_text(
+            json.dumps(clean, ensure_ascii=False), encoding="utf-8")
+        # 旧链路兼容标记：仅单元素时写 .current.txt，否则清掉避免误用
+        cp = self._current_study_area_path()
+        try:
+            if len(clean) == 1:
+                cp.write_text(clean[0], encoding="utf-8")
+            elif cp.exists():
+                cp.unlink()
+        except OSError:
+            pass
+        return {"ok": True, "message": "已更新启用的研究区", "active": clean}
+
+    def get_current_study_area(self) -> str:
+        """兼容旧接口：启用集恰好一个时返回它，否则空串。"""
+        act = self.get_active_study_areas()
+        return act[0] if len(act) == 1 else ""
 
     def set_current_study_area(self, name: str) -> bool:
-        """设置当前研究区；文件不存在返回 False"""
-        name = os.path.basename((name or "").strip())
-        if not name or not (self._study_dir() / name).is_file():
-            return False
-        self._current_study_area_path().write_text(name, encoding="utf-8")
-        return True
+        """兼容旧接口：单选语义 = 仅启用这一个。"""
+        r = self.set_active_study_areas([name])
+        return bool(r.get("ok"))
+
+    def study_area_outlines(self, names: list) -> list:
+        """读取指定研究区的 GeoJSON 内容（地图矢量叠显用；默认取启用集）。"""
+        d = self._study_dir()
+        target = names or self.get_active_study_areas()
+        out: list = []
+        for n in target:
+            f = d / os.path.basename(str(n))
+            if not f.is_file():
+                continue
+            try:
+                out.append({"name": f.stem, "file": f.name,
+                            "geojson": json.loads(f.read_text(encoding="utf-8"))})
+            except Exception:
+                continue
+        return out
+
+    def _task_region_refs(self, name: str) -> list:
+        """引用该研究区的未结束任务（删除保护用；按槽位记录匹配文件名）。"""
+        stem = os.path.splitext(name)[0]
+        store = self._get_state_store()
+
+        def _read(conn):
+            rows_ = conn.execute(
+                "SELECT id, label, summary_status FROM tasks"
+                " WHERE user_id=? AND summary_status NOT IN"
+                " ('completed','failed','cancelled') AND slots LIKE ?",
+                (self._uid(), f"%{stem}%")).fetchall()
+            return [{"id": r[0], "label": r[1], "status": r[2]} for r in rows_]
+        try:
+            return store.read(_read)
+        except Exception:
+            return []
 
     def delete_study_area(self, name: str) -> str:
-        """删除研究区文件（geojson 及同名配套 shp/dbf/shx/prj）；返回结果消息"""
+        """删除研究区文件（geojson 及同名配套 shp/dbf/shx/prj）；返回结果消息。
+        被未结束任务引用时拒绝删除（P3 删除保护）。"""
         name = os.path.basename((name or "").strip())
         if not name:
             return "未指定研究区文件名"
         gj = self._study_dir() / name
         if not gj.is_file():
             return f"研究区文件不存在：{name}"
+        refs = self._task_region_refs(name)
+        if refs:
+            labels = "、".join((r["label"] or r["id"])[:40] for r in refs[:3])
+            return (f"「{name}」正在被未结束的任务使用：{labels}"
+                    f"{'等' if len(refs) > 3 else ''}。请等任务结束或取消后再删除。")
         stem = os.path.splitext(name)[0]
         removed = 0
         for ext in (".geojson", ".shp", ".dbf", ".shx", ".prj"):
@@ -2970,12 +3154,10 @@ class AppBackend:
                     removed += 1
                 except OSError:
                     pass
-        # 删除的是当前选中项 → 清空 current 标记
-        if self.get_current_study_area() == name:
-            try:
-                self._current_study_area_path().unlink()
-            except OSError:
-                pass
+        # 从启用集移除（set_active 会同步 .current.txt 兼容标记）
+        act = self.get_active_study_areas()
+        if name in act:
+            self.set_active_study_areas([x for x in act if x != name])
         return f"已删除 {name}" if removed else f"删除失败：{name}"
 
     # ── 工作流 / 精度 ──────────────────────────────────────────
@@ -3190,7 +3372,8 @@ class AppBackend:
     def get_sys_usage(self) -> dict:
         """本软件的实时资源占用（GB，不含百分比）——整个软件口径：
 
-        内存：整个容器（cgroup 全部进程：服务 + 计算子进程）当前占用；
+        内存：整个容器的实际工作集（总占用 − 可回收页面缓存 inactive_file），
+        下载/读取过的大文件会进内核页缓存，计入总占用会让读数虚高且不回落；
         容器外环境回退“本进程 + 子进程”RSS 求和；再回退本进程。
         磁盘：软件数据根（/app/data：台账/执行缓存/所有用户数据）总大小，
         多个候选根去重；统计较慢，15 秒内缓存复用。
@@ -3200,16 +3383,44 @@ class AppBackend:
         if cached and now - cached["ts"] < 15:
             return cached["data"]
 
+        # 读数前低频归还空闲堆：瓦片渲染/统计等大分配后的高水位 RSS 会长期
+        # 留存（glibc arena 不主动归还）；距上次修剪超过 60 秒且 RSS 偏大
+        # 时执行一次，使面板读数自动回落（删除对话只动磁盘，不影响这里）
+        try:
+            if now - _LAST_TRIM[0] > 60:
+                _LAST_TRIM[0] = now
+                import psutil
+                if psutil.Process().memory_info().rss > 512 * 1024 * 1024:
+                    _memtrim_release()
+        except Exception:  # noqa: BLE001 — 修剪失败不影响读数
+            pass
+
         mem_gb = 0.0
-        # 1) cgroup 内存（容器内即整个软件的所有进程）
-        for path in ("/sys/fs/cgroup/memory.current",
-                     "/sys/fs/cgroup/memory/memory.usage_in_bytes"):
+        # 1) cgroup 工作集（容器内即整个软件的进程内存；剔除可回收页缓存）
+        for cur_p, stat_p in (
+                ("/sys/fs/cgroup/memory.current",
+                 "/sys/fs/cgroup/memory.stat"),
+                ("/sys/fs/cgroup/memory/memory.usage_in_bytes",
+                 "/sys/fs/cgroup/memory/memory.stat")):
             try:
-                with open(path, "r", encoding="utf-8") as f:
-                    mem_gb = float(f.read().strip()) / (1024.0 ** 3)
-                break
+                with open(cur_p, "r", encoding="utf-8") as f:
+                    used = float(f.read().strip())
             except Exception:
-                mem_gb = 0.0
+                continue
+            inactive = 0.0
+            try:
+                stats = {}
+                with open(stat_p, "r", encoding="utf-8") as f:
+                    for line in f:
+                        parts = line.split()
+                        if len(parts) == 2:
+                            stats[parts[0]] = float(parts[1])
+                inactive = stats.get("inactive_file",
+                                     stats.get("total_inactive_file", 0.0))
+            except Exception:
+                inactive = 0.0
+            mem_gb = max(0.0, used - max(0.0, inactive)) / (1024.0 ** 3)
+            break
         # 2) 回退：本进程 + 全部子进程 RSS 求和
         if mem_gb <= 0:
             try:
@@ -3737,6 +3948,7 @@ class AppBackend:
                         "workflow_status": conv_state["workflow_progress"],
                         "config": self._load_settings(),
                         "study_areas": self.list_study_areas(),  # 已上传研究区文件名
+                        "active_study_areas": self.get_active_study_areas(),  # 启用集（面板勾选）
                         "mode_hint": (
                             "当前为只读 Chat 模式：你不能执行任何降尺度工作流、"
                             "不能下载/生成/修改任何文件，只能基于已有资料回答用户问题。\n"
@@ -3766,6 +3978,7 @@ class AppBackend:
                             "workflow_status": conv_state["workflow_progress"],
                             "config": self._load_settings(),
                             "study_areas": self.list_study_areas(),
+                            "active_study_areas": self.get_active_study_areas(),
                         }
                         # 注入台账进展（多角色应知道流程状态）：任务进度/
                         # 当前节点/等待与失败原因 + 已选配对 + 待答问题
@@ -4368,6 +4581,7 @@ def bootstrap():
         "projects": tree,
         "settings": backend.get_settings(),
         "study_areas": backend.list_study_areas(),
+        "active_study_areas": backend.get_active_study_areas(),
         "current_study_area": backend.get_current_study_area(),
     }
 
@@ -4473,24 +4687,51 @@ async def upload_study_area(files: List[UploadFile] = File(...)):
         level, vmsg = backend.validate_study_area(str(path))
         validations.append({"name": disp, "level": level, "message": vmsg})
     return {"ok": True, "message": "\n".join(results),
-            "study_areas": backend.list_study_areas(), "validations": validations}
+            "study_areas": backend.list_study_areas(),
+            "active": backend.get_active_study_areas(),
+            "validations": validations}
 
 
 @app.get("/api/study-areas")
 def study_areas():
-    return {"study_areas": backend.list_study_areas(), "current": backend.get_current_study_area()}
+    return {"study_areas": backend.list_study_areas(),
+            "current": backend.get_current_study_area(),
+            "active": backend.get_active_study_areas()}
+
+
+@app.post("/api/study-area/active")
+def set_study_area_active(payload: dict):
+    """多选启用集：names 为研究区文件名数组（空数组 = 全部停用）。"""
+    names = payload.get("names")
+    if not isinstance(names, list):
+        raise HTTPException(status_code=400, detail="names 必须是文件名数组")
+    r = backend.set_active_study_areas(names)
+    if not r.get("ok"):
+        raise HTTPException(status_code=400, detail=r.get("message") or "设置失败")
+    return {"ok": True, "message": r.get("message"),
+            "active": r.get("active") or [],
+            "current": backend.get_current_study_area(),
+            "study_areas": backend.list_study_areas()}
+
+
+@app.get("/api/study-areas/outlines")
+def study_area_outlines(names: str = ""):
+    """研究区矢量轮廓（地图叠显）；names 逗号分隔，缺省取启用集。"""
+    wanted = [x for x in (names or "").split(",") if x.strip()]
+    return {"ok": True, "areas": backend.study_area_outlines(wanted)}
 
 
 @app.post("/api/study-area/current")
 def set_study_area_current(payload: dict):
-    """切换当前研究区：写入 .current.txt 标记，Agent 执行时优先使用该文件"""
+    """兼容旧接口：单选语义 = 仅启用这一个。"""
     name = payload.get("name") or ""
     if not backend.set_current_study_area(name):
         raise HTTPException(status_code=400, detail="研究区文件不存在")
     return {
         "ok": True,
-        "message": f"已切换当前研究区为 {name}",
+        "message": f"已启用研究区 {name}",
         "current": name,
+        "active": backend.get_active_study_areas(),
         "study_areas": backend.list_study_areas(),
     }
 
@@ -4498,10 +4739,13 @@ def set_study_area_current(payload: dict):
 @app.delete("/api/study-area")
 def delete_study_area(name: str = ""):
     message = backend.delete_study_area(name)
+    # 被未结束任务引用时后端拒绝删除（消息以「文件名」开头）
+    blocked = message.startswith("「")
     return {
-        "ok": True,
+        "ok": not blocked,
         "message": message,
         "current": backend.get_current_study_area(),
+        "active": backend.get_active_study_areas(),
         "study_areas": backend.list_study_areas(),
     }
 
@@ -4601,6 +4845,12 @@ def set_exec_mode(payload: dict):
         str(payload.get("project") or ""),
         str(payload.get("conv") or ""),
         str(payload.get("exec_mode") or ""))
+
+
+@app.get("/api/exec-mode")
+def get_exec_mode(conv: str = ""):
+    """读取对话自己的执行模式存档（前端切对话时恢复用）。"""
+    return {"exec_mode": backend.conversation_exec_mode(conv)}
 
 
 # ── API：聊天 SSE ──────────────────────────────────────────────

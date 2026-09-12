@@ -24,3 +24,5 @@ frontend/node_modules/
 # 本地部署用前端产物镜像（容器静态托管用；镜像内由 Dockerfile
 # 从 frontend/dist 自动生成，.dockerignore 已同款排除，不入库）
 /dist/
+# 云端密钥目录（如后续放入 GEE 等私钥，永远不入库）
+config/gee_keys/

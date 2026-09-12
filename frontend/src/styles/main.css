@@ -557,7 +557,8 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
 .panel-body { flex: 1; overflow-y: auto; padding: 14px; }
 .panel-body--map { padding: 0; display: flex; flex-direction: column; }
 .map-frame { flex: 1; border: none; width: 100%; min-height: 480px; }
-.map-toolbar { display: flex; gap: 8px; padding: 10px; border-bottom: 1px solid var(--border); align-items: center; }
+/* 地图工具栏/任务选择器样式统一在 MapView.vue 作用域内定义
+   （避免全局与作用域双份定义、优先级不一致导致改动不生效） */
 .layer-list { padding: 10px 14px; }
 .layer-item { display: flex; align-items: center; gap: 6px; padding: 4px 0; font-size: 13px; }
 .layer-item .dot { width: 8px; height: 8px; border-radius: 50%; }
@@ -679,4 +680,3 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
   border-color: var(--primary, #2563eb);
   box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.18);
 }
-.map-result-select { margin-bottom: 8px; }

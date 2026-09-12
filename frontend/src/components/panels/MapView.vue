@@ -28,6 +28,53 @@ const BASE_DEFS = computed(() => [
 let map = null
 let baseLayer = null
 const overlayMap = {} // id -> L.TileLayer
+let outlineLayer = null // 研究区矢量轮廓图层（启用集叠显 + 选中任务高亮）
+
+// 选中任务绑定的研究区名（任务卡快照字段 region）；无选中/无值返回空串
+function selectedTaskRegion() {
+  const tid = chat.activeTaskId
+  if (!tid) return ''
+  const tk = chat.kernelTasks ? chat.kernelTasks[tid] : null
+  return (tk && tk.region) || ''
+}
+
+// 研究区轮廓：启用集全部叠显（蓝色虚线）；选中任务的区高亮（橙色实线加粗）
+async function refreshOutlines() {
+  if (!map) return
+  let areas = []
+  try {
+    const r = await api.get('/api/study-areas/outlines')
+    areas = r.areas || []
+  } catch (_) {
+    return // 拉取失败保留现有轮廓，避免闪空
+  }
+  if (outlineLayer) { map.removeLayer(outlineLayer); outlineLayer = null }
+  if (!areas.length) return
+  if (!map.getPane('studyOutlinePane')) {
+    // 独立 pane 且 zIndex 高于栅格图层（500），保证轮廓不被瓦片盖住
+    const pane = map.createPane('studyOutlinePane')
+    pane.style.zIndex = 550
+  }
+  const sel = selectedTaskRegion()
+  outlineLayer = L.layerGroup()
+  for (const a of areas) {
+    const isSel = !!sel && a.name === sel
+    const gj = L.geoJSON(a.geojson, {
+      pane: 'studyOutlinePane',
+      interactive: false,
+      style: {
+        color: isSel ? '#e8590c' : '#1a73e8',
+        weight: isSel ? 4 : 2,
+        opacity: 0.95,
+        fillColor: isSel ? '#ffa94d' : '#4dabf7',
+        fillOpacity: isSel ? 0.16 : 0.05,
+        dashArray: isSel ? null : '5,4',
+      },
+    })
+    outlineLayer.addLayer(gj)
+  }
+  outlineLayer.addTo(map)
+}
 
 function tileUrl(l, ts) {
   // 瓦片由 <img> 加载，无法携带 Header，鉴权 token 走查询参数
@@ -72,6 +119,7 @@ function initMap() {
   map.on('click', onMapClick)
   setBase(currentBase.value)
   refresh()
+  refreshOutlines()
 }
 
 function removeOverlays() {
@@ -93,7 +141,7 @@ async function refresh() {
     return
   }
   taskEmptyHint.value = ""
-  if (!conv.value) { removeOverlays(); layers.value = []; return }
+  if (!conv.value) { removeOverlays(); layers.value = []; refreshOutlines(); return }
   let list
   try {
     const r = await api.get(`/api/layers?conv=${encodeURIComponent(conv.value)}`)
@@ -139,6 +187,7 @@ async function refresh() {
       map.fitBounds([[l.bounds[0][0], l.bounds[0][1]], [l.bounds[1][0], l.bounds[1][1]]])
     }
   }
+  await refreshOutlines()
 }
 
 /** 选中任务：原始输入层（恢复升级前的 10m S2 等原生图层）+ 产物层；
@@ -162,6 +211,8 @@ async function refreshFromTask(tid, seq) {
         opacityPct: it.key === 'sentinel2_path' ? 80 : 70,
         // 30m LST 输入层参与“显示温度”（按样式的 DN→K 换算采样）
         is_lst: it.key === 'landsat_path',
+        // 10m 层按服务端给出的原生缩放显示（避免超出后模糊）；缺省 14
+        max_native_zoom: it.max_native_zoom || 14,
         bounds: [[it.bounds[1], it.bounds[0]], [it.bounds[3], it.bounds[2]]],
       })
     }
@@ -193,6 +244,7 @@ async function refreshFromTask(tid, seq) {
       opacityPct: 70,
       // LST 产物层参与“显示温度”（lst_10m / lst_10m_filled）
       is_lst: meta.style === 'lst_10m' || meta.style === 'lst_10m_filled',
+      max_native_zoom: meta.max_native_zoom || 14,
       bounds: [[meta.bounds[1], meta.bounds[0]], [meta.bounds[3], meta.bounds[2]]],
     })
   }
@@ -203,7 +255,7 @@ async function refreshFromTask(tid, seq) {
     const overlay = L.tileLayer(tileUrl(l, ts), {
       opacity: l.opacity, zIndex: 500,
       bounds: [[l.bounds[0][0], l.bounds[0][1]], [l.bounds[1][0], l.bounds[1][1]]],
-      minZoom: 0, maxNativeZoom: 14, maxZoom: 20,
+      minZoom: 0, maxNativeZoom: l.max_native_zoom || 14, maxZoom: 20,
       noWrap: true, tileSize: 256, keepBuffer: 2, updateWhenIdle: false,
     })
     overlayMap[l.id] = overlay
@@ -213,6 +265,7 @@ async function refreshFromTask(tid, seq) {
       map.fitBounds([[l.bounds[0][0], l.bounds[0][1]], [l.bounds[1][0], l.bounds[1][1]]])
     }
   }
+  await refreshOutlines()
 }
 
 function onToggle(l) {
@@ -387,8 +440,10 @@ watch(projectDir, async () => {
   if (map) { map.invalidateSize(); refresh() }
 })
 
-// 选中任务变化（面板联动中枢）：地图切换到该任务的产物图层
+// 选中任务变化（面板联动中枢）：地图切换到该任务的产物图层 + 研究区高亮
 watch(() => chat.activeTaskId, () => { if (map) refresh() })
+// 启用集变化：刷新研究区轮廓叠显
+watch(() => (project.activeStudyAreas || []).join(','), () => refreshOutlines())
 
 // 图层勾选/透明度变化时刷新温度采样（勾选新图层 → 立即补查该点温度）
 watch(
@@ -425,7 +480,7 @@ const groups = computed(() => {
 <template>
   <div class="map-frame-wrap">
     <TaskResultSelect class="map-result-select" />
-    <p v-if="taskEmptyHint" class="form-hint" style="margin:-4px 0 8px">
+    <p v-if="taskEmptyHint" class="form-hint map-empty-hint">
       {{ taskEmptyHint }}
     </p>
     <div class="map-toolbar">
@@ -514,7 +569,22 @@ const groups = computed(() => {
 <style scoped>
 .map-frame-wrap { flex: 1; min-height: 0; display: flex; flex-direction: column; }
 
-.map-toolbar { display: flex; gap: 8px; padding: 10px; border-bottom: 1px solid var(--border); align-items: center; flex-wrap: wrap; }
+/* 任务选择框间距/宽度/对齐：需带更高优先级前缀覆盖子组件作用域样式
+   （.task-select{margin-bottom:10px}）；上边距与下方工具栏同取 14px */
+.map-frame-wrap .map-result-select { margin: 14px 0 0 10px; width: min(560px, calc(100% - 20px)); }
+/* 空态提示（无影像时）：与选择框同起线（10px），上间距 6px，不再用负边距（否则压盖选择框） */
+.map-empty-hint { margin: 6px 10px 0; }
+/* 选择框内部（子组件元素）：:deep 穿透作用域，带元素级前缀确保确定性生效 */
+.map-frame-wrap :deep(.task-select__btn) { position: relative; }
+.map-frame-wrap :deep(.task-select__label) { text-align: center; }
+.map-frame-wrap :deep(.task-select__caret) {
+  position: absolute; right: 8px; top: 50%; transform: translateY(-50%);
+}
+.map-frame-wrap :deep(.task-select__caret--open) {
+  transform: translateY(-50%) rotate(180deg);
+}
+
+.map-toolbar { display: flex; gap: 8px; padding: 14px 10px; border-bottom: 1px solid var(--border); align-items: center; flex-wrap: wrap; }
 .base-switch { display: flex; gap: 2px; background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 2px; }
 .base-switch__item { border: none; background: none; font-size: 12px; color: var(--text-secondary); padding: 3px 8px; border-radius: 4px; white-space: nowrap; }
 .base-switch__item--active { background: var(--primary); color: #fff; }

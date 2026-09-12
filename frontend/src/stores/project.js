@@ -12,6 +12,7 @@ export const useProjectStore = defineStore('project', {
     projectDir: '',
     studyAreas: [],
     currentStudyArea: '',
+    activeStudyAreas: [], // 启用集（多选；后端 .active.json 持久化）
     lastValidation: [], // [{name, level: 'ok'|'warn'|'fail', message}] 最近一次上传的研究区验证结果
     loaded: false,
   }),
@@ -36,6 +37,7 @@ export const useProjectStore = defineStore('project', {
       this.tree = data.projects || []
       this.studyAreas = data.study_areas || []
       this.currentStudyArea = data.current_study_area || ''
+      this.activeStudyAreas = data.active_study_areas || []
       this.loaded = true
       // 默认选中第一个项目/对话
       if (!this.currentProject && this.tree.length) {
@@ -151,14 +153,18 @@ export const useProjectStore = defineStore('project', {
     async uploadStudyArea(fileList) {
       const toast = useToast()
       if (!fileList || !fileList.length) { toast.error(t('project.selectFile')); return }
+      const prev = this.studyAreas
       const r = await api.uploadStudyArea([...fileList])
       this.studyAreas = r.study_areas || []
       this.lastValidation = r.validations || []
-      // 首次上传后自动把最新文件设为当前研究区（保持原「取最新」行为）
-      if (this.studyAreas.length && !this.currentStudyArea) {
-        const rr = await api.setCurrentStudyArea(this.studyAreas[0])
-        if (rr.ok) this.currentStudyArea = rr.current || ''
+      this.activeStudyAreas = r.active || this.activeStudyAreas
+      // 新上传的文件自动并入启用集（保持「上传即可用」的原行为）
+      const added = this.studyAreas.filter(
+        (n) => !prev.includes(n) && !this.activeStudyAreas.includes(n))
+      if (added.length) {
+        await this.setActiveStudyAreas([...this.activeStudyAreas, ...added], { silent: true })
       }
+      this.syncCurrentAlias()
       // 验证结果只在研究区面板内展示（与「测试」页同款状态行），toast 仅给简洁摘要
       const bad = (r.validations || []).filter((v) => v.level !== 'ok')
       if (bad.length) {
@@ -171,10 +177,39 @@ export const useProjectStore = defineStore('project', {
     async setCurrentStudyArea(name) {
       const toast = useToast()
       if (!name) { toast.error(t('project.noArea')); return }
-      const r = await api.setCurrentStudyArea(name)
-      if (!r.ok) { toast.error(trServer(r.message)); return }
-      this.currentStudyArea = r.current || ''
-      toast.success(trServer(r.message))
+      // 兼容旧接口：单选语义 = 仅启用这一个
+      await this.setActiveStudyAreas([name])
+    },
+
+    syncCurrentAlias() {
+      // 旧字段兼容：启用集恰好一个时同步它，否则空串
+      this.currentStudyArea = this.activeStudyAreas.length === 1
+        ? this.activeStudyAreas[0] : ''
+    },
+
+    async setActiveStudyAreas(names, opts = {}) {
+      const toast = useToast()
+      try {
+        const r = await api.setActiveStudyAreas(names)
+        this.activeStudyAreas = r.active || []
+        this.syncCurrentAlias()
+        if (!opts.silent) toast.success(trServer(r.message))
+        return r
+      } catch (e) {
+        if (!opts.silent) toast.error((e && e.message) || t('sa.multiNote'))
+        return null
+      }
+    },
+
+    async toggleStudyArea(name) {
+      const next = this.activeStudyAreas.includes(name)
+        ? this.activeStudyAreas.filter((n) => n !== name)
+        : [...this.activeStudyAreas, name]
+      return this.setActiveStudyAreas(next)
+    },
+
+    async setOnlyStudyArea(name) {
+      return this.setActiveStudyAreas([name])
     },
 
     async deleteStudyArea(name) {
@@ -182,7 +217,8 @@ export const useProjectStore = defineStore('project', {
       const r = await api.deleteStudyArea(name)
       if (!r.ok) { toast.error(trServer(r.message)); return }
       this.studyAreas = r.study_areas || []
-      this.currentStudyArea = r.current || ''
+      this.activeStudyAreas = r.active || this.activeStudyAreas
+      this.syncCurrentAlias()
       toast.success(trServer(r.message))
     },
   },
