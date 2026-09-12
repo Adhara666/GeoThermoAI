@@ -296,17 +296,6 @@ def insert_versioned(
     return object_id
 
 
-def get_object(conn: sqlite3.Connection, table: str, object_id: str) -> Optional[Dict[str, Any]]:
-    """读取一行对象为字典（供测试与排查；业务读取走各自的查询函数）。"""
-    if table not in VERSIONED_TABLES:
-        raise ValueError(f"表 {table} 不在版本化对象白名单内：{VERSIONED_TABLES}")
-    row = conn.execute(f"SELECT * FROM {table} WHERE id = ?", (object_id,)).fetchone()
-    if row is None:
-        return None
-    cols = [d[0] for d in conn.execute(f"SELECT * FROM {table} LIMIT 0").description]
-    return dict(zip(cols, row))
-
-
 def db_status(conn: sqlite3.Connection) -> Tuple[int, int]:
     """返回 (结构版本, 当前事件最大序号)，供台账巡检与验收使用。"""
     version = int(conn.execute("PRAGMA user_version").fetchone()[0])

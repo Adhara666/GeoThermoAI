@@ -1,10 +1,10 @@
 """
 可复用工作流经验
 
-`memory/projects/{project_id}/workflows.json`：一条记录 = 一次「靠谱」的完整流程。
+`memory/projects/{project_id}/workflows.json`：一条记录 = 一次质量达标的完整流程。
 规划 Agent 处理新任务时若检索到同区域的可复用工作流，会沿用其最终参数与云量阈值。
 
-写入条件（三个都满足才写，这是「靠谱」的定义）：
+写入条件（三个都满足才写入）：
 1. 整体状态为 success；
 2. 评估通过（报告由系统组装 + LLM 定性短句，始终完整，视为通过）；
 3. 测试集 R² ≥ WORKFLOW_MIN_R2（0.75，K24 的合格下限）。

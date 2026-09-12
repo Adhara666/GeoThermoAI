@@ -501,9 +501,9 @@ class DataAcquisitionSkill(BaseSkill):
             if is_monthly and not landsat_items and not sentinel2_items:
                 return SkillResult(
                     success=False,
-                    message=(f"该时间段内未搜索到任何影像（Landsat 0 景、Sentinel-2 0 景），"
-                             f"无法进行月度合成。请确认时间范围是否正确，"
-                             f"或尝试换一个月份。"),
+                    message=("该时间段内未搜索到任何影像（Landsat 0 景、Sentinel-2 0 景），"
+                             "无法进行月度合成。请确认时间范围是否正确，"
+                             "或尝试换一个月份。"),
                     data={"landsat_count": 0, "sentinel_count": 0,
                           "region": region, "start_date": start_date, "end_date": end_date,
                           "cloud_stats": _cloud_stats(landsat_items, sentinel2_items)},
@@ -1178,7 +1178,7 @@ class DataAcquisitionSkill(BaseSkill):
 
         返回每对含：每景详情（日期、L8/L9/S2、云量）+ 综合覆盖度
         """
-        from datetime import datetime, timedelta
+        from datetime import datetime
 
         def _warn(msg):
             if log_callback:
@@ -1484,7 +1484,7 @@ class DataAcquisitionSkill(BaseSkill):
             当 apply_s2_calibration=True 时，返回本次调用涉及的按景定标 provenance 列表；
             否则返回 None。
         """
-        from osgeo import gdal, osr
+        from osgeo import gdal
 
         if not items:
             msg = f"未找到任何 {band} 影像，无法继续后续流程"

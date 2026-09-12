@@ -279,7 +279,7 @@ class EvalAgent(RoleAgent):
         lines = [
             f"- 研究区：{self.bundle.get('region') or '未记录'}",
             self._data_time_line(),
-            f"- 产品分辨率：10m",
+            "- 产品分辨率：10m",
             f"- 有效像元数：{presentation.fmt_count(stats.get('total_valid'))} 个",
             f"- 影像尺寸：{presentation.fmt_count(size.get('height'))} 行 × "
             f"{presentation.fmt_count(size.get('width'))} 列",
@@ -362,7 +362,7 @@ class EvalAgent(RoleAgent):
     def _plan_has_gapfill(self, ctx: Any) -> bool:
         """当前执行计划是否已显式包含结果后处理步骤（lst_gapfill）。
 
-        用户要求「从头执行并包含结果后处理」时，规划 Agent 会在完整流程末尾带上
+        请求「从头执行并包含结果后处理」时，规划 Agent 会在完整流程末尾带上
         lst_gapfill 步骤——此时评估完成后由执行引擎直接执行该步骤，不再弹询问/提示。
         """
         plan = getattr(ctx, "plan", None)

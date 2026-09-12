@@ -132,11 +132,3 @@ def build_snapshot(task_row: Dict[str, Any],
         "execution": copy.deepcopy(settings.get("_execution") or {}),
         "taken_at": utcnow_iso(),
     }
-
-
-def param_value(snapshot: Dict[str, Any], key: str) -> Any:
-    """从快照取参数实际值（执行层唯一合法入口；缺键返回 None）。"""
-    entry = (snapshot.get("params") or {}).get(key)
-    if entry is None:
-        return None
-    return entry.get("value")

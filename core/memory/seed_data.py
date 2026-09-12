@@ -168,14 +168,3 @@ def seed_document() -> dict:
         "schema_version": SEED_SCHEMA_VERSION,
         "items": SEED_ITEMS,
     }
-
-
-def items_by_domain(domain: str) -> list:
-    return [item for item in SEED_ITEMS if item.get("domain") == domain]
-
-
-def item_by_id(kid: str) -> dict:
-    for item in SEED_ITEMS:
-        if item.get("id") == kid:
-            return item
-    return {}

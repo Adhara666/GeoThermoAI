@@ -32,7 +32,6 @@ from core.state_kernel.store import (
     insert_versioned,
     new_id,
     update_versioned,
-    utcnow_iso,
 )
 
 # 任务汇总状态（§3.5「任务汇总状态」推导表；阶段 2 只用到其中一部分，

@@ -257,7 +257,7 @@ class RoleHooks(StageHooks):
                                      message="已按你的要求停下，随时可以重新下达指令。")
 
         if option_id == Option.ACCEPT:
-            # 用户明确要求忽略检查未通过的提示，直接放行进入下一步
+            # 选择「忽略检查未通过提示」时，直接放行进入下一步
             message = "好的，已按你的确认继续执行后续步骤。"
             ctx.emit(message + "\n")
             return StepDecision.cont()

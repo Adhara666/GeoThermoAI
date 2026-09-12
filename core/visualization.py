@@ -418,7 +418,7 @@ class LayerVisualizer:
         elif kind == "range":
             result = (float(valid.min()), float(valid.max()))
         elif kind == "rgb":
-            # 真彩色专用拉伸（较 2/98 更亮，用户反馈 S2 RGB 偏暗）
+            # 真彩色专用拉伸（较 2/98 更亮，S2 RGB 默认偏暗）
             result = (float(np.percentile(valid, 1)), float(np.percentile(valid, 88)))
         else:
             result = (float(np.percentile(valid, 2)), float(np.percentile(valid, 98)))

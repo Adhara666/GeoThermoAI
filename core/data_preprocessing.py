@@ -31,7 +31,7 @@ import numpy as np
 import pandas as pd
 import rasterio
 from rasterio.enums import Resampling
-from rasterio.warp import calculate_default_transform, reproject
+from rasterio.warp import reproject
 
 from .atomic_io import write_verified
 from .geo_mask import rasterize_region as _rasterize_region
@@ -231,62 +231,6 @@ def _resample_and_align(
     return out_path
 
 
-def _reproject_to_crs_grid(
-    source_path: str,
-    out_path: str,
-    dst_crs: str,
-    resolution: float,
-    is_categorical: bool = False,
-) -> str:
-    """将栅格重投影到目标CRS和分辨率。"""
-    os.makedirs(os.path.dirname(out_path) if os.path.dirname(out_path) else ".", exist_ok=True)
-    resampling = Resampling.nearest if is_categorical else Resampling.bilinear
-
-    with rasterio.open(source_path) as src:
-        transform, width, height = calculate_default_transform(
-            src.crs, dst_crs, src.width, src.height, *src.bounds,
-            resolution=(resolution, resolution),
-        )
-        src_nodata = src.nodata
-
-        profile = src.profile.copy()
-        if is_categorical:
-            dst_nodata = profile.get("nodata", src_nodata)
-        else:
-            profile["dtype"] = "float32"
-            dst_nodata = np.nan
-
-        profile.update(
-            crs=dst_crs,
-            transform=transform,
-            width=width,
-            height=height,
-            count=src.count,
-            nodata=dst_nodata,
-        )
-
-        with rasterio.open(out_path, "w", **profile) as dst:
-            for band_idx in range(1, src.count + 1):
-                dtype = np.float32 if not is_categorical else src.dtypes[band_idx - 1]
-                dst_array = np.empty((height, width), dtype=dtype)
-                if dst_nodata is not None:
-                    dst_array.fill(dst_nodata)
-                reproject(
-                    source=rasterio.band(src, band_idx),
-                    destination=dst_array,
-                    src_transform=src.transform,
-                    src_crs=src.crs,
-                    src_nodata=src_nodata,
-                    dst_transform=transform,
-                    dst_crs=dst_crs,
-                    dst_nodata=dst_nodata,
-                    resampling=resampling,
-                )
-                dst.write(dst_array, band_idx)
-
-    return out_path
-
-
 # ======================================================================
 #  掩膜生成
 # ======================================================================
@@ -347,27 +291,6 @@ def _terrain_features(
     slope = np.degrees(np.arctan(np.sqrt(gx ** 2 + gy ** 2)))
     aspect = np.mod(np.degrees(np.arctan2(-gx, gy)) + 360.0, 360.0)
     return slope.astype(np.float32), aspect.astype(np.float32)
-
-
-# ======================================================================
-#  光谱指数计算
-# ======================================================================
-
-
-def _spectral_indices(
-    r: np.ndarray, g: np.ndarray, b: np.ndarray,
-    nir: np.ndarray, swir1: np.ndarray,
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """
-    计算光谱指数。
-
-    Returns:
-        tuple: (NDVI, NDWI, NDBI)
-    """
-    ndvi = (nir - r) / (nir + r + EPS)
-    ndwi = (g - nir) / (g + nir + EPS)
-    ndbi = (swir1 - nir) / (swir1 + nir + EPS)
-    return ndvi, ndwi, ndbi
 
 
 # ======================================================================

@@ -57,23 +57,6 @@ class Option:
     MONTHLY_MODE = "monthly_mode" # 影像获取：月度合成模式（该月影像合成一张）
 
 
-# AUTO（完全执行）模式下各节点的默认策略。
-# 值为 None 表示该节点在 AUTO 模式下**根本不暂停**（由规则自动决定）。
-AUTO_DEFAULT_STRATEGY: Dict[str, Optional[str]] = {
-    Node.PLAN_CONFIRM: Option.START,
-    Node.PAIR_SELECTION: None,        # 自动选质量得分最高的一组
-    Node.NO_PAIR: Option.REPLAN,      # 带原因交规划 Agent replan（≤REPLAN_MAX 次）
-    Node.DATA_QUALITY: Option.REPLAN,
-    Node.TUNING_DECISION: Option.AI_TUNE,
-    Node.TUNING_ROUND: None,          # 按七规则自动决定，不暂停
-    Node.FINAL_REPORT: Option.DONE,
-    # 结果后处理（可选）：完全执行模式默认跳过，不暂停询问
-    Node.POSTPROCESS: Option.SKIP_POSTPROCESS,
-    # 影像获取方式（配对/月度合成）：整月时由 role_flow 直接弹窗询问，
-    # 不经过本表（AUTO 也会弹），这里补占位保证节点完整性。
-    Node.ACQUISITION_MODE: None,
-}
-
 # 手动调参表单排除的超参：随机种子是可复现性开关，不是调优旋钮
 _MANUAL_TUNE_EXCLUDED = {"random_state"}
 
@@ -82,16 +65,11 @@ def should_pause(node: str, exec_mode: str) -> bool:
     """该节点在当前模式下是否需要真的暂停询问用户。
 
     由我批准模式下所有节点都要停（含 tuning_decision / tuning_round，
-    无论精度好坏都要询问并报告结果——用户明确要求）。
+    无论精度好坏都要询问并报告结果）。
     """
     if not is_auto(exec_mode):
         return True
     return False
-
-
-def auto_choice(node: str) -> Optional[str]:
-    """AUTO 模式下该节点的默认选项 id；None 表示不暂停、由规则自动决定。"""
-    return AUTO_DEFAULT_STRATEGY.get(node)
 
 
 # ── 载荷构造 ───────────────────────────────────────────────────────
@@ -295,42 +273,6 @@ def build_postprocess(summary: str) -> dict:
 
 # ── 载荷与恢复值校验 ───────────────────────────────────────────────
 
-def validate_payload(payload: Any) -> List[str]:
-    """校验审批载荷 schema 合法性（`test_exec_mode_approval.py` 逐条断言）。"""
-    issues: List[str] = []
-    if not isinstance(payload, dict):
-        return ["审批载荷必须是对象"]
-    if payload.get("type") != "approval":
-        issues.append("type 必须是 approval")
-    if payload.get("node") not in ALL_NODES:
-        issues.append(f"未知的审批节点：{payload.get('node')}")
-    for key in ("title", "summary"):
-        if not isinstance(payload.get(key), str):
-            issues.append(f"{key} 必须是字符串")
-    options = payload.get("options")
-    if not isinstance(options, list) or not options:
-        issues.append("options 必须是非空数组")
-        return issues
-    ids = []
-    for i, item in enumerate(options):
-        if not isinstance(item, dict):
-            issues.append(f"第 {i + 1} 个选项不是对象")
-            continue
-        if not item.get("id"):
-            issues.append(f"第 {i + 1} 个选项缺少 id")
-        if not item.get("label"):
-            issues.append(f"第 {i + 1} 个选项缺少 label")
-        ids.append(item.get("id"))
-        for field in item.get("fields") or []:
-            if not isinstance(field, dict) or not field.get("name"):
-                issues.append(f"选项 {item.get('id')} 的表单字段缺少 name")
-    if len(set(ids)) != len(ids):
-        issues.append("选项 id 重复")
-    if payload.get("default_option") not in ids:
-        issues.append("default_option 必须是 options 中的某个 id")
-    return issues
-
-
 def find_option(payload: dict, option_id: str) -> Optional[dict]:
     for item in (payload or {}).get("options") or []:
         if item.get("id") == option_id:
@@ -389,12 +331,3 @@ def parse_resume(payload: dict, resume: Any) -> Tuple[Optional[dict], str]:
         "option_id": option_id,
         "values": sanitize_values(payload, option_id, resume.get("values")),
     }, ""
-
-
-def auto_resume(payload: dict) -> Dict[str, Any]:
-    """AUTO 模式下不暂停，直接按 default_option 组装一份等效的恢复结果。"""
-    option_id = payload.get("default_option") or ""
-    return {
-        "option_id": option_id,
-        "values": sanitize_values(payload, option_id, None),
-    }

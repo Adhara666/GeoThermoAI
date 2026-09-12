@@ -1,12 +1,11 @@
 """
 关键词单一来源（I1 改进）
 
-之前散落在 4 处的关键词列表统一到本文件，防止修改时遗漏导致行为漂移：
-- geo_thermo_agent.py: _POSTPROCESS_KEYWORDS / _FULLWORKFLOW_MARKERS / _is_advisory_request
-- planner_agent.py: _POSTPROCESS_KEYWORDS / _POSTPROCESS_SOFT_KEYWORDS / _FULLWORKFLOW_MARKERS / _FALLBACK_TASK_KEYWORDS
-- role_flow.py: _detect_acquisition_mode_hint 内联关键词
-
-所有模块从本文件 import，不再各自定义。
+关键词列表统一在本文件维护，修改只需一处，避免多处定义漂移。
+使用方（均从本文件 import）：
+- geo_thermo_agent.py: 后处理 / 全流程标记 / 咨询类判定
+- planner_agent.py: 后处理 / 模糊后处理 / 全流程标记 / 兜底任务关键词
+- role_flow.py: 影像获取方式提示
 """
 
 import re
@@ -20,7 +19,7 @@ POSTPROCESS_KEYWORDS = (
 )
 
 # 模糊后处理关键词：仅在已有结果时才判 postprocess
-# 用户跑完全流程后说"继续"、"处理一下"等，大概率是对已有结果做后处理
+# 已有结果时，用户说"继续"、"处理一下"等通常是对已有结果做后处理
 POSTPROCESS_SOFT_KEYWORDS = (
     "继续", "处理一下", "处理下", "补全", "修复",
     "完善", "填上", "补上", "补一下", "填一下",
@@ -203,7 +202,7 @@ def is_postprocess_request(text: str) -> bool:
     if "包括" in text and any(kw in text for kw in POSTPROCESS_KEYWORDS):
         return False
     # 含新任务信号（重新跑/再跑/换个等）时不判 postprocess——
-    # 用户明确要求重跑全流程，即使提到"无空洞"也是全流程的一部分
+    # 明确要求重跑全流程时，即使提到"无空洞"也按全流程处理
     if any(kw in text for kw in NEW_TASK_SIGNALS):
         return False
     if any(kw in text for kw in POSTPROCESS_KEYWORDS):

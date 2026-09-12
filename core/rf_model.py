@@ -8,7 +8,7 @@
 修复：
     - 参数合并改为"先拷贝默认值，再用白名单校验过的用户参数覆盖"，不再是
       "只要前端传入非空 params 就整体不与默认值合并"，避免 random_state/
-      max_features 静默丢失、悄悄回退到 scikit-learn 自身默认值；
+      max_features 静默丢失并回退为 scikit-learn 自身默认值；
     - 不再无条件 n_jobs=-1：按容器 CPU 配额（cgroup v1/v2，兼容宿主机）解析
       实际可用核数并写入生效参数；
     - 评估指标含 MB（平均偏差），供测试集评估使用。

@@ -10,7 +10,6 @@
 
 from typing import Sequence
 
-from core.agent.understanding import operations as ops
 
 _OPS_TABLE = """\
 | 操作 | 什么时候用 |

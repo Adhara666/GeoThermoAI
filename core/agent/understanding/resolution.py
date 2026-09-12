@@ -396,7 +396,7 @@ def _resolve_region(book: SlotBook, ctx: ResolveContext, lang: str = "zh"):
 
     result = binding.bind_region(name, ctx.study_area_paths)
     if result.kind == binding.BIND_UNIQUE:
-        # 被否定过的地区不能靠「只剩一个候选」悄悄回来（9.2 第 4 条）
+        # 被否定过的地区不得因「只剩一个候选」而重新入选（9.2 第 4 条）
         if book.is_negated(ops.F_REGION, result.display):
             return book.drop(ops.F_REGION), QuestionSpec(
                 field=ops.F_REGION,

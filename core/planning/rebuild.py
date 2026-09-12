@@ -3,7 +3,7 @@
 
 依据总体技术方案 §5.5：
 
-  托管执行模式下，Skill 不再在内部调用 `ensure_stage_inputs()` 顺手启动
+  托管执行模式下，Skill 不再在内部调用 `ensure_stage_inputs()` 自行启动
   上游。适配器先进行输入预检，返回"缺少什么、为什么缺、可从哪份已登记
   输入重建"。编译器按原 `stage_rebuild.py` 的依赖关系加入显式重建节点，
   保存使用的原参数、原划分与 TTRI 系数；完成后再唤醒消费节点。
@@ -20,9 +20,8 @@
 """
 
 import json
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List
 
-from core.planning.catalog import NODE_TYPES
 from core.state_kernel.store import append_event, new_id, utcnow_iso
 
 # 技能级依赖（与 stage_rebuild.ensure_stage_inputs 的重建链一致）：

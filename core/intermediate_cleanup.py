@@ -77,11 +77,6 @@ _STAGE_FILES: dict = {
 }
 
 
-def is_intermediate_name(filename: str) -> bool:
-    """判断文件名是否属于会被删除的中间产物（供下载面板过滤）"""
-    return bool(filename) and os.path.basename(filename) in INTERMEDIATE_FILENAMES
-
-
 def cleanup_stage(project_dir: str, stage: str):
     """在指定阶段完成后删除该阶段不再需要的中间产物（含子目录）。
 

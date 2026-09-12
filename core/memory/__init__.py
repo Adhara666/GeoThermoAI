@@ -5,7 +5,7 @@
 - experiment_log：experiments.json 精确查询层
 - preferences：preferences.json 偏好键值
 - session_state：对话级槽位状态（多轮补全的落盘依据）
-- workflow_experience：可复用工作流经验（"靠谱流程"写回记忆）
+- workflow_experience：可复用工作流经验（质量达标流程写回记忆）
 - knowledge_eval：E 系列评估先验知识（防止 AI 乱说的依据）
 - memory_manager：聚合入口（写入/注入/删除级联/播种）
 """

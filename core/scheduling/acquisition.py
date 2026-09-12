@@ -2,7 +2,6 @@
 import copy
 import hashlib
 import json
-import os
 from pathlib import Path
 
 from .transfer import fetch_file, file_hash, stable_url

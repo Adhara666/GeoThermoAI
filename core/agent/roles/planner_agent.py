@@ -31,7 +31,6 @@ from ..orchestrator.keywords import (
     is_correction_request as _is_correction_request,
     negation_slot_terms as _negation_slot_terms,
     POSTPROCESS_KEYWORDS as _POSTPROCESS_KEYWORDS,
-    POSTPROCESS_SOFT_KEYWORDS as _POSTPROCESS_SOFT_KEYWORDS,
     FULLWORKFLOW_MARKERS as _FULLWORKFLOW_MARKERS,
     FALLBACK_TASK_KEYWORDS as _FALLBACK_TASK_KEYWORDS,
     TASK_PRODUCT_MARKERS,
@@ -164,7 +163,7 @@ class PlannerAgent(RoleAgent):
         if intent != "postprocess" and _is_postprocess_soft_request(ctx.user_input):
             _has_results = bool(self._existing_products_text(ctx))
             if _has_results:
-                self.log(f"意图修正：模糊关键词命中 + 已有结果，改判 postprocess")
+                self.log("意图修正：模糊关键词命中 + 已有结果，改判 postprocess")
                 intent = "postprocess"
                 parsed["question"] = ""
             else:
@@ -524,7 +523,7 @@ class PlannerAgent(RoleAgent):
                        intent: str = "task", project_dir: str = "") -> List[dict]:
         """内置步骤兜底（LLM 不可用或输出不合法时）。
 
-        partial 意图只生成用户要求的部分步骤（如只下载）；task/modify 生成完整7步。
+        partial 意图只生成请求涉及的部分步骤（如只下载）；task/modify 生成完整7步。
         续接请求（"继续后续流程"）跳过已完成的步骤。
         """
         start = time_value[0] if time_value else ""

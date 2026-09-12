@@ -56,7 +56,6 @@ def composite_median(
     projection = src.GetProjection()
     band1 = src.GetRasterBand(1)
     src_nodata = band1.GetNoDataValue()
-    src_dtype = band1.DataType
     src = None
 
     masks = list(mask_paths) if mask_paths else []

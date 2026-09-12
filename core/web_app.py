@@ -42,7 +42,6 @@ from core.state_kernel import (
     StateStore,
     mark_command_failed,
     mark_command_processed,
-    mark_command_processing,
     mark_command_rejected,
     questions as q_store,
     receive_command,
@@ -298,20 +297,6 @@ def _stamp_with_ts(text: str, ts_iso: str,
     for ln in str(text).split("\n"):
         out.append(f"[{ts}] {ln}" if ln.strip() else ln)
     return "\n".join(out)
-
-
-def _detect_lang(text: str) -> str:
-    """从用户消息检测语言：含 CJK 字符→zh，否则→en（无字母时回退 zh）。
-
-    程序组装的界面文案（任务提交/完成报告/任务名）按用户说话的语言呈现；
-    LLM 生成内容本就不受此影响。
-    """
-    s = str(text or "")
-    cjk = sum(1 for ch in s if "\u4e00" <= ch <= "\u9fff")
-    if cjk > 0:
-        return "zh"
-    letters = sum(1 for ch in s if ch.isascii() and ch.isalpha())
-    return "en" if letters > 0 else "zh"
 
 
 # ── 业务后端（移植自 GradioAPI，去除 Gradio 耦合） ─────────────
@@ -612,7 +597,8 @@ class AppBackend:
         """回收与当前任务无关的历史运行目录（磁盘占用治理）。
 
         删除条件（同时满足）：目录年龄超阈；运行已被新版本接替，或任务
-        处于失败/取消/草稿等终态，或已不是任务当前运行；且无未退出尝试。
+        处于失败/取消/草稿等终态，或已不是任务当前运行，或已无台账记录
+        （孤儿目录）；且无未退出尝试。
         保留：未完成任务/已完成任务的当前运行（含 staging 输入与 committed 产物）。
         """
         import shutil
@@ -637,12 +623,16 @@ class AppBackend:
                 # 绝不整体删除 runs 目录——发布产物就在这里）
                 if not d.is_dir() or d.name in ("cache", "runs") or d.name.startswith("."):
                     continue
-                row = run_state.get(d.name)
-                if row is None or d.name in active:
+                if d.name in active:
                     continue
-                superseded, t_status, current = row[1], row[2], row[3]
-                deletable = (bool(superseded) or t_status in stale_terminal
-                             or current != d.name)
+                row = run_state.get(d.name)
+                if row is None:
+                    # 孤儿目录（对应台账行已不存在：项目/对话彻底删除后的残留）
+                    deletable = True
+                else:
+                    superseded, t_status, current = row[1], row[2], row[3]
+                    deletable = (bool(superseded) or t_status in stale_terminal
+                                 or current != d.name)
                 if not deletable:
                     continue
                 try:
@@ -747,9 +737,8 @@ class AppBackend:
             return ""
 
     def _compose_completion_report(self, uid: str, label: str, run_id: str) -> str:
-        """组装完成报告正文：任务名 + 测试区精度 + 与 30m 对照 + 正式产物数 + AI 解读。
-
-        用户要求：不使用 emoji 图标；附一段模型生成的结果解读。"""
+        """组装完成报告正文：任务名 + 影像配对 + 测试区精度 + 与 30m 对照 +
+        正式产物数 + 结果解读段；不使用 emoji 图标。"""
         data = self._completion_report_data(run_id)
         if not (data.get("metrics") or data.get("closure") or data.get("final_count")):
             return ""
@@ -794,7 +783,7 @@ class AppBackend:
                    if len(lines) > 1 else lines[0])
         note = self._completion_ai_note(uid, label, data, lang)
         if note:
-            # 直接接在数据行后成段（用户要求：不出现“AI 解读”字样）
+            # 直接接在数据行后成段（不出现“AI 解读”前缀）
             content += "\n\n" + note
         from core.scheduling.scheduler import strip_emoji
         return strip_emoji(content)
@@ -845,9 +834,8 @@ class AppBackend:
             finally:
                 _uid_ctx.reset(token)
 
-    # 注意：历史上此处曾残留一份旧版 _compose_completion_report（带 emoji、
-    # 无影像配对与解读段），Python 后来者覆盖导致报告格式回退——已删除，
-    # 唯一定义在 _report_completed_tasks 之前的版本。
+    # 注意：_compose_completion_report 全库唯一；若出现重复定义，后定义会
+    # 覆盖先定义（验证脚本含唯一性断言）。
 
     def _conversation_exec_mode(self, task_row) -> str:
         """读取任务所属对话当前的交互模式（供无请求上下文的编译入口使用）。
@@ -1239,7 +1227,6 @@ class AppBackend:
     def _conversation_artifacts(self, store, uid: str, conv_pk: str,
                                 limit: int = 100) -> list:
         """本对话各运行的正式产物（含桥接后的项目视图路径与精度摘要）。"""
-        import os as _os
 
         def _read(conn):
             return [
@@ -1275,7 +1262,6 @@ class AppBackend:
     def task_detail(self, task_id: str) -> dict:
         """任务详情（§12.1）：版本、运行、节点、问题、产物、失败原因。"""
         from core.state_kernel import tasks as t_store
-        from core.state_kernel import questions as q_store
 
         if not task_id:
             return {"ok": False, "message": "缺少 task_id"}
@@ -1292,10 +1278,6 @@ class AppBackend:
                 (task.get("current_run_id"),)).fetchone()
             run_info = None
             if run:
-                try:
-                    snap = json.loads(run[5]).get("snapshot", {})
-                except (ValueError, TypeError):
-                    snap = {}
                 run_info = {"run_id": run[0], "status": run[2],
                             "cancel_requested": run[3],
                             "superseded_by": run[4],
@@ -2320,7 +2302,13 @@ class AppBackend:
             return {"ok": False, "message": "项目不存在"}
         if self._scheduler:
             self._scheduler.cancel_scope(self._uid(), pid)
-        # 级联删除记忆（experiments/preferences/ChromaDB Collection）放后台线程，
+        # 级联删除台账与运行数据：任务/运行/产物/日志 + 运行目录 + 下载缓存
+        legacy_ids = [c for c in convs[pid].keys() if not c.startswith("__")]
+        try:
+            run_ids = self._purge_kernel_for_conversations(legacy_ids)
+            self._purge_run_dirs(run_ids, pid)
+        except Exception as e:
+            logging.warning(f"[cleanup] 删除项目台账/运行数据失败: {e}")
         # 主线程先完成文件与状态删除，立即返回提示（删除慢体验优化）
         try:
             project_id = self._project_id(pid)
@@ -2364,6 +2352,130 @@ class AppBackend:
         except Exception as e:
             logging.warning(f"[memory] 后台删除项目记忆失败: {e}")
 
+    def _purge_kernel_for_conversations(self, legacy_ids: list) -> list:
+        """彻底删除对话所属的台账数据，返回被清掉的运行 id（供删除运行目录）。
+
+        项目/对话删除时调用：任务、运行、节点、尝试、产物、问题、事件、
+        日志与消息一并删除，避免"删了项目但台账与磁盘仍占用"的残留。
+        """
+        clean_ids = [str(x) for x in (legacy_ids or []) if x]
+        if not clean_ids:
+            return []
+        store = self._get_state_store()
+        uid = self._uid()
+
+        def tx(conn):
+            qs = ",".join("?" for _ in clean_ids)
+            conv_pks = [r[0] for r in conn.execute(
+                f"SELECT id FROM conversations WHERE user_id=?"
+                f" AND legacy_conv_id IN ({qs})", (uid, *clean_ids))]
+            if not conv_pks:
+                return []
+            cq = ",".join("?" for _ in conv_pks)
+            task_ids = [r[0] for r in conn.execute(
+                f"SELECT id FROM tasks WHERE conversation_id IN ({cq})", conv_pks)]
+            q_ids = [r[0] for r in conn.execute(
+                f"SELECT id FROM questions WHERE conversation_id IN ({cq})", conv_pks)]
+            tq = ",".join("?" for _ in task_ids)
+            run_ids = [r[0] for r in conn.execute(
+                f"SELECT id FROM runs WHERE task_id IN ({tq})", task_ids)] \
+                if task_ids else []
+            rq = ",".join("?" for _ in run_ids)
+            attempt_ids = [r[0] for r in conn.execute(
+                "SELECT a.id FROM attempts a JOIN nodes n ON n.id=a.node_id"
+                f" WHERE n.run_id IN ({rq})", run_ids)] if run_ids else []
+            aq = ",".join("?" for _ in attempt_ids)
+            artifact_ids = [r[0] for r in conn.execute(
+                f"SELECT id FROM artifacts WHERE attempt_id IN ({aq})",
+                attempt_ids)] if attempt_ids else []
+            # 叶子 → 根：按外键依赖自下而上级联删除
+            if q_ids:
+                qq = ",".join("?" for _ in q_ids)
+                conn.execute(f"DELETE FROM question_targets"
+                             f" WHERE question_id IN ({qq})", q_ids)
+                conn.execute(f"DELETE FROM questions WHERE id IN ({qq})", q_ids)
+            if artifact_ids:
+                aq2 = ",".join("?" for _ in artifact_ids)
+                conn.execute(f"DELETE FROM artifact_refs"
+                             f" WHERE artifact_id IN ({aq2})", artifact_ids)
+                conn.execute(f"DELETE FROM artifacts WHERE id IN ({aq2})",
+                             artifact_ids)
+            if attempt_ids:
+                conn.execute(f"DELETE FROM resource_reservations"
+                             f" WHERE attempt_id IN ({aq})", attempt_ids)
+                conn.execute(f"DELETE FROM commit_intents"
+                             f" WHERE attempt_id IN ({aq})", attempt_ids)
+                conn.execute(f"DELETE FROM attempts WHERE id IN ({aq})",
+                             attempt_ids)
+            if run_ids:
+                conn.execute(f"DELETE FROM node_edges WHERE run_id IN ({rq})",
+                             run_ids)
+                conn.execute(f"DELETE FROM decisions WHERE run_id IN ({rq})",
+                             run_ids)
+                conn.execute(f"DELETE FROM projection_jobs WHERE run_id IN ({rq})",
+                             run_ids)
+                conn.execute(f"DELETE FROM nodes WHERE run_id IN ({rq})", run_ids)
+            # 删除事件前先清引用事件序号的写回待办
+            # （projection_jobs.event_seq → events.seq 外键）
+            for cpk in conv_pks:
+                conn.execute("DELETE FROM projection_jobs WHERE event_seq IN"
+                             " (SELECT seq FROM events WHERE conversation_id=?)",
+                             (cpk,))
+            if task_ids:
+                conn.execute("DELETE FROM projection_jobs WHERE event_seq IN"
+                             f" (SELECT seq FROM events WHERE task_id IN ({tq}))",
+                             task_ids)
+            if run_ids:
+                conn.execute("DELETE FROM projection_jobs WHERE event_seq IN"
+                             f" (SELECT seq FROM events WHERE run_id IN ({rq}))",
+                             run_ids)
+                conn.execute(f"DELETE FROM runs WHERE id IN ({rq})", run_ids)
+            if task_ids:
+                conn.execute(f"DELETE FROM tasks WHERE id IN ({tq})", task_ids)
+            for cpk in conv_pks:
+                conn.execute("DELETE FROM commands WHERE message_id IN"
+                             " (SELECT id FROM messages WHERE conversation_id=?)",
+                             (cpk,))
+                conn.execute("DELETE FROM messages WHERE conversation_id=?", (cpk,))
+                conn.execute("DELETE FROM events WHERE conversation_id=?", (cpk,))
+                conn.execute("DELETE FROM task_logs WHERE conversation_id=?", (cpk,))
+                conn.execute("DELETE FROM conversations WHERE id=?", (cpk,))
+            # 兼收对话归属为空、但按任务/运行归属的残余事件
+            if run_ids:
+                conn.execute(f"DELETE FROM events WHERE run_id IN ({rq})", run_ids)
+            if task_ids:
+                conn.execute(f"DELETE FROM events WHERE task_id IN ({tq})", task_ids)
+            return run_ids
+
+        return store.submit_write(tx, timeout=60.0)
+
+    def _purge_run_dirs(self, run_ids: list, project_name: str = ""):
+        """后台删除运行目录（staging + runs/<run> 发布树）与项目下载缓存。
+
+        安全护栏：只删 executions 下的"运行号"直接子目录与 cache/{uid}_{项目}，
+        绝不整体删除 runs / cache 入口目录。
+        """
+        rids = [str(r) for r in (run_ids or []) if r]
+        if not rids and not project_name:
+            return
+        uid = self._uid()
+
+        def _job():
+            try:
+                root = self._get_state_store().db_path.parent / "executions"
+                for rid in rids:
+                    for d in (root / rid, root / "runs" / rid):
+                        if (d.parent.name in ("executions", "runs")
+                                and d.name == rid):
+                            shutil.rmtree(d, ignore_errors=True)
+                if project_name:
+                    shutil.rmtree(root / "cache" / f"{uid}_{project_name}",
+                                  ignore_errors=True)
+            except Exception as e:  # noqa: BLE001
+                logging.warning(f"[cleanup] 删除运行目录失败: {e}")
+
+        threading.Thread(target=_job, daemon=True).start()
+
     def _conv_project_dir(self, project_root: str, conv_id: str) -> str:
         """对话级独立工作目录（各对话并行互不干扰）。
 
@@ -2384,7 +2496,6 @@ class AppBackend:
     def create_conversation(self, project: str, title: str) -> dict:
         title = (title or "").strip() or "新对话"
         conv_id = uuid.uuid4().hex[:12]
-        now = time.strftime("%Y-%m-%d %H:%M:%S")
         convs = self.load_conversations()
         if project not in convs:
             return {"ok": False, "message": "项目不存在，请先创建项目"}
@@ -2450,6 +2561,12 @@ class AppBackend:
             return {"ok": False, "message": "对话不存在"}
         if self._scheduler:
             self._scheduler.cancel_scope(self._uid(), pid, cid)
+        # 级联删除该对话的台账与运行数据（含运行目录）
+        try:
+            run_ids = self._purge_kernel_for_conversations([cid])
+            self._purge_run_dirs(run_ids)
+        except Exception as e:
+            logging.warning(f"[cleanup] 删除对话台账/运行数据失败: {e}")
         # 级联删除该对话产生的实验记忆放后台线程，主线程先完成文件与状态删除，
         # 立即返回提示（删除慢体验优化）
         try:
@@ -2918,7 +3035,7 @@ class AppBackend:
 
     def _read_eval_json(self, path: str) -> dict:
         """读取评估 JSON，区分 missing（未生成）/ error（存在但损坏）/ ok（正常），
-        不把缺失或损坏都填成 0（禁止把缺数据伪装成完美零误差）。"""
+        不把缺失或损坏都填成 0（缺数据不得呈现为零误差）。"""
         if not os.path.isfile(path):
             return {"status": "missing"}
         try:
@@ -3594,7 +3711,6 @@ class AppBackend:
                 prior_messages.append({"role": m.get("role", "user"), "content": c})
 
         uid = self._uid()
-        wait_seconds = _approval_wait_seconds_from(agent_cfg)
 
         def _runner():
             ctx_token = _uid_ctx.set(uid)  # 后台线程不带请求 contextvars，需显式恢复用户
@@ -3843,7 +3959,6 @@ class AppBackend:
         yield from self._stream_events(cid, thread, q, pause_event, gen, tz)
 
     def _stream_events(self, cid, thread, q, pause_event, gen, tz: float = _DEFAULT_TZ_OFFSET):
-        paused = False
         convs = self.load_conversations()
         # 找到 pid/cid
         pid = None
@@ -3966,13 +4081,11 @@ class AppBackend:
                         # pause 时同步带上思考用时：由我批准模式在
                         # plan_confirm / 选影像处暂停，done 事件不会走到，用时须在此送达
                         yield from _emit("pause", {"pairs": pairs, "thinking_seconds": thinking_seconds})
-                        paused = True
                         return
                     if payload.get("type") == "approval":
                         # 通用审批节点：保存待处理载荷供 chat_resume 校验
                         self._get_conv_state(cid)["pending_approval"] = payload
                         yield from _emit("pause", {"approval": payload, "thinking_seconds": thinking_seconds})
-                        paused = True
                         return
                     # 既无 pairs 也非 approval：置空已选响应并唤醒等待线程，
                     # 由 pause_callback 侧按"无选择"处理（超时挂起语义）
@@ -4116,7 +4229,6 @@ from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse, JSO
 from starlette.background import BackgroundTask
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
-import urllib.parse
 
 from contextlib import asynccontextmanager
 

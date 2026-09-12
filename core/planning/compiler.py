@@ -14,9 +14,8 @@
 """
 
 import json
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
-from core.agent.understanding import operations as ops
 from core.agent.understanding.slotbook import SlotBook
 from core.planning.catalog import (
     CAPABILITY_TEMPLATES,
@@ -27,7 +26,6 @@ from core.planning.catalog import (
 from core.planning.snapshot import build_snapshot, snapshot_hash
 from core.state_kernel.store import (
     append_event,
-    insert_versioned,
     new_id,
     update_versioned,
     utcnow_iso,

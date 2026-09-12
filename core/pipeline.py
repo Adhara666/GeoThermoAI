@@ -284,7 +284,6 @@ class EasyLSTPipeline:
 
     def _run_preprocessing(self, progress_callback, log_callback) -> Dict:
         """执行数据预处理步骤（含完整30m约束层）。"""
-        paths = self.get_default_paths()
         result = process_preprocessing(
             landsat_path=self.config.get("landsat_path", ""),
             sentinel2_path=self.config.get("sentinel2_path", ""),

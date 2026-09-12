@@ -1,12 +1,10 @@
 """按节点调用原生产实现。文件交接显式引用，算法可写输入先私有复制。"""
 import json
-import os
 import shutil
 from pathlib import Path
 from types import SimpleNamespace
 
 from . import acquisition
-from .worker import write_json
 
 
 def _params(spec):

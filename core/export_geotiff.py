@@ -124,8 +124,8 @@ def export_geotiff(
         n = len(chunk)
 
         # 空值必须先于 int64 转换检出：NaN 转 int64 会变成 INT64_MIN
-        # (-9223372036854775808)，之后只能报「越界」，读者无法看出真实原因是
-        # 「row/col 是空的」——这通常意味着上游中间表写入不完整或被截断。
+        # (-9223372036854775808)，错误信息表现为「越界」而非真实原因
+        # 「row/col 为空」——这通常意味着上游中间表写入不完整或被截断。
         null_index = chunk["row"].isna() | chunk["col"].isna()
         if null_index.any():
             n_null = int(null_index.sum())

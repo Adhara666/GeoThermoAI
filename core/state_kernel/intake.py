@@ -231,7 +231,6 @@ def receive_command(
 def mark_command_processing(store: StateStore, command_id: str,
                             timeout: float = 30.0) -> None:
     """命令进入处理中（接收事务已提交，处理由任务线程异步进行）。"""
-    now = utcnow_iso()
 
     def _tx(conn):
         conn.execute(

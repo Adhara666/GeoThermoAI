@@ -122,8 +122,8 @@ def low_precision_direction(current: Dict[str, Any]) -> Dict[str, Any]:
 def fallback_direction(current: Dict[str, Any]) -> Dict[str, Any]:
     """必须再训一轮但拿不到调优方向时的兜底方向（与 R1 同一策略：加大模型容量）。
 
-    用于「用户明确要求继续下一轮，但大模型不可用」的场景——把用户的「继续」
-    落实成一次真实的参数变更，而不是悄悄变成「停止」。
+    用于「请求继续下一轮，但大模型不可用」的场景——把用户的「继续」
+    落实成一次真实的参数变更，而不是静默变成「停止」。
     """
     return low_precision_direction(current)
 

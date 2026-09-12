@@ -53,7 +53,7 @@ def rasterize_region(geojson_path: str, ref_tif: str) -> Optional[object]:
             "", ref.RasterXSize, ref.RasterYSize, 1, gdal.GDT_Byte)
         ds.SetGeoTransform(ref.GetGeoTransform())
         ds.SetProjection(ref.GetProjection())
-        err = gdal.RasterizeLayer(ds, [1], layer, burn_values=[1])
+        gdal.RasterizeLayer(ds, [1], layer, burn_values=[1])
         mask = ds.ReadAsArray().astype(bool)
         gdal.Unlink(tmp)
         return mask

@@ -3,7 +3,6 @@ import hashlib
 import json
 import logging
 import multiprocessing
-import os
 import queue
 import re
 import threading
@@ -15,7 +14,7 @@ from pathlib import Path
 import psutil
 
 from core.state_kernel.store import append_event, new_id, utcnow_iso
-from .resources import Budget, Claim, ResourceLedger, estimate, kind_for, process_memory
+from .resources import Budget, Claim, ResourceLedger, estimate, process_memory
 from .transfer import file_lock
 from .worker import worker_main
 
@@ -72,7 +71,7 @@ def _log_insert(conn, *, user_id, conversation_id, task_id, run_id, text):
 
 
 # 生命周期日志模板（zh/en）：界面语言由 web 层注入读取器，默认中文。
-# 用户要求：日志不使用 emoji 图标（纯文本）。
+# 日志不使用 emoji 图标（纯文本输出）。
 _LIFECYCLE_TEXT = {
     "failed": ("[{node}] 执行失败：{detail}",
                "[{node}] Failed: {detail}"),
@@ -91,7 +90,7 @@ _LIFECYCLE_TEXT = {
     "node_done": ("[{node}] 完成", "[{node}] Done"),
 }
 
-# 日志文本中的 emoji 过滤（用户要求日志/报告不出现图标表情）
+# 日志文本 emoji 过滤（日志/报告均为纯文本）
 _EMOJI_RE = re.compile(
     "[\U0001F000-\U0001FAFF\U00002600-\U000027BF\U00002B00-\U00002BFF"
     "\U00002300-\U000023FF\U0000FE0F\U0000200D]+")
@@ -778,22 +777,24 @@ class Scheduler:
             return
         except BaseException as e:
             # 取消竞态/发布失败：意向作废，节点如实失败，暂存不清理（供对账）
+            err_msg = str(e)
+
             def tx(conn):
                 conn.execute(
                     "UPDATE attempts SET status='failed', authorization=NULL,"
                     " process_exited=1, error=?, error_kind='commit', finished_at=?"
-                    " WHERE id=?", (str(e)[:1500], utcnow_iso(), aid))
+                    " WHERE id=?", (err_msg[:1500], utcnow_iso(), aid))
                 conn.execute(
                     "UPDATE resource_reservations SET released_at=? WHERE attempt_id=?",
                     (utcnow_iso(), aid))
                 conn.execute(
                     "UPDATE nodes SET status='failed', wait_reason=? WHERE id=?",
-                    (f"两步提交未完成，产物保留在暂存区：{str(e)[:300]}", row["id"]))
+                    (f"两步提交未完成，产物保留在暂存区：{err_msg[:300]}", row["id"]))
                 _event(conn, row, "node.failed", {
                     "attempt_id": aid, "error_kind": "commit",
-                    "error": str(e)[:500]})
+                    "error": err_msg[:500]})
                 if intent_id:
-                    abandon_commit_tx(conn, intent_id=intent_id, reason=str(e)[:300])
+                    abandon_commit_tx(conn, intent_id=intent_id, reason=err_msg[:300])
             self.store.submit_write(tx)
             self.ledger.release(aid)
             self._release_attempt_refs(aid)

@@ -68,7 +68,7 @@ class TrainAgent(RoleAgent):
         params = step.setdefault("params", {})
         params["output_dir"] = self._round_dir(ctx, 0)
         params["defer_cleanup"] = True
-        self.log(f"第 1 轮训练输出目录已设为 round_0，中间产物延迟清理")
+        self.log("第 1 轮训练输出目录已设为 round_0，中间产物延迟清理")
         return None
 
     # ── 执行后：主反思与调优循环 ───────────────────────────────────

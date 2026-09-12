@@ -37,10 +37,6 @@ def normalize(value: Optional[str], default: str = DEFAULT_EXEC_MODE) -> str:
     return mode if mode in ALL_MODES else default
 
 
-def is_approval(mode: Optional[str]) -> bool:
-    return normalize(mode) == ExecMode.APPROVAL
-
-
 def is_auto(mode: Optional[str]) -> bool:
     return normalize(mode) == ExecMode.AUTO
 

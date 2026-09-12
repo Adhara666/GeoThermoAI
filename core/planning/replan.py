@@ -20,7 +20,7 @@
 """
 
 import json
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, Optional
 
 from core.planning.compiler import (
     _insert_run,
@@ -31,10 +31,8 @@ from core.planning.compiler import (
 from core.planning.snapshot import build_snapshot, snapshot_hash
 from core.state_kernel.store import (
     append_event,
-    insert_versioned,
     new_id,
     update_versioned,
-    utcnow_iso,
 )
 
 # runs 表无 version 列，对 runs 的写入用 _insert_run/_patch_run（见 compiler.py）
@@ -84,7 +82,6 @@ def consume_replan_budget_tx(conn, *, task_id: str,
     返回消耗后的累计额度。额度耗尽抛 ReplanBudgetExhausted，
     绝不静默放行（§5.4：重规划次数持久记录）。
     """
-    from core.state_kernel import tasks as tasks_tx
     from core.state_kernel.store import StaleVersionError
 
     row = conn.execute(
@@ -117,16 +114,6 @@ def consume_replan_budget_tx(conn, *, task_id: str,
         payload={"replan_used": acc["replan_used"], "replan_max": replan_max},
     )
     return acc["replan_used"]
-
-
-def consume_replan_budget(store, *, task_id: str, expected_task_version: int,
-                          replan_max: int, timeout: float = 30.0) -> int:
-    """对外入口（事务包装）。"""
-    return store.submit_write(
-        consume_replan_budget_tx, task_id=task_id,
-        expected_task_version=expected_task_version, replan_max=replan_max,
-        timeout=timeout,
-    )
 
 
 def start_superseding_run_tx(conn, *, task_id: str,

@@ -4,8 +4,8 @@ import { reactive } from 'vue'
 export const toasts = reactive([])
 let _id = 0
 
-// 成功（绿色）弹窗统一去掉 emoji 图标：覆盖 ✅/⚠️/❌/🎉/🟢 等常用 emoji 及其
-// 变体选择符（U+FE0F），避免服务端消息里的 emoji 出现在绿色弹窗中。
+// 成功（绿色）弹窗统一去掉表情符号：覆盖勾选/警告/叉号/庆祝等常用符号及其
+// 变体选择符（U+FE0F），避免服务端消息里的表情符号出现在绿色弹窗中。
 const EMOJI_RE = /[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{2B00}-\u{2BFF}\u{2190}-\u{21FF}\u{FE0F}]/gu
 
 function cleanSuccessText(msg) {

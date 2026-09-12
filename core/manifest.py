@@ -164,23 +164,9 @@ def mark_downstream_skipped(
         save_manifest(output_dir, manifest)
 
 
-def get_stage_status(output_dir: str, stage: str) -> str:
-    manifest = load_manifest(output_dir)
-    return manifest.get("stages", {}).get(stage, {}).get("status", STATUS_PENDING)
-
-
 def get_stage_entry(output_dir: str, stage: str) -> Dict[str, Any]:
     manifest = load_manifest(output_dir)
     return manifest.get("stages", {}).get(stage, {})
-
-
-def resolve_artifact(output_dir: str, stage: str, key: str) -> Optional[str]:
-    """从 manifest 精确取某 stage 的产物路径；只有 status=completed 才返回，
-    避免用目录"最新文件名排序/计数+1"做不可靠推断。"""
-    entry = get_stage_entry(output_dir, stage)
-    if entry.get("status") != STATUS_COMPLETED:
-        return None
-    return entry.get("artifacts", {}).get(key)
 
 
 def sha256_file(path: str, chunk_size: int = 1024 * 1024) -> Optional[str]:
@@ -193,20 +179,4 @@ def sha256_file(path: str, chunk_size: int = 1024 * 1024) -> Optional[str]:
             if not chunk:
                 break
             h.update(chunk)
-    return h.hexdigest()
-
-
-def hash_inputs(*values: Any) -> str:
-    """对一组输入（文件路径会展开为 path:size:mtime，其余按字符串处理）计算稳定签名，
-    用于 stage 判断"复用已存在的固定产物"时输入是否与上次一致。"""
-    h = hashlib.sha256()
-    for v in values:
-        if isinstance(v, str) and os.path.isfile(v):
-            try:
-                st = os.stat(v)
-                h.update(f"{v}:{st.st_size}:{int(st.st_mtime)}".encode("utf-8"))
-                continue
-            except OSError:
-                pass
-        h.update(str(v).encode("utf-8"))
     return h.hexdigest()

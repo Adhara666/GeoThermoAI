@@ -142,7 +142,7 @@ class MemoryManager:
         2. ChromaDB project_{id} 写入自然语言段落（语义检索，metadata 带检索键）
         """
         if not project_id or not record.get("conv_id"):
-            logger.warning(f"[memory] 跳过实验入库（缺 project_id 或 conv_id）")
+            logger.warning("[memory] 跳过实验入库（缺 project_id 或 conv_id）")
             return
         try:
             self.experiment_log(project_id).add(record)

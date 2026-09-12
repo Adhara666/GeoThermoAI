@@ -102,8 +102,8 @@ _SKILL_NAME_RE = re.compile("|".join(sorted(STAGE_LABELS, key=len, reverse=True)
 
 # 形如 /a/b/c.tif、D:\a\b、./output/raw 的路径片段。
 # 分隔符前必须是「行首、空白或标点」，不能紧跟字母数字：否则 row/col、MB/MAE、
-# 训练/验证 这类正常写法会被当成路径吃掉（如诊断信息里的「row/col 越界」会被
-# 替换成「row（详见日志） 越界」，读者完全看不懂）。
+# 训练/验证 这类正常写法会被误判为路径（如诊断信息里的「row/col 越界」被替换
+# 成「row（详见日志） 越界」）。
 _PATH_RE = re.compile(
     r"(?<![A-Za-z0-9\u4e00-\u9fff])(?:[A-Za-z]:[\\/][^\s，。；：]*|\.{0,2}[\\/][^\s，。；：]{2,})"
 )
@@ -161,7 +161,7 @@ def fmt_percent(value: Any, digits: int = 1) -> str:
 
 
 # ── 数字与相邻文字之间的空格统一 ─────────────────────────────────────
-# 用户要求：气泡里数字前后都需要空一格（如「第 1 步」「共 7 步」），
+# 气泡里数字前后各留一个空格（如「第 1 步」「共 7 步」），
 # 但传感器名（Landsat 8/9、Sentinel-2）、数字+m 单位（10m/30m）这类
 # 既定紧凑写法保持不变；标点与数字直接相邻，不加空格。
 _CJK_STR = r"[\u4e00-\u9fff]"          # 常用汉字
@@ -192,7 +192,7 @@ def normalize_number_spacing(text: str) -> str:
     return out
 
 
-# ── 卫星与时间写法（用户要求：实际用了哪颗卫星就写哪颗，不写 8/9 泛指） ──
+# ── 卫星与时间写法（使用实际卫星型号，不写 8/9 泛指） ──
 
 def satellite_label(sat: str) -> str:
     """配对里的卫星代号转气泡写法：L8→「Landsat 8」，L9→「Landsat 9」。"""
@@ -385,10 +385,6 @@ def plan_ready(step_count: int) -> str:
 
 def plan_completed_by_safety_net() -> str:
     return "已补全为完整流程\n"
-
-
-def tuning_params_suggesting() -> str:
-    return "正在根据数据特征推荐训练参数\n"
 
 
 def pairs_found(count: int) -> str:

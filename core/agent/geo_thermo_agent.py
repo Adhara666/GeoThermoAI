@@ -6,7 +6,6 @@ GeoThermoAI 核心智能体
 """
 
 import json
-import glob
 import logging
 import os
 import pathlib
@@ -21,7 +20,6 @@ from . import executor, presentation
 from .executor import PAUSE_MARKER
 from .orchestrator import agent_config, approval as approval_proto
 from .orchestrator.approval import Option
-from .orchestrator.exec_mode import normalize as _normalize_exec_mode
 from .roles.base_role import extract_json
 from .roles.slots import match_study_area
 
@@ -44,7 +42,6 @@ from .orchestrator.keywords import (
     is_postprocess_request as _is_postprocess_request,
     is_advisory_request as _is_advisory_request,
     guess_city_bbox,
-    FULLWORKFLOW_MARKERS,
 )
 
 
@@ -180,7 +177,7 @@ class GeoThermoAgent:
         if memory_manager is not None and project_id:
             try:
                 memory_block = memory_manager.enrich_prompt(project_id, user_input)
-            except Exception as _e:
+            except Exception:
                 memory_block = ""
         system_prompt = self._build_system_prompt(context, tool_desc, project_dir=project_dir, memory_block=memory_block)
 
@@ -218,7 +215,7 @@ class GeoThermoAgent:
 
         _emit(presentation.plan_ready(len(plan.get("steps", []))))
 
-        # 5.5 安全网：用户要求全流程时，确保计划完整且参数有效
+        # 5.5 安全网：请求全流程时，确保计划完整且参数有效
         steps = plan.get("steps", [])
         skill_names = [s.get("skill", "") for s in steps]
         user_wants_workflow = any(kw in user_input for kw in ["全流程", "一键", "跑完全流程", "执行全流程"])
@@ -1026,7 +1023,6 @@ class GeoThermoAgent:
         计算训练集的特征统计（NDVI, NDWI, NDBI, DEM, LST），
         以及地形复杂度、植被覆盖度、温度范围等衍生指标。
         """
-        import pandas as pd
 
         from ..table_io import read_table, read_row_count
 

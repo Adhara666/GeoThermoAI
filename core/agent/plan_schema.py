@@ -149,11 +149,6 @@ def is_full_workflow(plan: Dict[str, Any]) -> bool:
     return tuple(skill_names(plan)) == WORKFLOW_STEPS
 
 
-def missing_workflow_skills(plan: Dict[str, Any]) -> List[str]:
-    present = set(skill_names(plan))
-    return [s for s in WORKFLOW_STEPS if s not in present]
-
-
 def has_empty_params(plan: Dict[str, Any]) -> bool:
     """任一步骤的 params 为空或全空值（沿用现有安全网判据）。"""
     for step in plan.get("steps") or []:
@@ -180,20 +175,6 @@ def with_steps(plan: Dict[str, Any], steps: List[Dict[str, Any]]) -> Dict[str, A
     """替换步骤（不可变）。"""
     normalized = [c for c in (_clean_step(s, i) for i, s in enumerate(steps)) if c]
     return {**plan, "steps": normalized}
-
-
-def to_legacy(plan: Dict[str, Any]) -> Dict[str, Any]:
-    """降级为旧格式 `{"steps": [{skill, params, reason}]}`。
-
-    供只认旧格式的路径（如现有测试与兜底逻辑）消费。
-    """
-    return {
-        "steps": [
-            {"skill": s["skill"], "params": dict(s.get("params") or {}),
-             "reason": s.get("reason", "")}
-            for s in (plan.get("steps") or [])
-        ]
-    }
 
 
 def validate(plan: Dict[str, Any], registry=None) -> List[str]:

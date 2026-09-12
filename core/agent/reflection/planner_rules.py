@@ -118,7 +118,7 @@ def enforce_workflow_order(plan: Dict[str, Any],
                            wants_full_workflow: bool) -> Tuple[Dict[str, Any], List[str]]:
     """P5：全流程任务的步骤必须是 7 步且顺序正确，缺失则补齐、乱序则重排。
 
-    用户明确要求「从头执行并包含结果后处理」时，LLM 会在 steps 里带 lst_gapfill
+    当请求「从头执行并包含结果后处理」时，LLM 会在 steps 里带 lst_gapfill
     步骤——把它保留并追加到 accuracy_eval 之后，成为完整流程的最后一步
     （此前 reorder_to_workflow 只保留固定 7 步技能，会把该步骤丢弃）。
     """
@@ -148,7 +148,7 @@ def enforce_workflow_order(plan: Dict[str, Any],
             }
         steps.append({"skill": name, "params": params,
                       "reason": _DEFAULT_REASONS.get(name, "")})
-    # 结果后处理步骤（LLM 因用户明确要求而输出）追加到完整流程末尾，
+    # 结果后处理步骤（LLM 按请求输出时）追加到完整流程末尾，
     # 由执行引擎交给结果 Agent（EvalAgent）执行
     extra = by_skill.get("lst_gapfill")
     if extra is not None:

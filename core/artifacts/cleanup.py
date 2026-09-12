@@ -13,9 +13,9 @@
 
 import shutil
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
-from core.state_kernel.store import append_event, utcnow_iso
+from core.state_kernel.store import append_event
 from core.artifacts.publisher import (
     AV_AVAILABLE,
     AV_CLEANED,
