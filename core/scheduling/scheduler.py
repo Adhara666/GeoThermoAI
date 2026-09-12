@@ -5,6 +5,7 @@ import logging
 import multiprocessing
 import os
 import queue
+import re
 import threading
 import time
 from dataclasses import asdict
@@ -58,6 +59,52 @@ def _event(conn, row, event, payload):
                  object_id=row["id"], payload=payload)
 
 
+def _log_insert(conn, *, user_id, conversation_id, task_id, run_id, text):
+    """持久写一条执行日志（task_logs）：跨刷新/重启/中断不丢失。
+
+    写入前统一过滤 emoji（用户要求日志无图标表情）；文本存原文，
+    展示时按用户时区盖时间戳（web 层负责）。"""
+    conn.execute(
+        "INSERT INTO task_logs (user_id, conversation_id, task_id, run_id, text, created_at)"
+        " VALUES (?,?,?,?,?,?)",
+        (user_id, conversation_id, task_id or None, run_id or None,
+         strip_emoji(text), utcnow_iso()))
+
+
+# 生命周期日志模板（zh/en）：界面语言由 web 层注入读取器，默认中文。
+# 用户要求：日志不使用 emoji 图标（纯文本）。
+_LIFECYCLE_TEXT = {
+    "failed": ("[{node}] 执行失败：{detail}",
+               "[{node}] Failed: {detail}"),
+    "retry_wait": ("[{node}] 网络错误，稍后自动重试：{detail}",
+                   "[{node}] Network error; will retry automatically: {detail}"),
+    "waiting_input": ("[{node}] 等待用户选择：{detail}",
+                      "[{node}] Waiting for your selection: {detail}"),
+    "cancelled": ("[{node}] 已停止：{detail}",
+                  "[{node}] Stopped: {detail}"),
+    "retry": ("[{node}] 已提交重试，重新排队执行",
+              "[{node}] Retry submitted; re-queued"),
+    "interrupted": ("[{node}] 服务中断，旧尝试已停止，可重试本节点",
+                    "[{node}] Service interrupted; previous attempt stopped. You can retry this node"),
+    "task_completed": ("任务完成：{label}", "Task completed: {label}"),
+    "task_failed": ("任务失败：{label}", "Task failed: {label}"),
+    "node_done": ("[{node}] 完成", "[{node}] Done"),
+}
+
+# 日志文本中的 emoji 过滤（用户要求日志/报告不出现图标表情）
+_EMOJI_RE = re.compile(
+    "[\U0001F000-\U0001FAFF\U00002600-\U000027BF\U00002B00-\U00002BFF"
+    "\U00002300-\U000023FF\U0000FE0F\U0000200D]+")
+
+
+def strip_emoji(text: str) -> str:
+    """去掉文本中的 emoji/图标字符并修正多余空白（日志/报告统一入口）。"""
+    s = _EMOJI_RE.sub("", str(text or ""))
+    s = re.sub(r"[ \t]{2,}", " ", s)
+    s = re.sub(r"(?m)^[ \t]+", "", s)
+    return s
+
+
 class Scheduler:
     def __init__(self, store, root, budget=None, *, handler=None):
         self.store, self.root = store, Path(root).resolve()
@@ -76,6 +123,40 @@ class Scheduler:
         self._view_lock = threading.RLock()
         self.last_error = None
         self._model_queue = threading.BoundedSemaphore(max(2, self.budget.model_jobs * 4))
+        # 界面语言读取器（zh/en）：由 web 层注入，决定生命周期日志的文案语言
+        self._lang_lookup = None
+
+    # ── 执行日志（task_logs）：语言与写入辅助 ──
+
+    def log_lang(self, user_id: str) -> str:
+        fn = getattr(self, "_lang_lookup", None)
+        if fn:
+            try:
+                lang = str(fn(user_id or "") or "")
+                if lang in ("zh", "en"):
+                    return lang
+            except Exception:
+                pass
+        return "zh"
+
+    def _lifecycle_text(self, user_id: str, kind: str, **fmt) -> str:
+        zh, en_t = _LIFECYCLE_TEXT[kind]
+        tpl = zh if self.log_lang(user_id) == "zh" else en_t
+        try:
+            return tpl.format(**fmt)
+        except (KeyError, ValueError):
+            return tpl
+
+    def _log_raw(self, row, text: str):
+        """独立写一条原始日志（进度行），不依赖事务上下文。"""
+        try:
+            self.store.submit_write(lambda conn: _log_insert(
+                conn, user_id=row.get("user_id"),
+                conversation_id=row.get("conversation_id"),
+                task_id=row.get("task_id"), run_id=row.get("run_id"),
+                text=text))
+        except Exception:
+            pass
 
     def start(self):
         if self.thread is not None:
@@ -205,7 +286,9 @@ class Scheduler:
                     conn.execute("UPDATE nodes SET status=?, wait_reason=?, ready_at=CASE WHEN ?='ready' THEN COALESCE(ready_at,?) ELSE ready_at END WHERE id=?",
                                  (state, reason, state, utcnow_iso(), row["id"]))
                     _event(conn, row, "node.state", {"status": state, "reason": reason})
-            for run in rows(conn, "SELECT r.id,r.task_id,t.current_run_id,t.summary_status FROM runs r JOIN tasks t ON t.id=r.task_id WHERE r.status NOT IN ('completed','cancelled')"):
+            for run in rows(conn, "SELECT r.id,r.task_id,t.current_run_id,t.summary_status,"
+                            " t.user_id,t.conversation_id,t.label FROM runs r JOIN tasks t ON t.id=r.task_id"
+                            " WHERE r.status NOT IN ('completed','cancelled')"):
                 states = [r[0] for r in conn.execute("SELECT status FROM nodes WHERE run_id=?", (run["id"],))]
                 if not states:
                     continue
@@ -224,17 +307,79 @@ class Scheduler:
                 conn.execute("UPDATE runs SET status=?,updated_at=? WHERE id=? AND status<>?", (status, utcnow_iso(), run["id"], status))
                 if run["current_run_id"] == run["id"] and run["summary_status"] != status:
                     conn.execute("UPDATE tasks SET summary_status=?,version=version+1,updated_at=? WHERE id=?", (status, utcnow_iso(), run["task_id"]))
+                    # 任务总体完成/失败：持久一条汇总日志（用户实测：失败与完成
+                    # 必须在日志里可见，且不因刷新/重启消失）
+                    if status in ("completed", "failed"):
+                        kind = "task_completed" if status == "completed" else "task_failed"
+                        uid = run["user_id"]
+                        label = run["label"]
+                        zh, en_t = _LIFECYCLE_TEXT[kind]
+                        tpl = zh if self.log_lang(uid) == "zh" else en_t
+                        _log_insert(conn, user_id=uid,
+                                    conversation_id=run["conversation_id"],
+                                    task_id=run["task_id"], run_id=run["id"],
+                                    text=tpl.format(label=label or run["task_id"]))
         self.store.submit_write(tx)
 
     def _context(self, row):
         ancestors = self.store.read(lambda c: rows(c,
             "WITH RECURSIVE ancestors(id) AS (SELECT predecessor_id FROM node_edges WHERE successor_id=?"
             " UNION SELECT e.predecessor_id FROM node_edges e JOIN ancestors a ON e.successor_id=a.id)"
-            " SELECT n.result,n.node_type FROM ancestors a JOIN nodes n ON n.id=a.id WHERE n.status='succeeded' ORDER BY n.exec_order", (row["id"],)))
+            " SELECT n.id AS node_id,n.result,n.node_type FROM ancestors a JOIN nodes n ON n.id=a.id WHERE n.status='succeeded' ORDER BY n.exec_order", (row["id"],)))
         context = {}
         for parent in ancestors:
-            context.update(decode(parent["result"]).get("context", {}))
+            result = decode(parent["result"])
+            ctx = dict(result.get("context") or {})
+            # 历史兼容：修复前提交的节点 result.context 被覆盖成提交信息，
+            # 下游拿不到输入映射与数据上下文（files/pipeline_data 等）——
+            # 从完成凭据补回完整 context，并把路径重定向到发布目录
+            # （staging 产物已被 move）。新数据 context 完整，自动跳过。
+            published = str(result.get("published_dir") or "")
+            if published:
+                recovered, staging_work = self._recover_context(parent["node_id"])
+                if recovered:
+                    if staging_work:
+                        from core.artifacts.publisher import _rebase_paths
+                        recovered = _rebase_paths(
+                            recovered, staging_work.rstrip("/"),
+                            published.rstrip("/"))
+                    # 缺什么补什么（setdefault）：既不覆盖新数据，也能修复
+                    # 旧合并只补了部分键（如只有 files、缺 pipeline_data）的情况
+                    for k, v in recovered.items():
+                        ctx.setdefault(k, v)
+            context.update(ctx)
         return context
+
+    def _recover_context(self, node_id: str):
+        """从节点的完成凭据恢复完整上下文（历史提交兼容）。
+
+        返回 (context, staging_work)；失败返回 ({}, "")。
+        """
+        try:
+            attempt = self.store.read(lambda c: c.execute(
+                "SELECT result_path, staging_dir FROM attempts WHERE node_id=?"
+                " AND status='succeeded' ORDER BY attempt_no DESC LIMIT 1",
+                (node_id,)).fetchone())
+            if not attempt:
+                return {}, ""
+            staging_work = str(Path(attempt[1]) / "work") if attempt[1] else ""
+            candidates = []
+            if attempt[0]:
+                candidates.append(Path(attempt[0]))
+            if attempt[1]:
+                candidates.append(Path(attempt[1]) / "completion.json")
+            for path in candidates:
+                try:
+                    envelope = json.loads(path.read_text(encoding="utf-8"))
+                    ctx = dict(((envelope.get("result") or {})
+                                .get("context") or {}))
+                    if ctx:
+                        return ctx, staging_work
+                except (OSError, ValueError):
+                    continue
+        except Exception:
+            pass
+        return {}, ""
 
     def _dispatch_ready(self):
         candidates = self.store.read(lambda c: self._node_rows(c, "n.status IN ('ready','waiting_resource')"))
@@ -333,7 +478,9 @@ class Scheduler:
                 "task_version": row["task_version"], "node": row, "staging_dir": str(stage),
                 "snapshot": decode(row["frozen_inputs"])["snapshot"], "context": context,
                 "claim": asdict(claim), "disk_margin": self.budget.disk_margin,
-                "cache_root": str(self.root / "cache"), "cache_limit": self.budget.disk_cache}
+                "cache_root": str(self.root / "cache"), "cache_limit": self.budget.disk_cache,
+                # 运行时交互模式（不随编译冻结）：“完全执行”下暂停点自动代选
+                "runtime_exec_mode": self._runtime_exec_mode(row)}
         if self.handler:
             spec["handler"] = self.handler
         process = self.ctx.Process(target=worker_main, args=(spec, child, self.progress, cancel), name=f"gtai-node-{aid}")
@@ -347,6 +494,32 @@ class Scheduler:
             parent.close()
         finally:
             child.close()
+
+    def _runtime_exec_mode(self, row) -> str:
+        """读取该对话当前的交互模式（交互模式不随编译快照冻结）。
+
+        “完全执行”下暂停点（如配对选择）自动代选；读取失败返回空串，
+        调用方回退到编译快照里的值（保守行为不变）。
+        """
+        try:
+            uid = str(row.get("user_id") or "")
+            conv_pk = str(row.get("conversation_id") or "")
+            if not uid or not conv_pk:
+                return ""
+            legacy = self.store.read(lambda c: c.execute(
+                "SELECT legacy_conv_id FROM conversations WHERE id = ?",
+                (conv_pk,)).fetchone())
+            if not legacy or not legacy[0]:
+                return ""
+            conv_file = (self.store.db_path.parent.parent / "users" / uid
+                         / "conversations" / f"{legacy[0]}.json")
+            if not conv_file.is_file():
+                return ""
+            data = json.loads(conv_file.read_text(encoding="utf-8"))
+            from core.agent.orchestrator.exec_mode import normalize
+            return normalize(data.get("exec_mode"), default="")
+        except Exception:
+            return ""
 
     def _request_stop(self, aid, active, reason, error_kind):
         if active["stopping"] is not None:
@@ -366,6 +539,23 @@ class Scheduler:
             if active:
                 # 仅最新进度常驻，关键状态另走 events；不累计海量日志。
                 active["progress"] = item["message"]
+                # 进度日志持久化（task_logs）：变化才记，单次尝试限流 3 秒一条，
+                # 避免下载分块进度刷爆日志表；刷新/重启后日志面板仍能看到过程。
+                msg = item.get("message") or ""
+                if msg and active.get("last_log_msg") != msg:
+                    active["last_log_msg"] = msg
+                    now_ts = time.monotonic()
+                    if now_ts - active.get("last_log_at", 0.0) >= 3.0:
+                        active["last_log_at"] = now_ts
+                        row = active.get("row") or {}
+                        node_key = str(row.get("node_key") or "")
+                        taskid = {
+                            "user_id": row.get("user_id"),
+                            "conversation_id": row.get("conversation_id"),
+                            "task_id": row.get("task_id"),
+                            "run_id": row.get("run_id"),
+                        }
+                        self._log_raw(taskid, f"[{node_key}] {msg}" if node_key else msg)
         for aid, active in list(self.active.items()):
             process, control = active["process"], active["control"]
             writers = active.setdefault("writers", {})
@@ -477,6 +667,31 @@ class Scheduler:
                 self._decision(conn, current, result)
             conn.execute("UPDATE nodes SET status=?,result=?,wait_reason=? WHERE id=?", (node_status, json.dumps(result, ensure_ascii=False), error, row["id"]))
             _event(conn, row, "node." + node_status, {"attempt_id": aid, "status": node_status, "error": error, "error_kind": envelope.get("error_kind"), "peak_memory_bytes": peak, "staged_only": True})
+            # 生命周期日志持久化：失败原因/等待回答/停止都要在日志里可见（不因刷新消失）
+            if node_status == "failed":
+                _log_insert(conn, user_id=row["user_id"], conversation_id=row["conversation_id"],
+                            task_id=row["task_id"], run_id=row["run_id"],
+                            text=self._lifecycle_text(row["user_id"], "failed",
+                                                      node=row["node_key"],
+                                                      detail=str(error or "")[:300]))
+            elif node_status == "retry_wait":
+                _log_insert(conn, user_id=row["user_id"], conversation_id=row["conversation_id"],
+                            task_id=row["task_id"], run_id=row["run_id"],
+                            text=self._lifecycle_text(row["user_id"], "retry_wait",
+                                                      node=row["node_key"],
+                                                      detail=str(error or "")[:300]))
+            elif node_status == "waiting_input":
+                _log_insert(conn, user_id=row["user_id"], conversation_id=row["conversation_id"],
+                            task_id=row["task_id"], run_id=row["run_id"],
+                            text=self._lifecycle_text(row["user_id"], "waiting_input",
+                                                      node=row["node_key"],
+                                                      detail=str(error or "")[:300]))
+            elif node_status == "cancelled":
+                _log_insert(conn, user_id=row["user_id"], conversation_id=row["conversation_id"],
+                            task_id=row["task_id"], run_id=row["run_id"],
+                            text=self._lifecycle_text(row["user_id"], "cancelled",
+                                                      node=row["node_key"],
+                                                      detail=str(error or "")[:300]))
         self.store.submit_write(tx)
         self.ledger.release(aid)
         self._release_attempt_refs(aid)
@@ -507,6 +722,7 @@ class Scheduler:
         from core.artifacts.publisher import (
             CommitError,
             abandon_commit_tx,
+            bridge_artifacts,
             confirm_commit_tx,
             prepare_commit_tx,
             publish_outputs,
@@ -548,12 +764,16 @@ class Scheduler:
             published = publish_outputs(str(staging), intent_dir, outputs)
 
             def confirm(conn):
-                confirm_commit_tx(conn, intent_id=intent_id, published=published)
+                result = confirm_commit_tx(conn, intent_id=intent_id, published=published)
                 conn.execute(
                     "UPDATE attempts SET peak_memory_bytes=?, result_path=? WHERE id=?",
                     (peak, str(staging / "completion.json"), aid))
+                return result
 
-            self.store.submit_write(confirm)
+            confirmed = self.store.submit_write(confirm)
+            # 第六阶段（§12.4）：正式产物桥接进项目视图目录（地图/精度/下载
+            # 按产物编号解析）；失败只记日志，不影响产物本身。
+            bridge_artifacts(confirmed.get("bridges") or [])
             self._release_attempt_refs(aid)
             return
         except BaseException as e:
@@ -726,6 +946,11 @@ class Scheduler:
                 conn.execute("UPDATE attempts SET status='failed',authorization=NULL,process_exited=1,error='服务中断后的旧尝试已停止',error_kind='interrupted',finished_at=? WHERE id=?", (utcnow_iso(), aid))
                 conn.execute("UPDATE resource_reservations SET released_at=? WHERE attempt_id=?", (utcnow_iso(), aid))
                 conn.execute("UPDATE nodes SET status='failed',wait_reason='旧尝试已退出，可重试本节点；暂存产物尚未正式发布' WHERE id=?", (attempt["node_id"],))
+                node_row = self._node_rows(conn, "n.id=?", (attempt["node_id"],))[0]
+                _log_insert(conn, user_id=node_row["user_id"], conversation_id=node_row["conversation_id"],
+                            task_id=node_row["task_id"], run_id=node_row["run_id"],
+                            text=self._lifecycle_text(node_row["user_id"], "interrupted",
+                                                      node=node_row["node_key"]))
             self.store.submit_write(tx)
 
     def _recover_completion(self, attempt):
@@ -791,6 +1016,10 @@ class Scheduler:
                 raise ValueError("旧进程还未退出")
             conn.execute("UPDATE nodes SET status='pending',retry_at=NULL,wait_reason=NULL WHERE id=?", (node_id,))
             _event(conn, row, "node.retry_requested", {})
+            _log_insert(conn, user_id=row["user_id"], conversation_id=row["conversation_id"],
+                        task_id=row["task_id"], run_id=row["run_id"],
+                        text=self._lifecycle_text(row["user_id"], "retry",
+                                                  node=row["node_key"]))
         self.store.submit_write(tx)
         self.notify()
 

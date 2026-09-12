@@ -17,7 +17,7 @@ from typing import List, Optional, Tuple
 
 # 当前数据库结构版本：每次结构变更（新增表/字段/约束）必须 +1，
 # 并在 MIGRATIONS 末尾追加对应的迁移条目。
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 5
 
 # 建库时冻结的默认连接参数（§3.3）：
 #   - 默认回滚日志模式（不启用 WAL）
@@ -329,6 +329,33 @@ CREATE TABLE resource_reservations (
 """
 
 
+# ── 版本 4：界面（升级第六阶段）──
+# 运行记录其项目视图落点与标签：正式产物（keep_forever）确认后符号链接到
+# 项目目录约定路径，地图/精度/下载面板按产物编号绑定，不再各自找最新文件。
+_DDL_V4 = """
+ALTER TABLE runs ADD COLUMN project_dir TEXT;
+ALTER TABLE runs ADD COLUMN run_label TEXT;
+"""
+
+
+# ── 版本 5：界面（日志持久化）──
+# 任务执行日志跨刷新/重启/中断不丢失：调度器与旧执行链把过程日志
+# （进度、失败原因、重试、任务完成等）持久写入本表；日志面板按对话
+# 读取历史 + SSE 增量推送。text 存原文，展示时按用户时区盖时间戳。
+_DDL_V5 = """
+CREATE TABLE IF NOT EXISTS task_logs (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id         TEXT,
+    conversation_id TEXT,
+    task_id         TEXT,
+    run_id          TEXT,
+    text            TEXT NOT NULL,
+    created_at      TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS ix_task_logs_conv ON task_logs (conversation_id, id);
+"""
+
+
 def _apply_connection_pragmas(conn: sqlite3.Connection) -> None:
     """按 §3.3 设置连接参数。读/写连接共用（默认回滚日志模式，不用 WAL）。"""
     conn.execute("PRAGMA foreign_keys=ON")
@@ -343,6 +370,8 @@ def migrations() -> List[Tuple[int, str, str]]:
         (1, "初始表结构（总体技术方案 §3.2 全部必需表）", _DDL_V1),
         (2, "理解层：任务标签/原始消息、问题正文/答案/接替关系与查询索引", _DDL_V2),
         (3, "调度执行：节点尝试、唯一授权与资源预留", _DDL_V3),
+        (4, "界面：运行的项目视图绑定（产物符号链接落点与运行标签）", _DDL_V4),
+        (5, "界面：任务执行日志持久化（跨刷新/重启不丢失）", _DDL_V5),
     ]
 
 

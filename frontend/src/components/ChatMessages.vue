@@ -1,11 +1,39 @@
 <script setup>
-import { ref, watch, nextTick } from 'vue'
+import { ref, watch, nextTick, computed } from 'vue'
 import { useChatStore } from '../stores/chat'
 import { t } from '../i18n'
 import MarkdownRender from './MarkdownRender.vue'
 
 const chat = useChatStore()
 const scrollEl = ref(null)
+
+// 配对类候选（带 info）：云量/覆盖率格式化
+function fmtPct(v) {
+  return typeof v === 'number' ? `${v.toFixed(1)}%` : '—'
+}
+function fmtNum(v) {
+  return v === null || v === undefined || v === '' ? '—' : String(v)
+}
+
+// 历史气泡防护：极长正文/思考（如模型异常复读的历史数据）截断渲染
+function clipText(s, limit = 3000) {
+  const t2 = String(s || '')
+  return t2.length > limit
+    ? `${t2.slice(0, limit)}\n\n（内容过长，已截断显示）`
+    : t2
+}
+
+// 第六阶段：待答问题卡（按问题编号）——在消息流末尾以可点击选项呈现，
+// 点击即提交答案（与文字回复共用同一通道）；问题被回答/失效后自动消失。
+const openQuestions = computed(() =>
+  (chat.kernelQuestionsOrder || [])
+    .map((id) => chat.kernelQuestions[id])
+    .filter((q) => q && (q.candidates || []).length)
+    .map((q) => {
+      const tid = (q.targets || [{}])[0]?.task_id
+      const task = tid ? chat.kernelTasks[tid] : null
+      return { ...q, taskLabel: task ? (task.label || task.region || '') : '' }
+    }))
 
 watch(
   () => [chat.messages, chat.streaming],
@@ -41,10 +69,51 @@ watch(
               <span v-if="m.thinking_seconds" class="thinking-box__seconds">{{ t('chat.thinkingSeconds', { sec: m.thinking_seconds }) }}</span>
               <span v-if="chat.streaming && i === chat.messages.length - 1" class="thinking-box__live">{{ t('chat.thinkingLive') }}</span>
             </summary>
-            <div class="thinking-box__body">{{ m.thinking }}</div>
+            <div class="thinking-box__body">{{ clipText(m.thinking) }}</div>
           </details>
-          <MarkdownRender :content="m.content" />
+          <MarkdownRender :content="clipText(m.content)" />
           <span v-if="chat.streaming && i === chat.messages.length - 1 && m.role === 'assistant'" class="typing-cursor"></span>
+        </div>
+      </div>
+      <!-- 待答问题卡：可点击选项，过期自动失效 -->
+      <div v-if="openQuestions.length" class="kernel-questions">
+        <div v-for="q in openQuestions" :key="q.id" class="kernel-question">
+          <div v-if="q.taskLabel" class="kernel-question__task">{{ q.taskLabel }}</div>
+          <div class="kernel-question__prompt">{{ q.prompt }}</div>
+          <div class="kernel-question__opts">
+            <template v-for="c in q.candidates" :key="c.id">
+              <button
+                v-if="!c.info"
+                class="kernel-question__opt"
+                @click="chat.answerKernelQuestion(q.id, c.label)"
+              >{{ c.id }}. {{ c.label }}</button>
+              <button
+                v-else
+                class="kernel-question__pair"
+                @click="chat.answerKernelQuestion(q.id, c.label)"
+              >
+                <span class="kernel-question__pair-head">
+                  <span class="kernel-question__no">{{ c.id }}</span>
+                  {{ c.label }}
+                  <em v-if="c.info.recommended" class="kernel-question__rec">{{ t('pair.recTag') }}</em>
+                </span>
+                <span class="kernel-question__pair-row">
+                  Landsat：{{ t('pair.lCloud') }} {{ fmtPct(c.info.landsat && c.info.landsat.cloud) }}
+                  · {{ t('pair.lCover') }} {{ fmtPct(c.info.landsat && c.info.landsat.coverage) }}
+                  · {{ fmtNum(c.info.landsat && c.info.landsat.count) }}{{ t('pair.lCount') }}
+                </span>
+                <span class="kernel-question__pair-row">
+                  Sentinel-2：{{ t('pair.lCloud') }} {{ fmtPct(c.info.sentinel2 && c.info.sentinel2.cloud) }}
+                  · {{ t('pair.lCover') }} {{ fmtPct(c.info.sentinel2 && c.info.sentinel2.coverage) }}
+                  · {{ fmtNum(c.info.sentinel2 && c.info.sentinel2.count) }}{{ t('pair.lCount') }}
+                </span>
+                <span v-if="c.info.time_diff_days != null" class="kernel-question__pair-row">
+                  {{ t('pair.lTimeDiff') }} {{ fmtNum(c.info.time_diff_days) }}{{ t('pair.lDays') }}
+                  <template v-if="c.info.recommend_reason"> · {{ c.info.recommend_reason }}</template>
+                </span>
+              </button>
+            </template>
+          </div>
         </div>
       </div>
     </div>
@@ -57,6 +126,40 @@ watch(
   margin-left: 2px; vertical-align: -2px; animation: blink 0.8s step-end infinite;
 }
 @keyframes blink { 50% { opacity: 0; } }
+
+/* ── 第六阶段：待答问题卡（可点击选项） ── */
+.kernel-questions { display: flex; flex-direction: column; gap: 10px; padding: 4px 8px 12px; }
+.kernel-question {
+  border: 1px solid #dbe3f0; border-left: 3px solid var(--primary, #2563eb);
+  border-radius: 10px; background: #f7faff; padding: 10px 12px;
+}
+.kernel-question__task { font-size: 12px; font-weight: 600; color: #334155; margin-bottom: 4px; }
+.kernel-question__prompt { font-size: 13px; color: #1f2937; margin-bottom: 8px; }
+.kernel-question__opts { display: flex; flex-wrap: wrap; gap: 8px; }
+.kernel-question__opt {
+  border: 1px solid var(--primary, #2563eb); color: var(--primary, #2563eb);
+  background: #fff; border-radius: 8px; padding: 4px 12px; font-size: 13px; cursor: pointer;
+}
+.kernel-question__opt:hover { background: var(--primary, #2563eb); color: #fff; }
+
+/* 配对选择卡片（带结构信息：云量/覆盖/时差） */
+.kernel-question__pair {
+  width: 100%; display: flex; flex-direction: column; gap: 3px;
+  border: 1px solid var(--primary, #2563eb); border-radius: 8px;
+  background: #fff; color: var(--text, #1f2937);
+  padding: 8px 12px; font-size: 13px; cursor: pointer; text-align: left;
+}
+.kernel-question__pair:hover { background: #eef4ff; }
+.kernel-question__pair-head { display: flex; align-items: center; gap: 6px; font-weight: 600; }
+.kernel-question__no {
+  color: #9ca3af; font-size: 11px; font-weight: 400; flex-shrink: 0;
+  border: 1px solid #e5e7eb; border-radius: 4px; padding: 0 5px;
+}
+.kernel-question__rec {
+  font-style: normal; font-size: 11px; color: #fff;
+  background: var(--primary, #2563eb); border-radius: 999px; padding: 1px 8px;
+}
+.kernel-question__pair-row { color: #6b7280; font-size: 12px; }
 
 /* ── 思考过程折叠块──────────────────────────────
    浅灰底、深灰字，与正文白色气泡区分但风格协调；

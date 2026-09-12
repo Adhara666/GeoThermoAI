@@ -4,6 +4,7 @@
 // 登录页左上角与主界面侧栏顶栏各放一个，读取同一全局 lang，双向同步。
 import { onBeforeUnmount, onMounted, ref } from 'vue'
 import { lang, setLang, t } from '../i18n'
+import { api } from '../api'
 
 const open = ref(false)
 const root = ref(null)
@@ -17,8 +18,14 @@ function toggle() {
   open.value = !open.value
 }
 
+// 语言也同步到后端用户设置：完成报告/生命周期日志等程序文案按此呈现
+function syncLangToBackend(next) {
+  api.post('/api/preferences', { lang: next }).catch(() => {})
+}
+
 function pick(id) {
   setLang(id)
+  syncLangToBackend(id)
   open.value = false
 }
 
@@ -26,7 +33,11 @@ function onDocClick(e) {
   if (root.value && !root.value.contains(e.target)) open.value = false
 }
 
-onMounted(() => document.addEventListener('click', onDocClick))
+onMounted(() => {
+  document.addEventListener('click', onDocClick)
+  // 登录后同步一次当前语言（后端默认中文；未登录时 401 静默忽略）
+  syncLangToBackend(lang.value)
+})
 onBeforeUnmount(() => document.removeEventListener('click', onDocClick))
 </script>
 

@@ -20,6 +20,7 @@
 
 import hashlib
 import json
+import os
 import shutil
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -227,6 +228,86 @@ def _same_volume(a: Path, b: Path) -> bool:
         return True
 
 
+def _node_prior_result(conn, node_id: str) -> dict:
+    """退化路径：读节点现有 result（无 completion 时保底）。"""
+    row = conn.execute("SELECT result FROM nodes WHERE id = ?",
+                       (node_id,)).fetchone()
+    try:
+        return json.loads((row[0] if row else "") or "{}") or {}
+    except ValueError:
+        return {}
+
+
+def _load_worker_result(conn, attempt_id: str) -> dict:
+    """读回 worker 完成时的 result（含下游需要的 context 输入映射）。"""
+    row = conn.execute(
+        "SELECT result_path, staging_dir FROM attempts WHERE id = ?",
+        (attempt_id,)).fetchone()
+    candidates = []
+    if row and row[0]:
+        candidates.append(Path(row[0]))
+    if row and row[1]:
+        candidates.append(Path(row[1]) / "completion.json")
+    for path in candidates:
+        try:
+            envelope = json.loads(path.read_text(encoding="utf-8"))
+            return envelope.get("result") or {}
+        except (OSError, ValueError):
+            continue
+    return {}
+
+
+def _rebase_paths(value, old_prefix: str, new_prefix: str):
+    """深度重定向：把 context 中所有指向旧目录（staging/work）的路径换成
+    发布目录（committed）。仅当新路径实际存在时替换，否则保留原样
+    （未发布的 work 文件仍在原位）。支持嵌套 dict/list。"""
+    if isinstance(value, str):
+        if old_prefix and value.startswith(old_prefix):
+            candidate = new_prefix + value[len(old_prefix):]
+            if Path(candidate).exists():
+                return candidate
+        return value
+    if isinstance(value, dict):
+        return {k: _rebase_paths(v, old_prefix, new_prefix)
+                for k, v in value.items()}
+    if isinstance(value, list):
+        return [_rebase_paths(v, old_prefix, new_prefix) for v in value]
+    return value
+
+
+def merge_published_result(prior: dict, target_dir: str,
+                           artifact_ids: List[str],
+                           staging_work: str = "") -> dict:
+    """提交后节点结果合并：保留原 result 的 context（下游靠它拿输入映射
+    与数据上下文如 pipeline_data），并把指向已搬移文件的路径重定向到发布目录。
+
+    背景：发布时 work 产物被 move 到唯一发布目录（publish_outputs），旧实现
+    提交后把 nodes.result 直接覆盖为 {published_dir, artifacts}，下游检查
+    节点拿不到输入映射/数据上下文、报错（用户实测：prep_check 找不到
+    for_train/split_info.json，随后又因缺 pipeline_data 失败）。
+    """
+    context = dict((prior or {}).get("context") or {})
+    if staging_work and context:
+        context = _rebase_paths(context, staging_work.rstrip("/"),
+                                target_dir.rstrip("/"))
+    merged = dict(prior or {})
+    merged.update(context=context, published_dir=target_dir,
+                  artifacts=artifact_ids)
+    return merged
+
+
+def _staging_work_of(conn, attempt_id: str) -> str:
+    """尝试的 work 目录前缀（供路径重定向）；查不到返回空串。"""
+    try:
+        row = conn.execute("SELECT staging_dir FROM attempts WHERE id = ?",
+                           (attempt_id,)).fetchone()
+        if row and row[0]:
+            return str(Path(row[0]) / "work")
+    except Exception:
+        pass
+    return ""
+
+
 def confirm_commit_tx(conn, *, intent_id: str,
                       published: Dict[str, Any]) -> Dict[str, Any]:
     """提交确认（§10.2 第 6 步）：最后核对后原子登记正式结果。
@@ -238,7 +319,8 @@ def confirm_commit_tx(conn, *, intent_id: str,
     intent = conn.execute(
         "SELECT ci.attempt_id, ci.target_dir, ci.outputs, ci.status,"
         " a.authorization, a.status AS a_status, a.node_id, a.task_version,"
-        " n.run_id, r.cancel_requested, r.status AS run_status, r.task_id"
+        " n.run_id, n.node_type, r.cancel_requested, r.status AS run_status,"
+        " r.task_id, r.project_dir, r.run_label"
         " FROM commit_intents ci JOIN attempts a ON a.id = ci.attempt_id"
         " JOIN nodes n ON n.id = a.node_id JOIN runs r ON r.id = n.run_id"
         " WHERE ci.id = ?",
@@ -247,7 +329,8 @@ def confirm_commit_tx(conn, *, intent_id: str,
     if intent is None:
         raise CommitError(f"提交意向不存在：{intent_id}")
     (attempt_id, target_dir, outputs_raw, status, authorization, a_status,
-     node_id, task_version, run_id, cancel_requested, run_status, task_id) = intent
+     node_id, task_version, run_id, node_type, cancel_requested, run_status,
+     task_id, project_dir, run_label) = intent
     if status != INTENT_PREPARED:
         raise CommitError(f"提交意向不在 prepared 状态（{status}）")
     if a_status not in ("running", "committing") or not authorization:
@@ -260,9 +343,10 @@ def confirm_commit_tx(conn, *, intent_id: str,
 
     now = utcnow_iso()
     task_version = int(task_version or 0)
-    retention = RETENTION_POLICY.get(_node_type_of_node(conn, node_id),
+    retention = RETENTION_POLICY.get(node_type,
                                      RETENTION_REBUILDABLE)
     artifact_ids = []
+    bridges: List[Dict[str, str]] = []
     for item in outputs:
         artifact_id = new_id()
         rel = item["path"]
@@ -290,6 +374,15 @@ def confirm_commit_tx(conn, *, intent_id: str,
                 " consumer_id, usage, pinned) VALUES (?, 'run', ?, 'pipeline_output', 1)",
                 (artifact_id, run_id),
             )
+            # 第六阶段（§12.3/§12.4）：正式产物桥接进项目视图目录——
+            # 地图图层/精度/下载按产物编号解析到同一份文件，
+            # 不再各自找最新文件。桥接文件系统操作由控制端在确认后执行。
+            if project_dir and run_label:
+                bridges.append({
+                    "artifact_id": artifact_id,
+                    "source": str(Path(target_dir) / rel),
+                    "link_path": str(Path(project_dir) / run_label / rel),
+                })
 
     conn.execute("UPDATE commit_intents SET status = ? WHERE id = ?",
                  (INTENT_CONFIRMED, intent_id))
@@ -299,9 +392,11 @@ def confirm_commit_tx(conn, *, intent_id: str,
         (now, attempt_id),
     )
     conn.execute("UPDATE nodes SET status='succeeded', result=? WHERE id=?",
-                 (json.dumps({"published_dir": target_dir,
-                              "artifacts": artifact_ids},
-                             ensure_ascii=False), node_id))
+                 (json.dumps(merge_published_result(
+                     _load_worker_result(conn, attempt_id) or _node_prior_result(conn, node_id),
+                     target_dir, artifact_ids,
+                     staging_work=_staging_work_of(conn, attempt_id)),
+                     ensure_ascii=False), node_id))
     conn.execute(
         "INSERT INTO projection_jobs (id, run_id, target, status, created_at,"
         " updated_at) VALUES (?, ?, 'run_manifest_view', 'pending', ?, ?)",
@@ -314,13 +409,36 @@ def confirm_commit_tx(conn, *, intent_id: str,
                  "published_dir": target_dir, "artifacts": artifact_ids},
     )
     return {"artifact_ids": artifact_ids, "published_dir": target_dir,
-            "run_id": run_id, "node_id": node_id}
+            "run_id": run_id, "node_id": node_id, "bridges": bridges}
 
 
 def _node_type_of_node(conn, node_id: str) -> str:
     row = conn.execute("SELECT node_type FROM nodes WHERE id = ?",
                        (node_id,)).fetchone()
     return str(row[0]) if row else ""
+
+
+def bridge_artifacts(bridges: List[Dict[str, str]]) -> None:
+    """确认后的文件桥接（§12.4 结果接口）：把正式产物符号链接到项目视图
+    目录约定相对路径，供现有图层/瓦片/精度/下载逻辑按产物解析。
+
+    由控制端在确认事务成功后执行；失败只记日志（不影响产物本身，
+    可由下一次对账/视图请求重试），绝不删除或改动产物本体。
+    """
+    import logging
+
+    for bridge in bridges:
+        link = Path(bridge["link_path"])
+        source = Path(bridge["source"])
+        try:
+            if link.exists() or link.is_symlink():
+                continue  # 已桥接，不覆盖
+            link.parent.mkdir(parents=True, exist_ok=True)
+            os.symlink(source.resolve(), link)
+        except OSError as e:
+            logging.getLogger(__name__).warning(
+                "产物桥接失败（视图暂时不可用，可重试）：%s -> %s：%s",
+                bridge["artifact_id"], link, e)
 
 
 def abandon_commit_tx(conn, *, intent_id: str, reason: str) -> None:

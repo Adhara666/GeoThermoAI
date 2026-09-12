@@ -53,7 +53,9 @@ FAIL = []
 
 def check(name, cond, detail=""):
     print(f"  [{'PASS' if cond else 'FAIL'}] {name}" + (f"  {detail}" if not cond else ""))
-    if not cond:
+    if cond:
+        PASS.append(name)
+    else:
         FAIL.append((name, detail))
 
 

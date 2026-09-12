@@ -134,7 +134,9 @@ def start_superseding_run_tx(conn, *, task_id: str,
                              settings: Dict[str, Any],
                              replan_max: int,
                              reason: str,
-                             stop_old_run: bool = True) -> Dict[str, Any]:
+                             stop_old_run: bool = True,
+                             project_dir: Optional[str] = None,
+                             run_label: Optional[str] = None) -> Dict[str, Any]:
     """建立替代运行（§5.4）：同任务版本、新快照、旧运行留档并停止派发。
 
     - 消耗一次重规划额度（持久累计，不因换运行清零）；
@@ -180,6 +182,8 @@ def start_superseding_run_tx(conn, *, task_id: str,
                 "reason": reason,
             },
             "status": "queued",
+            **({"project_dir": project_dir} if project_dir else {}),
+            **({"run_label": run_label} if run_label else {}),
         },
     )
 

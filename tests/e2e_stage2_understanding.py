@@ -504,8 +504,11 @@ def phase_verify(args):
               r3.get("ok") is False and r3.get("expired") is True, str(r3)[:200])
 
     snap3 = session(token, conv_id)
-    check("补齐后任务转为就绪",
-          any(t.get("summary_status") == "ready"
+    # 第四阶段起调度器在线：任务补齐信息后可能已被编译推进（ready→queued→…），
+    # 这里接受“已不再缺信息”的全部后续状态
+    check("补齐后任务进入就绪或已被调度",
+          any(t.get("summary_status") in
+              ("ready", "queued", "running", "completed")
               for t in (snap3.get("tasks") or [])),
           str([(t.get("label"), t.get("summary_status"))
                for t in (snap3.get("tasks") or [])]))

@@ -24,7 +24,7 @@ REQUIRED_FIELDS: Dict[str, Tuple[str, ...]] = {
     ops.CAP_GAPFILL: (ops.F_REGION,),
 }
 
-# 能力的中文名（气泡/问题文案用；不出现英文能力名）
+# 能力的中文/英文名（气泡/任务名文案用；不出现英文能力名）
 LABELS: Dict[str, str] = {
     ops.CAP_QUERY: "查询与解释",
     ops.CAP_SEARCH: "搜索影像",
@@ -33,6 +33,16 @@ LABELS: Dict[str, str] = {
     ops.CAP_TRAIN: "模型训练",
     ops.CAP_FULL_LST: "10 米地表温度完整生产",
     ops.CAP_GAPFILL: "已有结果空洞填补",
+}
+
+LABELS_EN: Dict[str, str] = {
+    ops.CAP_QUERY: "Query & explanation",
+    ops.CAP_SEARCH: "Imagery search",
+    ops.CAP_DOWNLOAD_SUBSET: "Data download",
+    ops.CAP_PREPROCESS: "Data preprocessing",
+    ops.CAP_TRAIN: "Model training",
+    ops.CAP_FULL_LST: "10 m LST full production",
+    ops.CAP_GAPFILL: "Gap-filling for existing results",
 }
 
 # 能力 → 旧执行链的意图（阶段 2 只做映射，不改执行链本身）
@@ -66,8 +76,9 @@ def required_fields(capability: str) -> Tuple[str, ...]:
     return REQUIRED_FIELDS.get(capability, ())
 
 
-def label(capability: str) -> str:
-    return LABELS.get(capability, capability)
+def label(capability: str, lang: str = "zh") -> str:
+    table = LABELS if lang != "en" else LABELS_EN
+    return table.get(capability, capability)
 
 
 def legacy_intent(capability: str) -> str:

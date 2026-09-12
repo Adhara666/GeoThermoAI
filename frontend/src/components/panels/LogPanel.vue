@@ -1,5 +1,5 @@
 <script setup>
-import { ref, watch, nextTick, onMounted, onUnmounted } from 'vue'
+import { ref, watch, nextTick, onMounted, onUnmounted, computed } from 'vue'
 import { useChatStore } from '../../stores/chat'
 import { api } from '../../api'
 import { t } from '../../i18n'
@@ -9,6 +9,26 @@ const box = ref(null)
 const autoscroll = ref(true)
 const usage = ref(null) // { mem_gb, disk_gb }
 const copied = ref(false)
+const filterTask = ref('') // 日志过滤：空串=全部；否则任务号（跟随选中中枢）
+
+// 日志条目兼容：新链路为 {text, task_id}，旧链路/服务端恢复为字符串
+const textOf = (l) => (typeof l === 'string' ? l : (l && l.text) || '')
+const taskOf = (l) => (l && typeof l === 'object' && l.task_id) || ''
+
+// 按任务过滤后的渲染窗口（仅作用于当前渲染尾部，全量复制不受影响）
+const viewLines = computed(() => {
+  if (!filterTask.value) return chat.logLines
+  return chat.logLines.filter((l) => taskOf(l) === filterTask.value)
+})
+
+// 可过滤的任务 chips（按任务编号）；跟随面板选中中枢自动切换
+const taskChips = computed(() =>
+  (chat.kernelTasksOrder || []).map((id, i) => {
+    const tk = chat.kernelTasks[id] || {}
+    return { id, num: i + 1, label: tk.label || tk.region || `任务 ${i + 1}` }
+  }))
+
+watch(() => chat.activeTaskId, (tid) => { filterTask.value = tid || '' }, { immediate: true })
 
 // 实时资源占用：内存每 5 秒刷新，磁盘后端 30 秒缓存
 let usageTimer = null
@@ -34,7 +54,7 @@ onUnmounted(() => {
 
 // 实时日志追加时自动滚动到底部（用户手动上滚时暂停跟随）
 watch(
-  () => chat.logLines.length,
+  () => viewLines.value.length,
   async () => {
     if (!autoscroll.value || !box.value) return
     await nextTick()
@@ -50,14 +70,15 @@ function onScroll() {
 }
 
 function clearLog() {
-  chat.logLines = []
-  chat.logAll = []
+  // 清除走 store：内存视图与服务端持久记录一起清（用户显式操作）
+  chat.clearLogs()
   autoscroll.value = true
 }
 
-/** 复制完整日志（logAll 是完整副本，不受渲染窗口限制）；剪贴板 API 不可用时降级 */
+/** 复制完整日志（logAll 是完整副本，不受渲染窗口与过滤限制）；剪贴板 API 不可用时降级 */
 async function copyLog() {
-  const full = chat.logAll.length ? chat.logAll.join('\n') : chat.logLines.join('\n')
+  const src = chat.logAll.length ? chat.logAll : chat.logLines
+  const full = src.map(textOf).join('\n')
   if (!full) return
   try {
     await navigator.clipboard.writeText(full)
@@ -85,13 +106,27 @@ async function copyLog() {
       <button class="log-panel__clear" :disabled="!chat.logAll.length && !chat.logLines.length" @click="clearLog">{{ t('log.clear') }}</button>
       <span v-if="usage" class="log-panel__usage" :title="t('log.usageTitle')">{{ t('log.usage', { m: usage.mem_gb.toFixed(2), d: usage.disk_gb.toFixed(2) }) }}</span>
     </div>
+    <!-- 任务过滤 chips：在日志框上方（用户反馈：不能嵌在日志框里面） -->
+    <div v-if="taskChips.length" class="log-filter">
+      <button
+        class="log-filter__chip"
+        :class="{ 'log-filter__chip--active': !filterTask }"
+        @click="filterTask = ''; chat.setActiveTask('')"
+      >{{ t('log.all') }}</button>
+      <button
+        v-for="c in taskChips" :key="c.id"
+        class="log-filter__chip"
+        :class="{ 'log-filter__chip--active': filterTask === c.id }"
+        @click="filterTask = c.id; chat.setActiveTask(c.id)"
+      >{{ c.num }}. {{ c.label }}</button>
+    </div>
     <div ref="box" class="log-panel__box" @scroll="onScroll">
       <div
-        v-for="(line, i) in chat.logLines"
+        v-for="(line, i) in viewLines"
         :key="i"
         class="log-line"
-        :class="{ 'log-line--warn': line.includes('[WARN]') }"
-      >{{ line }}</div>
+        :class="{ 'log-line--warn': textOf(line).includes('[WARN]') }"
+      >{{ textOf(line) }}</div>
     </div>
   </div>
 </template>
@@ -117,7 +152,7 @@ async function copyLog() {
 .log-panel__clear:hover:not(:disabled) { color: var(--text); border-color: var(--text-muted); }
 .log-panel__clear:disabled { opacity: 0.4; cursor: default; }
 .log-panel__box {
-  flex: 1; min-height: 0; overflow-y: auto; margin-top: 8px;
+  flex: 1; min-height: 0; overflow-y: auto; margin-top: 2px;
   background: var(--bg-panel); border: 1px solid var(--border);
   border-radius: var(--radius-sm); padding: 8px 10px;
   font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
@@ -125,4 +160,20 @@ async function copyLog() {
 }
 .log-line { color: var(--text-secondary); white-space: pre-wrap; word-break: break-all; }
 .log-line--warn { color: #d97706; }
+
+/* ── 任务过滤 chips（在日志框上方；面板联动：与选中任务同步） ── */
+.log-filter {
+  display: flex; flex-wrap: wrap; gap: 6px; padding: 8px 0 8px;
+  font-family: system-ui, -apple-system, sans-serif;
+}
+.log-filter__chip {
+  border: 1px solid var(--border-strong); background: #fff;
+  color: var(--text-secondary); border-radius: 999px;
+  font-size: 11px; padding: 2px 10px; cursor: pointer;
+}
+.log-filter__chip:hover { color: var(--text); }
+.log-filter__chip--active {
+  background: var(--primary, #2563eb); border-color: var(--primary, #2563eb);
+  color: #fff;
+}
 </style>

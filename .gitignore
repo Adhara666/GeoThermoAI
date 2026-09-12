@@ -13,3 +13,14 @@ tests/.e2e_stage2_state.json
 
 # 前端依赖
 frontend/node_modules/
+
+# 旧版本软件写入仓库根的项目桥接目录（运行数据，含 Linux 符号链接，
+# Windows 下 git 无法索引；容器以绑定挂载方式把本仓库挂到 /app，这些目录
+# 会出现在仓库根，必须永远排除）
+/测试阶段*/
+/阶段*/
+/南京市_市.geojson
+
+# 本地部署用前端产物镜像（容器静态托管用；镜像内由 Dockerfile
+# 从 frontend/dist 自动生成，.dockerignore 已同款排除，不入库）
+/dist/

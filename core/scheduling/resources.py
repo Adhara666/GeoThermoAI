@@ -156,10 +156,16 @@ def estimate(node_type, snapshot, facts, budget, history_peak=0):
     if kind in ("catalog", "model"):
         memory, disk = 384 * MIB, 16 * MIB
     elif kind == "download":
-        memory, disk = 384 * MIB + budget.connections * MIB, max(GIB, int(scale.get("asset_bytes", 0)))
+        # 下载真实体量常大于元数据估算（同日期多景、多波段、签名链接
+        # 文件大小差异）：给 3 倍裕量；完全未知时按 16GB 预留
+        # （不超过磁盘缓存预算）——此前 4GB 下限在大数据集上会撞
+        # 预留上限、下载被中途截断（用户实测：两轮均在此失败）。
+        asset_bytes = max(0, int(scale.get("asset_bytes", 0)))
+        memory = 384 * MIB + budget.connections * MIB
+        disk = max(2 * GIB, asset_bytes * 3)
         unknown = not bool(scale.get("asset_size_known", True))
-        if unknown:
-            disk = max(disk, min(4 * GIB, budget.disk_cache))
+        if unknown or not asset_bytes:
+            disk = max(disk, min(16 * GIB, budget.disk_cache))
     else:
         base = 512 * MIB
         if node_type in ("data_check", "prep_check", "ttri_check", "promote_best"):
@@ -225,11 +231,12 @@ class ResourceLedger:
         counts["model"] += self.external_model_requests
         caps = {"compute": b.compute_jobs, "download": b.download_jobs, "catalog": b.catalog_jobs, "model": b.model_jobs}
         if counts[claim.kind] >= caps[claim.kind]:
-            return False, f"等待{claim.kind}作业位置"
+            kind_cn = {"compute": "计算", "download": "下载", "catalog": "目录检索", "model": "模型调用"}.get(claim.kind, claim.kind)
+            return False, f"等待{kind_cn}作业位置"
         if claim.kind in ("compute", "download") and any(c.exclusive for c in self.claims.values()):
-            return False, "未知峰值节点正在独占执行，暂停预取"
+            return False, "另一任务正在独占执行（尚无峰值估计），暂停预取"
         if claim.exclusive and any(c.kind in ("compute", "download") for c in self.claims.values()):
-            return False, "峰值估计保守，等待独占计算且无预取"
+            return False, "为安全起见本节点独占执行，等待其他计算结束"
         if sum(c.cpu for c in self.claims.values()) + claim.cpu > b.cpu + 1e-9:
             return False, "等待 CPU 额度"
         if sum(c.connections for c in self.claims.values()) + claim.connections > b.connections:

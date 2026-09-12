@@ -76,6 +76,31 @@ def search(spec, report):
     return {"context": {"candidates_path": str(target)}, "message": result.message}
 
 
+def _pair_candidate(index: int, pair: dict) -> dict:
+    """配对候选：编号可引用；label 给人读；info 供前端卡片渲染
+    （云量/覆盖率/景数/时差/推荐理由，与升级前配对卡片信息对齐）。"""
+    ld = pair.get("landsat_date") or "?"
+    sd = pair.get("sentinel2_date") or "?"
+    return {
+        "id": str(index + 1),
+        "label": f"Landsat {ld} · Sentinel-2 {sd}",
+        "value": pair,
+        "info": {
+            "landsat": {"satellite": pair.get("landsat_satellite") or "",
+                        "date": ld, "count": pair.get("landsat_count"),
+                        "coverage": pair.get("landsat_coverage"),
+                        "cloud": pair.get("landsat_cloud_cover")},
+            "sentinel2": {"date": sd, "count": pair.get("sentinel2_count"),
+                          "coverage": pair.get("sentinel2_coverage"),
+                          "cloud": pair.get("sentinel2_cloud_cover")},
+            "time_diff_days": pair.get("time_diff_days"),
+            "quality_score": pair.get("quality_score"),
+            "recommended": bool(pair.get("recommended")),
+            "recommend_reason": str(pair.get("recommend_reason") or ""),
+        },
+    }
+
+
 def select(spec):
     from core.agent.roles.data_agent import rank_pairs
     from core.agent.orchestrator.exec_mode import is_auto
@@ -84,6 +109,9 @@ def select(spec):
     mode = config.get("product_mode", "pair")
     capability = json.loads(spec["node"]["frozen_inputs"])["capability"]
     answer = json.loads(spec["node"]["params"]).get("execution_answer")
+    # 交互模式运行时生效（不随编译冻结）：用户在界面切到“完全执行”后，
+    # 等待中的配对选择也会自动代选最高分组合；读取失败回退编译快照值。
+    exec_mode = spec.get("runtime_exec_mode") or config.get("exec_mode")
     pair = None
     if mode != "monthly" and capability != "download_subset":
         pairs = rank_pairs(candidates.get("image_pairs", []))
@@ -93,10 +121,11 @@ def select(spec):
             pair = next((p for i, p in enumerate(pairs) if str(i + 1) == str(answer.get("option_id"))), None)
             if pair is None:
                 raise ValueError("选择不在已保存候选内")
-        elif not is_auto(config.get("exec_mode")):
-            return {"question": {"prompt": "请选择本次影像配对", "candidates": [
-                {"id": str(i + 1), "label": f"L{p['landsat_date']} S{p['sentinel2_date']}", "value": p}
-                for i, p in enumerate(pairs)]}}
+        elif not is_auto(exec_mode):
+            return {"question": {
+                "prompt": "请选择本次影像配对",
+                "payload": {"kind": "pair_select"},
+                "candidates": [_pair_candidate(i, p) for i, p in enumerate(pairs)]}}
         else:
             pair = pairs[0]
     groups = {"landsat": candidates.get("landsat_items", []), "sentinel2": candidates.get("sentinel2_items", []), "dem": candidates.get("dem_items", [])}

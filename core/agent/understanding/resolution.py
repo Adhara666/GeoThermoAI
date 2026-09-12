@@ -152,7 +152,7 @@ def resolve(batch: ops.CandidateBatch,
     """把候选批次解析成草稿修改与追问。任何无法确定的地方一律追问，不猜。"""
     outcome = ResolutionOutcome()
     if not batch.valid:
-        outcome.failure = _failure_message(batch)
+        outcome.failure = _failure_message(batch, _lang_of(ctx.message))
         return outcome
 
     negated = turn_negations(batch)
@@ -199,13 +199,22 @@ def resolve(batch: ops.CandidateBatch,
     return outcome
 
 
-def _failure_message(batch: ops.CandidateBatch) -> str:
+def _failure_message(batch: ops.CandidateBatch, lang: str = "zh") -> str:
     """模型失败时的说明：讲清楚原因，不默认城市/整月/下载（§4.5）。"""
     if batch.source == "unavailable":
+        if lang == "en":
+            return ("The language model is temporarily unreachable, so I could not "
+                    "parse this message. Confirmed information is kept; you can "
+                    "try again later or tell me the study area, time range and "
+                    "target product directly.")
         return ("暂时联系不上语言模型，这一句我没法理解。"
                 "已经确认过的信息都还在，你可以稍后再说一次，"
                 "或者直接告诉我研究区、时间和要做的产品。")
-    detail = "；".join(batch.errors[:3]) or "输出不符合约定格式"
+    detail = "；".join(batch.errors[:3]) or ("输出不符合约定格式" if lang == "zh"
+                                              else "output format mismatch")
+    if lang == "en":
+        return (f"I could not turn this into an executable operation ({detail}). "
+                f"Please state the study area, time range and what to do separately.")
     return (f"我没能把这句话整理成可执行的操作（{detail}）。"
             f"请把研究区、时间范围和要做的事分开说一次。")
 
@@ -326,7 +335,7 @@ def _apply_and_validate(change: DraftChange, op: ops.CandidateOperation,
     change.notes = list(dict.fromkeys(change.notes + notes))
     change.missing = _missing_fields(book, change.capability)
     change.ambiguity = list(op.ambiguity)
-    change.label = _label_for(book, change.capability)
+    change.label = _label_for(book, change.capability, _lang_of(ctx.message))
     return change
 
 
@@ -334,18 +343,19 @@ def _validate(book: SlotBook, capability: str, ctx: ResolveContext):
     """把原始表达变成真实对象：边界文件、绝对日期、枚举值。"""
     questions: List[QuestionSpec] = []
     notes: List[str] = []
+    lang = _lang_of(ctx.message)
 
-    book, region_q, region_note = _resolve_region(book, ctx)
+    book, region_q, region_note = _resolve_region(book, ctx, lang)
     if region_q:
         questions.append(region_q)
     if region_note:
         notes.append(region_note)
 
-    book, time_q = _resolve_time(book, ctx)
+    book, time_q = _resolve_time(book, ctx, lang)
     if time_q:
         questions.append(time_q)
 
-    book, mode_q = _resolve_product_mode(book, capability)
+    book, mode_q = _resolve_product_mode(book, capability, lang)
     if mode_q:
         questions.append(mode_q)
 
@@ -362,15 +372,19 @@ def _validate(book: SlotBook, capability: str, ctx: ResolveContext):
                        if q.field in ASK_ORDER else len(ASK_ORDER))
         head, rest = questions[0], questions[1:]
         head.missing_fields = [q.field for q in questions]
-        head.prompt = head.prompt + "（这个任务还差：" + \
-            "、".join(_field_label(q.field) for q in rest) + "）"
+        if lang == "en":
+            head.prompt = head.prompt + " (Still missing: " + \
+                ", ".join(_field_label(q.field, lang) for q in rest) + ")"
+        else:
+            head.prompt = head.prompt + "（这个任务还差：" + \
+                "、".join(_field_label(q.field, lang) for q in rest) + "）"
         questions = [head]
     elif questions:
         questions[0].missing_fields = [questions[0].field]
     return book, questions, notes
 
 
-def _resolve_region(book: SlotBook, ctx: ResolveContext):
+def _resolve_region(book: SlotBook, ctx: ResolveContext, lang: str = "zh"):
     raw = book.value(ops.F_REGION)
     detail = book.get(ops.F_REGION).get("detail") or {}
     if detail.get("path") and Path(str(detail["path"])).is_file():
@@ -386,9 +400,12 @@ def _resolve_region(book: SlotBook, ctx: ResolveContext):
         if book.is_negated(ops.F_REGION, result.display):
             return book.drop(ops.F_REGION), QuestionSpec(
                 field=ops.F_REGION,
-                prompt="这次要处理哪个研究区？",
+                prompt=("这次要处理哪个研究区？" if lang == "zh"
+                        else "Which study area should be processed this time?"),
                 candidates=result.options), ""
-        note = ("只有一个可用研究区，本次采用它" if not name else "")
+        note = (("只有一个可用研究区，本次采用它" if lang == "zh"
+                 else "Only one study area is available; it will be used this time.")
+                if not name else "")
         return (book.set(ops.F_REGION, result.display,
                          book.source(ops.F_REGION) or SRC_USER,
                          evidence=book.get(ops.F_REGION).get("evidence", ""),
@@ -402,22 +419,37 @@ def _resolve_region(book: SlotBook, ctx: ResolveContext):
     if result.kind == binding.BIND_EMPTY:
         return unbound, QuestionSpec(
             field=ops.F_REGION,
-            prompt="还没有看到你上传的研究区文件，请先上传研究区"
-                   "（GeoJSON 或 Shapefile），我再安排流程。"), ""
+            prompt=("还没有看到你上传的研究区文件，请先上传研究区"
+                    "（GeoJSON 或 Shapefile），我再安排流程。"
+                    if lang == "zh" else
+                    "No uploaded study area file was found. Please upload a "
+                    "study area (GeoJSON or Shapefile) first, then I will "
+                    "arrange the workflow.")), ""
     if result.kind == binding.BIND_AMBIGUOUS:
-        listed = "、".join(o["label"] for o in result.options[:6])
+        listed = ("、".join(o["label"] for o in result.options[:6]) if lang == "zh"
+                  else ", ".join(o["label"] for o in result.options[:6]))
+        prompt = (f"「{name}」匹配到多个研究区：{listed}，你要处理哪一个？"
+                  if lang == "zh" else
+                  f'"{name}" matches multiple study areas: {listed}. '
+                  f"Which one do you want to process?")
         return unbound, QuestionSpec(
-            field=ops.F_REGION,
-            prompt=f"「{name}」匹配到多个研究区：{listed}，你要处理哪一个？",
+            field=ops.F_REGION, prompt=prompt,
             candidates=result.options), ""
-    listed = "、".join(o["label"] for o in result.options[:6])
-    prompt = (f"没有找到名为「{name}」的研究区。已上传的有：{listed}，要用哪一个？"
-              if name else f"你已上传的研究区有：{listed}。这次要处理哪一个？")
+    listed = ("、".join(o["label"] for o in result.options[:6]) if lang == "zh"
+              else ", ".join(o["label"] for o in result.options[:6]))
+    if lang == "zh":
+        prompt = (f"没有找到名为「{name}」的研究区。已上传的有：{listed}，要用哪一个？"
+                  if name else f"你已上传的研究区有：{listed}。这次要处理哪一个？")
+    else:
+        prompt = (f'No study area named "{name}" was found. Uploaded ones: '
+                  f"{listed}. Which one should be used?" if name else
+                  f"You have these study areas uploaded: {listed}. "
+                  f"Which one should be processed?")
     return unbound, QuestionSpec(field=ops.F_REGION, prompt=prompt,
                                  candidates=result.options), ""
 
 
-def _resolve_time(book: SlotBook, ctx: ResolveContext):
+def _resolve_time(book: SlotBook, ctx: ResolveContext, lang: str = "zh"):
     raw = book.value(ops.F_TIME)
     if isinstance(raw, dict) and raw.get("start") and raw.get("end"):
         return book, None              # 已经是绝对区间，不重新解释
@@ -426,12 +458,21 @@ def _resolve_time(book: SlotBook, ctx: ResolveContext):
     if not expression:
         return book, QuestionSpec(
             field=ops.F_TIME,
-            prompt="要处理哪个时间范围？可以说具体月份（如 2025 年 7 月）、"
-                   "具体某天（如 2025-07-15），也可以说相对时间（如上个月）。")
+            prompt=("要处理哪个时间范围？可以说具体月份（如 2025 年 7 月）、"
+                    "具体某天（如 2025-07-15），也可以说相对时间（如上个月）。"
+                    if lang == "zh" else
+                    "Which time range should be processed? You can give a "
+                    "month (e.g., July 2025), a specific day (e.g., "
+                    "2025-07-15), or a relative time (e.g., last month)."))
 
     resolved = timeparse.resolve(expression, anchor_date=ctx.anchor_date,
                                  tz_offset=ctx.tz_offset)
     if not resolved.ok:
+        if lang == "en":
+            return book.clear(ops.F_TIME), QuestionSpec(
+                field=ops.F_TIME,
+                prompt=f"{resolved.reason} Please provide an unambiguous time, "
+                       f"e.g. July 2025, or 2025-07-01 to 2025-07-31.")
         return book.clear(ops.F_TIME), QuestionSpec(
             field=ops.F_TIME,
             prompt=f"{resolved.reason}。请给一个能唯一确定的时间，"
@@ -442,7 +483,7 @@ def _resolve_time(book: SlotBook, ctx: ResolveContext):
                     override=True), None
 
 
-def _resolve_product_mode(book: SlotBook, capability: str):
+def _resolve_product_mode(book: SlotBook, capability: str, lang: str = "zh"):
     """整月才问配对/月度合成；非整月按配对，来源记为默认（§4.4）。"""
     if capability not in capabilities.MODE_ONLY_FOR_WHOLE_MONTH:
         return book, None
@@ -461,6 +502,21 @@ def _resolve_product_mode(book: SlotBook, capability: str):
         return book.fill_default(ops.F_PRODUCT_MODE, ops.MODE_PAIR,
                                  SRC_DEFAULT), None
 
+    if lang == "en":
+        try:
+            month = (f"{_MONTHS_EN[int(time_value['start'][5:7]) - 1]} "
+                     f"{time_value['start'][:4]}")
+        except (ValueError, IndexError):
+            month = str(time_value["start"])[:7]
+        return book, QuestionSpec(
+            field=ops.F_PRODUCT_MODE,
+            prompt=f"Your time range is {month} (a whole month). "
+                   f"Which approach should be used?",
+            candidates=[
+                {"id": "1", "label": "Pair mode", "value": ops.MODE_PAIR},
+                {"id": "2", "label": "Monthly composite mode",
+                 "value": ops.MODE_MONTHLY},
+            ])
     month = f"{time_value['start'][:4]} 年 {int(time_value['start'][5:7])} 月"
     return book, QuestionSpec(
         field=ops.F_PRODUCT_MODE,
@@ -489,15 +545,35 @@ def _missing_fields(book: SlotBook, capability: str) -> List[str]:
             if not book.has_value(f)]
 
 
-def _field_label(name: str) -> str:
+def _field_label(name: str, lang: str = "zh") -> str:
+    if lang == "en":
+        return {ops.F_REGION: "study area", ops.F_TIME: "time range",
+                ops.F_PRODUCT_MODE: "product mode", ops.F_DATASETS: "datasets",
+                ops.F_PRODUCT: "product type", ops.F_MODEL: "model",
+                "target": "target task"}.get(name, name)
     return {ops.F_REGION: "研究区", ops.F_TIME: "时间范围",
             ops.F_PRODUCT_MODE: "产品方式", ops.F_DATASETS: "数据集合",
             ops.F_PRODUCT: "产品类型", ops.F_MODEL: "模型",
             "target": "目标任务"}.get(name, name)
 
 
-def _label_for(book: SlotBook, capability: str) -> str:
-    """任务卡片上的中文标签：研究区 + 时间 + 能力。"""
+def _lang_of(text: str) -> str:
+    """按用户消息判定语言：含 CJK→zh，否则有拉丁字母→en。
+
+    任务名等程序生成文案遵循“用户当时使用的语言”（英文对话→英文任务名）。"""
+    s = str(text or "")
+    if any("\u4e00" <= ch <= "\u9fff" for ch in s):
+        return "zh"
+    return "en" if any(ch.isascii() and ch.isalpha() for ch in s) else "zh"
+
+
+_MONTHS_EN = ("January", "February", "March", "April", "May", "June",
+              "July", "August", "September", "October", "November",
+              "December")
+
+
+def _label_for(book: SlotBook, capability: str, lang: str = "zh") -> str:
+    """任务卡片标签：研究区 + 时间 + 能力（随用户对话语言）。"""
     parts: List[str] = []
     region = book.value(ops.F_REGION)
     if region:
@@ -505,10 +581,24 @@ def _label_for(book: SlotBook, capability: str) -> str:
     time_value = book.value(ops.F_TIME)
     if isinstance(time_value, dict) and time_value.get("start"):
         start, end = str(time_value["start"]), str(time_value.get("end") or "")
-        parts.append(start if start == end
-                     else (f"{start[:4]} 年 {int(start[5:7])} 月"
-                           if start[:7] == end[:7] else f"{start} 至 {end}"))
+        if lang == "en":
+            if start == end:
+                parts.append(start)
+            elif start[:7] == end[:7]:
+                try:
+                    parts.append(f"{_MONTHS_EN[int(start[5:7]) - 1]} {start[:4]}")
+                except (ValueError, IndexError):
+                    parts.append(start[:7])
+            else:
+                parts.append(f"{start} to {end}")
+        else:
+            parts.append(start if start == end
+                         else (f"{start[:4]} 年 {int(start[5:7])} 月"
+                               if start[:7] == end[:7] else f"{start} 至 {end}"))
     elif time_value:
         parts.append(str(time_value))
-    parts.append(capabilities.label(capability) if capability else "待确认目标")
+    if capability:
+        parts.append(capabilities.label(capability, lang))
+    else:
+        parts.append("待确认目标" if lang == "zh" else "target pending")
     return " ".join(parts)

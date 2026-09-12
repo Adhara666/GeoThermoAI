@@ -89,6 +89,43 @@ def _load_targets(conn, question_id: str) -> List[Dict[str, Any]]:
 # ── 写操作（必须在写事务内调用） ─────────────────────────────────
 
 
+def renumber_candidates(conn, conversation_id: str,
+                        candidates: Optional[Sequence[Dict[str, Any]]]
+                        ) -> List[Dict[str, Any]]:
+    """把候选编号续编为对话内全局唯一（§4.4：编号保存后可稳定引用）。
+
+    问题创建时统一调用：新问题候选编号从“本对话已出现过的最大编号 + 1”
+    开始连排——提示语“如 1、3”与实际显示一致，用户按编号回复也不会在
+    多个任务之间产生歧义（旧对话数据不受影响）。仅对**纯数字编号**的
+    候选生效（配对/产品方式等选择题）；语义编号（accept/ai_tune 等
+    审批选项）保持原样，保证答案回传可与审批载荷匹配。
+    """
+    items = [dict(c) for c in (candidates or [])]
+    if not items:
+        return items
+    # 仅对“数字编号型”候选续编（如配对/产品方式选择，用户按编号回复）；
+    # 带语义编号的审批选项（accept / ai_tune / start 等）保持原样——
+    # 否则答案按编号回传时与审批载荷无法匹配（scheduler.answer 校验失败）
+    for c in items:
+        try:
+            int(str(c.get("id")))
+        except (TypeError, ValueError):
+            return items
+    max_id = 0
+    for (raw,) in conn.execute(
+            "SELECT candidates FROM questions WHERE conversation_id = ?",
+            (conversation_id,)):
+        try:
+            for c in json.loads(raw or "[]"):
+                max_id = max(max_id, int(str(c.get("id"))))
+        except (TypeError, ValueError):
+            continue
+    for c in items:
+        max_id += 1
+        c["id"] = str(max_id)
+    return items
+
+
 def create_question(
     conn,
     *,
@@ -105,9 +142,10 @@ def create_question(
 
     `targets` 每项：`{"task_id", "task_version", "field", "run_id"(可选)}`。
     `candidates` 每项：`{"id", "label", "value"(可选)}`——编号在此固定，
-    答案按编号解释。
+    答案按编号解释；编号自动续编为对话内全局唯一（跨问题连排）。
     """
     question_id = new_id()
+    candidates = renumber_candidates(conn, conversation_id, candidates)
     insert_versioned(
         conn,
         "questions",

@@ -10,10 +10,14 @@ v3.2 变更：
 - Sentinel-2 RGB 改用分位数拉伸，兼容 0-255 与 0-10000 等不同量纲，避免全黑不显示
 """
 
+import contextlib
 import glob
+import hashlib
 import math
 import os
 import re
+import tempfile
+import threading
 from functools import lru_cache
 from typing import List, Optional, Tuple
 
@@ -38,6 +42,86 @@ try:
     HAS_CM = True
 except ImportError:
     HAS_CM = False
+
+
+# ── 大文件句柄缓存（每瓦片重开大 GeoTIFF 是渲染主要固定成本）───
+# 按线程缓存 rasterio 句柄（DatasetReader 非线程安全，每线程独立句柄）；
+# 文件 mtime/大小变化时自动重开；句柄不主动关闭（进程生命周期内复用）。
+_DS_LOCAL = threading.local()
+
+
+def _open_cached(path: str):
+    """获取按线程缓存的 rasterio 句柄（大文件 open 成本高，不重复付）。"""
+    reg = getattr(_DS_LOCAL, "handles", None)
+    if reg is None:
+        reg = _DS_LOCAL.handles = {}
+    try:
+        st = os.stat(path)
+        stamp = (st.st_mtime, st.st_size)
+    except OSError:
+        stamp = None
+    entry = reg.get(path)
+    if entry is not None:
+        ds, old_stamp = entry
+        if not ds.closed and stamp is not None and old_stamp == stamp:
+            return ds
+        with contextlib.suppress(Exception):
+            ds.close()
+        reg.pop(path, None)
+    ds = rasterio.open(path)
+    if stamp is not None:
+        reg[path] = (ds, stamp)
+    return ds
+
+
+# ── 大地图瓦片加速：低分辨率概览副本 ────────────────────
+# 10m LST 等大地图（数千万像素）逐瓦片从原图解码较慢；首次渲染时
+# 懒构建一份 ≤4096 像素边长的概览副本（存 /tmp，带 mtime 失效），
+# 常规缩放级别（z≤15）的瓦片与全局统计都从副本计算——显示级够清晰，
+# 渲染显著加快；高缩放（z>15）仍从原图读取保清晰。
+_OVERVIEW_LOCK = threading.Lock()
+_OVERVIEW_READY = {}  # (file_path, mtime) → 副本路径 or ""（无需/失败）
+_OVERVIEW_MAX_DIM = 4096
+_OVERVIEW_MAX_PIXELS = 12_000_000  # 超过才值得建副本
+_OVERVIEW_MAX_Z = 15
+
+
+def _overview_or_self(file_path: str, mtime: float, z: int) -> str:
+    """返回瓦片/统计应读取的文件路径（大地图为概览副本，否则原图）。"""
+    if z > _OVERVIEW_MAX_Z or not HAS_RASTERIO:
+        return file_path
+    key = (file_path, mtime)
+    if key in _OVERVIEW_READY:
+        return _OVERVIEW_READY[key] or file_path
+    with _OVERVIEW_LOCK:
+        if key in _OVERVIEW_READY:
+            return _OVERVIEW_READY[key] or file_path
+        try:
+            with rasterio.open(file_path) as src:
+                if (src.width * src.height <= _OVERVIEW_MAX_PIXELS
+                        or max(src.width, src.height) <= _OVERVIEW_MAX_DIM):
+                    _OVERVIEW_READY[key] = ""
+                    return file_path
+                scale = _OVERVIEW_MAX_DIM / max(src.width, src.height)
+                ow = max(1, int(src.width * scale))
+                oh = max(1, int(src.height * scale))
+                data = src.read(out_shape=(src.count, oh, ow))
+                prof = src.profile.copy()
+                prof.update(width=ow, height=oh, count=src.count,
+                            transform=src.transform * src.transform.scale(
+                                src.width / ow, src.height / oh))
+            out_dir = os.path.join(tempfile.gettempdir(), "gtai_overview")
+            os.makedirs(out_dir, exist_ok=True)
+            digest = hashlib.md5(
+                f"{file_path}:{mtime}".encode()).hexdigest()[:16]
+            out = os.path.join(out_dir, f"ov_{digest}.tif")
+            with rasterio.open(out, "w", **prof) as dst:
+                dst.write(data)
+            _OVERVIEW_READY[key] = out
+            return out
+        except Exception:
+            _OVERVIEW_READY[key] = ""
+            return file_path
 
 
 # 默认地图中心（武汉），未指定项目目录或无法读取时使用
@@ -326,13 +410,16 @@ class LayerVisualizer:
         cached = LayerVisualizer._STATS_CACHE.get(key)
         if cached is not None:
             return cached
-        with rasterio.open(file_path) as src:
+        with contextlib.nullcontext(_open_cached(file_path)) as src:
             arr = LayerVisualizer._read_sample(src, band)
         valid = arr[~np.isnan(arr)]
         if valid.size == 0:
             result = (0.0, 1.0)
         elif kind == "range":
             result = (float(valid.min()), float(valid.max()))
+        elif kind == "rgb":
+            # 真彩色专用拉伸（较 2/98 更亮，用户反馈 S2 RGB 偏暗）
+            result = (float(np.percentile(valid, 1)), float(np.percentile(valid, 88)))
         else:
             result = (float(np.percentile(valid, 2)), float(np.percentile(valid, 98)))
         LayerVisualizer._STATS_CACHE[key] = result
@@ -433,8 +520,11 @@ class LayerVisualizer:
         try:
             from rasterio.windows import Window, from_bounds as win_from_bounds
             import rasterio.warp
+            # 大地图加速：z≤15 从低分辨率概览副本渲染/统计（首次调用时懒构建）
+            render_path = _overview_or_self(file_path, mtime, z)
             minx, miny, maxx, maxy = LayerVisualizer._tile_merc_bounds(z, x, y)
-            with rasterio.open(file_path) as src:
+            # 句柄缓存：避免每瓦片重开大文件（nullcontext 保持不关闭语义）
+            with contextlib.nullcontext(_open_cached(render_path)) as src:
                 try:
                     sx0, sy0, sx1, sy1 = rasterio.warp.transform_bounds(
                         "EPSG:3857", src.crs, minx, miny, maxx, maxy, densify_pts=4)
@@ -470,7 +560,7 @@ class LayerVisualizer:
                     colored = np.empty((size, size, 3), dtype=np.uint8)
                     for i in range(3):
                         band = tile[..., i]
-                        lo, hi = LayerVisualizer._cached_stats(file_path, "pct", layer_def["bands"][i]) \
+                        lo, hi = LayerVisualizer._cached_stats(render_path, "rgb", layer_def["bands"][i]) \
                             if layer_def["bands"][i] <= src.count else (0.0, 1.0)
                         if hi <= lo:
                             hi = lo + 1e-6
@@ -490,7 +580,7 @@ class LayerVisualizer:
                     tile = np.full((size, size), np.nan, dtype=np.float32)
                     tile[row0:row0 + oh, col0:col0 + ow] = arr
                     vmin, vmax = LayerVisualizer._cached_stats(
-                        file_path, "range", layer_def.get("band", 1))
+                        render_path, "range", layer_def.get("band", 1))
                     rgba = LayerVisualizer._colorize_with_range(
                         tile, vmin, vmax, layer_def.get("colormap"))
             # 编码 PNG
@@ -645,6 +735,21 @@ class LayerVisualizer:
         file_path = LayerVisualizer._resolve_layer_path(project_dir, layer_def)
         if not os.path.isfile(file_path):
             return None
+        return LayerVisualizer.sample_file_value(file_path, lat, lon, layer_id)
+
+    @staticmethod
+    def sample_file_value(file_path: str, lat: float, lon: float,
+                          style_id: str = "") -> Optional[float]:
+        """读取任意栅格文件在 (lat, lon) 处单个像元值（LST 层为 K）。
+
+        style_id 提供 band/scale/offset（LAYER_DEFS 样式）；无样式时用栅格
+        自带 scales/offsets。返回 None 表示路径不可用、坐标越界或 NoData。
+        供“显示温度”采样：旧图层与新任务输入/产物图层共用同一实现。
+        """
+        if not HAS_RASTERIO or not file_path or not os.path.isfile(file_path):
+            return None
+        layer_def = next((d for d in LayerVisualizer.LAYER_DEFS
+                          if d["id"] == style_id), None) or {}
         try:
             with rasterio.open(file_path) as src:
                 if src.crs and not src.crs.is_geographic:
@@ -660,13 +765,13 @@ class LayerVisualizer:
                 if row < 0 or col < 0 or row >= src.height or col >= src.width:
                     return None
                 window = rasterio.windows.Window(col, row, 1, 1)
-                band = layer_def.get("band", 1)
+                band = int(layer_def.get("band", 1) or 1)
                 raw = src.read(band, window=window)[0, 0]
                 if src.nodata is not None and raw == src.nodata:
                     return None
                 if not np.isfinite(raw):
                     return None
-                # 换算为 K：优先用图层定义里显式声明的 scale/offset
+                # 换算为 K：优先用样式定义里显式声明的 scale/offset
                 # （如 Landsat L2 的 DN→K），否则回退栅格自带（多为默认 1/0）
                 scale = float(layer_def.get("scale") or 1.0)
                 offset = float(layer_def.get("offset") or 0.0)

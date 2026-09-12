@@ -120,11 +120,15 @@ def compile_task_tx(
     task_id: str,
     expected_task_version: int,
     settings: Dict[str, Any],
+    project_dir: Optional[str] = None,
+    run_label: Optional[str] = None,
 ) -> Dict[str, Any]:
     """「编译任务」原子操作：快照 → 运行 → 节点图 → 任务状态推进。
 
     在 BEGIN IMMEDIATE 事务内执行（由 StateStore.submit_write 提供 conn）。
     settings 由调用方在**进队前**读取并传入；快照建立后与设置解耦。
+    project_dir/run_label（第六阶段）：运行的项目视图落点与标签，
+    正式产物确认后符号链接到该项目目录，供地图/精度/下载面板按产物绑定。
     """
     from core.state_kernel import tasks as tasks_tx
 
@@ -167,9 +171,7 @@ def compile_task_tx(
 
     # 4) 创建运行（排队态；模板版本 + 快照指纹随运行留档）
     run_id = new_id()
-    _insert_run(
-        conn, run_id=run_id,
-        fields={
+    run_fields = {
             "task_id": task_id,
             "task_version": int(task_row.get("version") or 1) + 1,
             "template_version": TEMPLATE_VERSION,
@@ -180,7 +182,14 @@ def compile_task_tx(
                 "steps": steps,
             },
             "status": "queued",
-        },
+    }
+    if project_dir:
+        run_fields["project_dir"] = project_dir
+    if run_label:
+        run_fields["run_label"] = run_label
+    _insert_run(
+        conn, run_id=run_id,
+        fields=run_fields,
     )
 
     # 5) 展开节点图：每类型首次出现的实例做前驱解析（同类型多实例时
@@ -255,12 +264,15 @@ def compile_task_tx(
 
 
 def compile_task(store, *, task_id: str, expected_task_version: int,
-                 settings: Dict[str, Any], timeout: float = 30.0) -> Dict[str, Any]:
+                 settings: Dict[str, Any], timeout: float = 30.0,
+                 project_dir: Optional[str] = None,
+                 run_label: Optional[str] = None) -> Dict[str, Any]:
     """对外入口：把一个确认后的任务草稿编译为运行 + 节点图（排队态）。"""
     return store.submit_write(
         compile_task_tx, task_id=task_id,
         expected_task_version=expected_task_version,
         settings=settings, timeout=timeout,
+        project_dir=project_dir, run_label=run_label,
     )
 
 

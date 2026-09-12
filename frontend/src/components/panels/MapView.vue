@@ -3,10 +3,13 @@ import { ref, computed, watch, onMounted, onBeforeUnmount, nextTick } from 'vue'
 import L from 'leaflet'
 import 'leaflet/dist/leaflet.css'
 import { useProjectStore } from '../../stores/project'
+import { useChatStore } from '../../stores/chat'
 import { api, getToken } from '../../api'
 import { t, mapLayerLabel } from '../../i18n'
+import TaskResultSelect from './TaskResultSelect.vue'
 
 const project = useProjectStore()
+const chat = useChatStore()
 const conv = computed(() => project.currentConv)
 const projectDir = computed(() => project.projectDir)
 
@@ -14,6 +17,7 @@ const mapEl = ref(null)
 const panelOpen = ref(true)
 const layers = ref([]) // [{id,label,group,available,visible,opacity,bounds}]
 const currentBase = ref('gaode')
+const taskEmptyHint = ref('') // 选中任务但无产物时的空态提示（避免看似“坏掉”）
 
 const BASE_DEFS = computed(() => [
   { id: 'gaode', label: t('map.street'), url: 'https://webrd0{s}.is.autonavi.com/appmaptile?lang=zh_cn&size=1&scale=1&style=8&x={x}&y={y}&z={z}', maxZoom: 18, attr: t('map.attrGaode'), subdomains: '1234' },
@@ -25,8 +29,20 @@ let map = null
 let baseLayer = null
 const overlayMap = {} // id -> L.TileLayer
 
-function tileUrl(id, ts) {
+function tileUrl(l, ts) {
   // 瓦片由 <img> 加载，无法携带 Header，鉴权 token 走查询参数
+  if (l && l.input_key && l.task_id) {
+    // 任务原始输入层（10m S2 / 30m LST / DEM）：服务端解析路径
+    return `/api/tasks/${encodeURIComponent(l.task_id)}/inputs/`
+      + `${encodeURIComponent(l.input_key)}/tile/{z}/{x}/{y}`
+      + `?t=${ts}&token=${encodeURIComponent(getToken())}`
+  }
+  if (l && l.artifact_id) {
+    // 选中任务的产物：按产物文件直接渲染（§12.4 面板绑定同一产物）
+    return `/api/artifacts/${encodeURIComponent(l.artifact_id)}/tile/{z}/{x}/{y}`
+      + `?style=${encodeURIComponent(l.style || '')}&t=${ts}&token=${encodeURIComponent(getToken())}`
+  }
+  const id = (l && l.id) || l
   return `/api/layer/${encodeURIComponent(id)}/tile/{z}/{x}/{y}?conv=${encodeURIComponent(conv.value || '')}&t=${ts}&token=${encodeURIComponent(getToken())}`
 }
 
@@ -72,6 +88,11 @@ let _refreshSeq = 0
 async function refresh() {
   const seq = ++_refreshSeq
   if (!map) return
+  if (chat.activeTaskId) {
+    await refreshFromTask(chat.activeTaskId, seq)
+    return
+  }
+  taskEmptyHint.value = ""
   if (!conv.value) { removeOverlays(); layers.value = []; return }
   let list
   try {
@@ -88,13 +109,15 @@ async function refresh() {
     ...l,
     visible: !!l.visible,
     opacity: typeof l.opacity === 'number' ? l.opacity : 0.7,
+    opacityPct: Math.round(
+      (typeof l.opacity === 'number' ? l.opacity : 0.7) * 100),
   }))
 
   let fitted = false
   for (const l of layers.value) {
     if (!l.available || !l.bounds) continue
     // 瓦片金字塔渲染：按原生分辨率加载，bounds 限定图层地理范围
-    const overlay = L.tileLayer(tileUrl(l.id, ts), {
+    const overlay = L.tileLayer(tileUrl(l, ts), {
       opacity: l.opacity,
       zIndex: 500, // 数据图层始终高于底图，切换底图不被覆盖
       bounds: [
@@ -118,6 +141,80 @@ async function refresh() {
   }
 }
 
+/** 选中任务：原始输入层（恢复升级前的 10m S2 等原生图层）+ 产物层；
+ *  图层名用标准名（style_label），不再直接展示文件名。 */
+async function refreshFromTask(tid, seq) {
+  const list = []
+  // 1) 原始输入层（任务输入，未产出的阶段也能看底图）
+  try {
+    const r = await api.get(`/api/tasks/${encodeURIComponent(tid)}/inputs`)
+    for (const it of (r.inputs || [])) {
+      list.push({
+        id: `input:${it.key}`,
+        task_id: tid,
+        input_key: it.key,
+        style: it.style_id,
+        label: it.label,
+        group: it.group || 'acquire',
+        available: true,
+        visible: true,
+        opacity: it.key === 'sentinel2_path' ? 0.8 : 0.7,
+        opacityPct: it.key === 'sentinel2_path' ? 80 : 70,
+        // 30m LST 输入层参与“显示温度”（按样式的 DN→K 换算采样）
+        is_lst: it.key === 'landsat_path',
+        bounds: [[it.bounds[1], it.bounds[0]], [it.bounds[3], it.bounds[2]]],
+      })
+    }
+  } catch (_) { /* 无原始输入（如未走到准备节点）时跳过 */ }
+
+  // 2) 任务产物层：只显示正式结果（keep_forever），中间产物不上图
+  const arts = chat.activeTaskArtifacts.filter(
+    (a) => a.type === 'geotiff' && a.retention_class === 'keep_forever')
+  const metas = []
+  for (const a of arts) {
+    try {
+      const meta = await api.get(`/api/artifacts/${a.id}/meta`)
+      if (meta.ok && meta.bounds) metas.push({ art: a, meta })
+    } catch (_) { /* 单个产物失败不影响其他 */ }
+  }
+  if (seq !== _refreshSeq) return
+  removeOverlays()
+  const ts = Date.now()
+  for (const { art, meta } of metas) {
+    list.push({
+      id: `artifact:${art.id}`,
+      artifact_id: art.id,
+      style: meta.style,
+      label: meta.label_dated || meta.style_label || meta.name,
+      group: 'result',
+      available: true,
+      visible: true,
+      opacity: 0.7,
+      opacityPct: 70,
+      // LST 产物层参与“显示温度”（lst_10m / lst_10m_filled）
+      is_lst: meta.style === 'lst_10m' || meta.style === 'lst_10m_filled',
+      bounds: [[meta.bounds[1], meta.bounds[0]], [meta.bounds[3], meta.bounds[2]]],
+    })
+  }
+  layers.value = list
+  taskEmptyHint.value = layers.value.length ? "" : t('map.noTaskLayers')
+  let fitted = false
+  for (const l of layers.value) {
+    const overlay = L.tileLayer(tileUrl(l, ts), {
+      opacity: l.opacity, zIndex: 500,
+      bounds: [[l.bounds[0][0], l.bounds[0][1]], [l.bounds[1][0], l.bounds[1][1]]],
+      minZoom: 0, maxNativeZoom: 14, maxZoom: 20,
+      noWrap: true, tileSize: 256, keepBuffer: 2, updateWhenIdle: false,
+    })
+    overlayMap[l.id] = overlay
+    if (l.visible) overlay.addTo(map)
+    if (!fitted) {
+      fitted = true
+      map.fitBounds([[l.bounds[0][0], l.bounds[0][1]], [l.bounds[1][0], l.bounds[1][1]]])
+    }
+  }
+}
+
 function onToggle(l) {
   if (!map || !overlayMap[l.id]) return
   if (l.visible) {
@@ -128,11 +225,14 @@ function onToggle(l) {
   }
 }
 
-// 透明度滑条（0-100%）→ l.opacity（0-1），供 Leaflet setOpacity 使用
-function onOpacity(l, val) {
-  const pct = Number(val)
+// 透明度滑条（0-100%）：显示值走独立的 opacityPct 字段（与滑条同源），
+// 避免只更新图层而数字滞后；l.opacity（0-1）供 Leaflet setOpacity 使用
+function onOpacity(l, ev) {
+  const pct = Number(ev && ev.target ? ev.target.value : ev)
   if (!Number.isFinite(pct)) return
-  l.opacity = Math.min(1, Math.max(0, pct / 100))
+  const clamped = Math.min(100, Math.max(0, Math.round(pct)))
+  l.opacityPct = clamped
+  l.opacity = clamped / 100
   if (map && overlayMap[l.id]) overlayMap[l.id].setOpacity(l.opacity)
 }
 
@@ -200,15 +300,26 @@ function toggleTempMode() {
 }
 
 async function queryTemps(lat, lon) {
-  const ids = checkedLstLayers.value.map((l) => l.id)
-  if (!ids.length) {
+  const targets = checkedLstLayers.value
+  if (!targets.length) {
     tempValues.value = {}
     return
   }
+  // 入口协议：旧对话图层（字符串 id）与新任务图层（输入/产物对象）统一批量
+  // 一次请求；服务端按各自样式换算为 K
+  const payload = targets.map((l) => {
+    if (l.input_key && l.task_id) {
+      return { kind: 'input', id: l.id, task_id: l.task_id, key: l.input_key }
+    }
+    if (l.artifact_id) {
+      return { kind: 'artifact', id: l.id, artifact_id: l.artifact_id }
+    }
+    return l.id
+  })
   try {
     const r = await api.post(
       `/api/lst-values?conv=${encodeURIComponent(conv.value || '')}`,
-      { lat, lon, layers: ids },
+      { lat, lon, layers: payload },
     )
     tempValues.value = r.values || {}
   } catch (_) {
@@ -276,6 +387,9 @@ watch(projectDir, async () => {
   if (map) { map.invalidateSize(); refresh() }
 })
 
+// 选中任务变化（面板联动中枢）：地图切换到该任务的产物图层
+watch(() => chat.activeTaskId, () => { if (map) refresh() })
+
 // 图层勾选/透明度变化时刷新温度采样（勾选新图层 → 立即补查该点温度）
 watch(
   () => layers.value.map((l) => `${l.id}:${l.visible}`).join(','),
@@ -287,12 +401,22 @@ watch(
 )
 
 const hasAny = computed(() => layers.value.some((l) => l.available))
+
+// 分组显示名：新任务图层用语言键（acquire/result），旧图层保留原文并做英文映射
+function groupName(g) {
+  if (g === 'acquire' || g === '数据获取') return t('map.grpAcquire')
+  if (g === 'result' || g === '结果') return t('map.grpResult')
+  return mapLayerLabel(g || '') || t('map.defaultGroup')
+}
+
 const groups = computed(() => {
   const g = {}
   for (const l of layers.value) {
     if (!l.available) continue
-    const gname = mapLayerLabel(l.group || '') || t('map.defaultGroup')
-    ;(g[gname] = g[gname] || []).push({ ...l, label: mapLayerLabel(l.label) || l.label || l.id })
+    const gname = groupName(l.group)
+    // 必须保留源对象引用（响应式）：此前用 { ...l } 浅拷贝导致
+    // 滑条/勾选修改的是副本，透明度数字等界面永远不更新
+    ;(g[gname] = g[gname] || []).push(l)
   }
   return g
 })
@@ -300,6 +424,10 @@ const groups = computed(() => {
 
 <template>
   <div class="map-frame-wrap">
+    <TaskResultSelect class="map-result-select" />
+    <p v-if="taskEmptyHint" class="form-hint" style="margin:-4px 0 8px">
+      {{ taskEmptyHint }}
+    </p>
     <div class="map-toolbar">
       <button class="btn btn--sm" @click="refresh">
         <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/></svg>
@@ -350,17 +478,17 @@ const groups = computed(() => {
                 v-model="l.visible"
                 @change="onToggle(l)"
               />
-              <span class="layer-row__label" :title="l.label">{{ l.label || l.id }}</span>
+              <span class="layer-row__label" :title="l.label">{{ mapLayerLabel(l.label) || l.label || l.id }}</span>
             </label>
             <input
               type="range"
               class="layer-row__opacity"
               min="0" max="100"
-              :value="Math.round(l.opacity * 100)"
-              :title="t('map.opacityTitle', { pct: Math.round(l.opacity * 100) })"
-              @input="onOpacity(l, $event.target.value)"
+              :value="l.opacityPct"
+              :title="t('map.opacityTitle', { pct: l.opacityPct })"
+              @input="onOpacity(l, $event)"
             />
-            <span class="layer-row__pct">{{ Math.round(l.opacity * 100) }}%</span>
+            <span class="layer-row__pct">{{ l.opacityPct }}%</span>
           </div>
         </div>
       </div>
@@ -373,7 +501,7 @@ const groups = computed(() => {
         <div v-if="showCoord" class="temp-panel__coord">{{ coordText }}</div>
         <div v-if="checkedLstLayers.length" class="temp-panel__rows">
           <div v-for="l in checkedLstLayers" :key="l.id" class="temp-panel__row">
-            <span class="temp-panel__name" :title="l.label">{{ l.label }}</span>
+            <span class="temp-panel__name" :title="l.label">{{ mapLayerLabel(l.label) || l.label }}</span>
             <span class="temp-panel__val">{{ fmtTemp(showValues[l.id]) }}</span>
           </div>
         </div>

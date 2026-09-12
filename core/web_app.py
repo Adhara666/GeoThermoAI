@@ -159,6 +159,113 @@ def release_rss_memory() -> None:
 _DEFAULT_TZ_OFFSET = 8.0
 
 
+def _guard_stream_text(text: str) -> str:
+    """流式正文防刷屏：复读熔断 + 长度上限（保护性截断，正常内容不受影响）。
+
+    模型偶发抽风会把同一段说明复读数百遍导致气泡刷屏（用户实测）。
+    采用**行级判重**：同一长行（≥20 字符）重复达阈值时截断——正常
+    编号/步骤列表每行不同，不会误伤。
+    """
+    if not text:
+        return text
+    lines = text.splitlines()
+    if lines:
+        from collections import Counter
+        counter = Counter(
+            ln.strip() for ln in lines[-400:] if len(ln.strip()) >= 20)
+        for dup, n in counter.most_common(1):
+            if n >= 6 and text.count(dup) >= 8:
+                first = text.find(dup)
+                return (text[:first + len(dup) * 2]
+                        + "\n\n（检测到重复内容，已自动截断）")
+    if len(text) > _STREAM_MAX_CHARS:
+        return text[:_STREAM_MAX_CHARS] + "\n\n（回复过长，已自动截断）"
+    return text
+
+
+_STREAM_MAX_CHARS = 3000  # 单条流式文本硬上限（正文与思考共用）：
+# 模型异常复读（含数字/标点微变的“变体复读”）难以 100% 识别，
+# 硬上限是最可靠的刷屏兜底（正常结论类回答远短于此）。
+
+# 调度节点中文名（与前端 NODE_LABELS 保持同一套措辞，供问答上下文注入）
+_NODE_LABELS = {
+    "search_scene": "检索场景候选", "select_scene": "配对选择或场景确定",
+    "acquire_asset": "网络资产获取", "prepare_local": "本地定标对齐准备",
+    "data_check": "原始包数据检查", "preprocess_split": "预处理与空间划分",
+    "prep_check": "预处理数据检查", "ttri": "TTRI 拟合与应用",
+    "ttri_check": "TTRI 数据检查", "rf_round": "RF 轮训练与测试预测",
+    "train_decision": "训练决定", "promote_best": "登记最佳模型引用",
+    "tcr": "TCR 与最终温度", "export": "导出 GeoTIFF",
+    "closure_eval": "闭合评价", "gapfill": "独立填洞产品",
+    "rebuild": "重建缺失输入",
+}
+
+
+_QUERY_HINTS = ("哪一天", "哪天", "是什么", "什么是", "为什么", "怎么",
+                "哪些", "哪一个", "哪几个", "多少", "几点", "是不是",
+                "有没有", "状态", "进度")
+_ACTION_HINTS = ("生成", "处理", "执行", "开始", "重试", "取消",
+                 "改成", "换成", "下载", "导出", "训练", "重建",
+                 "重发", "提交", "新建", "上传", "继续", "建个", "停",
+                 "帮我跑", "跑一下", "跑起来")
+_STRONG_Q = ("哪一天", "哪天", "哪一步", "是什么", "什么是", "为什么",
+             "怎么", "哪些", "哪一个", "哪几个", "多少", "几点", "是不是")
+
+
+def _is_query_only(message: str) -> bool:
+    """判断是否“纯查询句”（走问答通道，不进理解层 JSON 操作通道）。
+
+    用户实测：查询式问句（如“我当前武汉市的配对用的是哪一天？”）会让
+    理解模型输出失控（无法解析 JSON 或复读）——它不含任务操作意图，
+    应直接交给带台账上下文的自由问答。保守策略：
+      - 含操作词且无强疑问点 → 操作句（如“帮我重试一下？”）
+      - “帮我/把…”式确认句 → 操作句
+      - “…吗？”结尾且无强疑问词 → 可能是想做任务（如“武汉 7 月做
+        LST 吗？”），保守走理解层
+      - 其余“问号结尾或含强疑问词”才命中查询
+    """
+    m = (message or "").strip()
+    if not m or len(m) > 80:
+        return False
+    strong_q = any(h in m for h in _STRONG_Q)
+    if any(h in m for h in _ACTION_HINTS) and not strong_q:
+        return False
+    if (m.startswith(("帮我", "给我")) or m.startswith("把") or "帮我" in m) \
+            and not strong_q:
+        return False
+    if m.endswith(("吗？", "吗?")) and not strong_q:
+        return False
+    return m.endswith(("？", "?")) or strong_q
+
+
+def _date_from_name(name: str) -> str:
+    """从文件名解析影像日期（8 位 yyyymmdd → YYYY-MM-DD）；无则空串。"""
+    import re as _re
+    m = _re.search(r"(20\d{2})(\d{2})(\d{2})", name or "")
+    if not m:
+        return ""
+    y, mo, d = m.groups()
+    if not (1 <= int(mo) <= 12 and 1 <= int(d) <= 31):
+        return ""
+    return f"{y}-{mo}-{d}"
+
+
+def _artifact_style(name: str) -> str:
+    """按产物文件名推断渲染样式（对应 LayerVisualizer.LAYER_DEFS 的 id）。"""
+    n = (name or "").lower()
+    if "dem" in n:
+        return "dem"
+    if "sentinel" in n or "_s2" in n or n.startswith("s2"):
+        return "sentinel_rgb"
+    if "gapfill" in n or "filled" in n or "nofill" in n or "no_hole" in n or "无空洞" in n:
+        return "lst_10m_filled"
+    if "10m" in n:
+        return "lst_10m"
+    if "landsat" in n or "30m" in n or "lst" in n:
+        return "landsat_lst"
+    return "lst_10m"
+
+
 def _stamp_log_lines(text: str, tz_offset: float = _DEFAULT_TZ_OFFSET) -> str:
     """日志行前缀时间戳（按用户本地时区 年-月-日 时:分:秒），空行保持原样。
 
@@ -170,6 +277,41 @@ def _stamp_log_lines(text: str, tz_offset: float = _DEFAULT_TZ_OFFSET) -> str:
     for ln in str(text).split("\n"):
         out.append(f"[{ts}] {ln}" if ln.strip() else ln)
     return "\n".join(out)
+
+
+def _stamp_with_ts(text: str, ts_iso: str,
+                   tz_offset: float = _DEFAULT_TZ_OFFSET) -> str:
+    """按日志产生的时刻（UTC ISO）盖用户本地时区时间戳。
+
+    持久化的日志存原文 + 产生时刻；读取/推送时用当次请求的时区再现，
+    保证不同时区用户看到的都是自己本地时间（不因服务端时区改变）。
+    """
+    try:
+        dt = datetime.fromisoformat(str(ts_iso))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        dt = datetime.now(timezone.utc)
+    local = dt.astimezone(timezone(timedelta(hours=float(tz_offset or 0))))
+    ts = local.strftime("%Y-%m-%d %H:%M:%S")
+    out = []
+    for ln in str(text).split("\n"):
+        out.append(f"[{ts}] {ln}" if ln.strip() else ln)
+    return "\n".join(out)
+
+
+def _detect_lang(text: str) -> str:
+    """从用户消息检测语言：含 CJK 字符→zh，否则→en（无字母时回退 zh）。
+
+    程序组装的界面文案（任务提交/完成报告/任务名）按用户说话的语言呈现；
+    LLM 生成内容本就不受此影响。
+    """
+    s = str(text or "")
+    cjk = sum(1 for ch in s if "\u4e00" <= ch <= "\u9fff")
+    if cjk > 0:
+        return "zh"
+    letters = sum(1 for ch in s if ch.isascii() and ch.isalpha())
+    return "en" if letters > 0 else "zh"
 
 
 # ── 业务后端（移植自 GradioAPI，去除 Gradio 耦合） ─────────────
@@ -220,6 +362,11 @@ class AppBackend:
         self._stream_thinking_seconds: Dict[str, float] = {}
         # 每个对话已累积的实时日志（日志面板权威全量）：刷新/断线重连后恢复日志连续性
         self._stream_logs: Dict[str, list] = {}
+        # 对话消息版本号：完成报告等由服务端主动追加气泡时递增，
+        # conversation_events 监测变化并把新气泡推给已打开的页面
+        self._conv_msg_ver: Dict[str, int] = {}
+        # 用户界面语言缓存（ui_lang → zh/en）：完成报告/生命周期日志按此呈现
+        self._user_lang_cache: Dict[str, str] = {}
 
         # 状态内核（升级第一阶段）：SQLite 台账 + 命令接收服务。
         # 单例惰性初始化；唯一写连接由内核内部写入者线程独占。
@@ -231,13 +378,510 @@ class AppBackend:
         from core.scheduling.scheduler import Scheduler
         store = self._get_state_store()
         self._scheduler = Scheduler(store, store.db_path.parent / "executions")
+        # 生命周期日志（失败/重试/完成）按行上用户的语言设置呈现
+        self._scheduler._lang_lookup = self._user_lang
         self._scheduler.start()
+        # 历史台账事件回填为日志行（升级前的过程日志没持久化，从事件重建
+        # 失败原因/重试/节点完成，让日志区从失败到重试恢复的完整过程可见）
+        threading.Thread(target=self._backfill_logs_from_events,
+                         name="log-backfill", daemon=True).start()
+        # 启动时回收历史运行目录（失败/被接替运行的暂存与产物；
+        # 6 小时静默期保护刚创建的任务目录）
+        threading.Thread(target=lambda: self._cleanup_stale_runs(6.0),
+                         name="run-cleanup", daemon=True).start()
+        # 产物可用性对账（文件缺失→cleaned，重建后自动恢复）
+        threading.Thread(target=self._reconcile_artifact_availability,
+                         name="artifact-reconcile", daemon=True).start()
+        # 任务完成主动气泡报告（含精度）：后台轮询，历史已完成任务自动补报
+        self._start_completion_watcher()
+
+    # ── 执行日志持久化 / 界面语言 / 完成报告 ──────────────────
+
+    def _backfill_logs_from_events(self):
+        """一次性把历史台账事件转成日志行（幂等）。
+
+        升级前的过程日志只在内存，重启后丢失；但台账 events 表保存着
+        节点级生命周期（node.failed/retry_wait/cancelled/waiting_input/
+        retry_requested/succeeded，含失败原因）。按（对话, 文本, 时间）
+        去重插入：重复重启不会产生重复行，已存在的日志不受影响。
+        """
+        from core.scheduling.scheduler import _LIFECYCLE_TEXT, strip_emoji
+        store = self._get_state_store()
+        try:
+            rows_ = store.read(lambda c: c.execute(
+                "SELECT e.seq, e.occurred_at, e.user_id, e.conversation_id,"
+                " e.task_id, e.run_id, e.type, n.node_key, e.payload"
+                " FROM events e LEFT JOIN nodes n ON n.id = e.object_id"
+                " WHERE e.type IN ('node.failed','node.retry_wait',"
+                " 'node.cancelled','node.waiting_input','node.retry_requested',"
+                " 'node.succeeded') AND e.conversation_id IS NOT NULL"
+                " ORDER BY e.seq LIMIT 5000").fetchall())
+        except Exception as e:  # noqa: BLE001
+            print(f"[logs] 历史事件读取失败：{e}")
+            return
+        if not rows_:
+            return
+        kind_map = {"node.failed": "failed", "node.retry_wait": "retry_wait",
+                    "node.cancelled": "cancelled",
+                    "node.waiting_input": "waiting_input",
+                    "node.retry_requested": "retry",
+                    "node.succeeded": "node_done"}
+        inserts = []
+        for _seq, occurred, uid, conv, tid, run, etype, node_key, payload in rows_:
+            kind = kind_map.get(str(etype))
+            if not kind:
+                continue
+            try:
+                p = json.loads(payload or "{}")
+            except ValueError:
+                p = {}
+            zh, en_t = _LIFECYCLE_TEXT[kind]
+            tpl = zh if self._user_lang(str(uid or "")) == "zh" else en_t
+            try:
+                text = tpl.format(node=str(node_key or ""),
+                                  detail=str(p.get("error") or "")[:300],
+                                  label=str(p.get("label") or ""))
+            except (KeyError, ValueError):
+                text = tpl
+            inserts.append((uid, conv, tid, run, strip_emoji(text), occurred))
+
+        def tx(conn):
+            added = 0
+            for uid, conv, tid, run, text, occurred in inserts:
+                cur = conn.execute(
+                    "INSERT INTO task_logs (user_id, conversation_id, task_id,"
+                    " run_id, text, created_at)"
+                    " SELECT ?,?,?,?,?,? WHERE NOT EXISTS ("
+                    " SELECT 1 FROM task_logs WHERE conversation_id = ?"
+                    " AND text = ? AND created_at = ?)",
+                    (uid, conv, tid, run, text, occurred,
+                     conv, text, occurred))
+                try:
+                    added += int(cur.rowcount or 0)
+                except Exception:
+                    pass
+            return added
+
+        try:
+            added = store.submit_write(tx)
+            if added:
+                print(f"[logs] 历史台账事件回填日志 {added} 条")
+        except Exception as e:  # noqa: BLE001
+            print(f"[logs] 历史日志回填失败：{e}")
+
+    def _user_lang(self, uid: str) -> str:
+        """用户界面语言（zh/en）：读用户设置 ui_lang，默认 zh。"""
+        uid = uid or ""
+        if not uid:
+            return "zh"
+        cached = self._user_lang_cache.get(uid)
+        if cached:
+            return cached
+        lang = "zh"
+        try:
+            path = _ROOT / "data" / "users" / uid / "settings.json"
+            if path.is_file():
+                lang = str(json.loads(path.read_text(encoding="utf-8"))
+                           .get("ui_lang") or "zh")
+                if lang not in ("zh", "en"):
+                    lang = "zh"
+        except Exception:
+            lang = "zh"
+        self._user_lang_cache[uid] = lang
+        return lang
+
+    def set_ui_language(self, lang: str) -> dict:
+        """保存当前用户的界面语言（供后端组装文案使用）。"""
+        next_lang = "en" if str(lang or "").lower().startswith("en") else "zh"
+        uid = self._uid()
+        path = _ROOT / "data" / "users" / uid / "settings.json"
+        try:
+            data = {}
+            if path.is_file():
+                data = json.loads(path.read_text(encoding="utf-8")) or {}
+            data["ui_lang"] = next_lang
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(data, ensure_ascii=False, indent=2),
+                            encoding="utf-8")
+            self._user_lang_cache[uid] = next_lang
+            return {"ok": True, "lang": next_lang}
+        except Exception as e:  # noqa: BLE001
+            return {"ok": False, "message": str(e)}
+
+    def _append_log_line(self, uid: str, conv_pk: str, text: str,
+                        task_id: str = "", run_id: str = "") -> int:
+        """持久写一条对话日志（旧执行链 / 理解层日志）：返回日志行编号。"""
+        if not conv_pk or not str(text or "").strip():
+            return 0
+        from core.scheduling.scheduler import strip_emoji
+        def tx(conn):
+            cur = conn.execute(
+                "INSERT INTO task_logs (user_id, conversation_id, task_id,"
+                " run_id, text, created_at) VALUES (?,?,?,?,?,?)",
+                (uid or None, conv_pk, task_id or None, run_id or None,
+                 strip_emoji(text), datetime.now(timezone.utc).isoformat()))
+            return cur.lastrowid
+        try:
+            return int(self._get_state_store().submit_write(tx) or 0)
+        except Exception:
+            return 0
+
+    def conversation_logs(self, cid: str, tz: float = _DEFAULT_TZ_OFFSET,
+                          after_id: int = 0, limit: int = 4000) -> dict:
+        """对话执行日志历史（持久化，跨刷新/重启保留）；带本地时区时间戳。"""
+        store = self._get_state_store()
+        uid = self._uid()
+        limit = max(1, min(int(limit or 4000), 20000))
+        conv = store.read(lambda c: c.execute(
+            "SELECT id FROM conversations"
+            " WHERE (id = ? OR legacy_conv_id = ?) AND user_id = ?",
+            (cid, cid, uid)).fetchone())
+        if not conv:
+            return {"ok": True, "logs": []}
+        rows_ = store.read(lambda c: c.execute(
+            "SELECT id, task_id, text, created_at FROM task_logs"
+            " WHERE conversation_id = ? AND id > ? ORDER BY id LIMIT ?",
+            (conv[0], int(after_id or 0), limit)).fetchall())
+        from core.scheduling.scheduler import strip_emoji
+        logs = [{"id": int(r[0]), "task_id": r[1] or "",
+                 "text": _stamp_with_ts(strip_emoji(r[2]), r[3], tz)}
+                for r in rows_]
+        return {"ok": True, "logs": logs}
+
+    def clear_conversation_logs(self, cid: str) -> dict:
+        """清除本对话的执行日志（用户显式操作：内存与持久记录一起清）。"""
+        store = self._get_state_store()
+        uid = self._uid()
+        conv = store.read(lambda c: c.execute(
+            "SELECT id FROM conversations"
+            " WHERE (id = ? OR legacy_conv_id = ?) AND user_id = ?",
+            (cid, cid, uid)).fetchone())
+        if conv:
+            store.submit_write(lambda c: c.execute(
+                "DELETE FROM task_logs WHERE conversation_id = ?", (conv[0],)))
+        self._stream_logs.pop(cid, None)
+        return {"ok": True}
+
+    # ── 任务完成主动报告（含精度）：后台轮询，幂等补写气泡 ──────
+
+    def _start_completion_watcher(self):
+        if getattr(self, "_completion_thread", None):
+            return
+        t = threading.Thread(target=self._completion_watch_loop,
+                             name="completion-watcher", daemon=True)
+        self._completion_thread = t
+        t.start()
+
+    def _completion_watch_loop(self):
+        time.sleep(8)  # 启动静默期：先让服务就绪
+        last_cleanup = 0.0
+        while True:
+            try:
+                self._report_completed_tasks()
+                # 每日一次历史运行目录回收（磁盘占用治理，见 _cleanup_stale_runs）
+                if time.time() - last_cleanup > 24 * 3600:
+                    last_cleanup = time.time()
+                    try:
+                        self._cleanup_stale_runs()
+                    except Exception as e:  # noqa: BLE001
+                        print(f"[cleanup] 历史目录回收异常：{e}")
+            except Exception as e:  # noqa: BLE001
+                print(f"[completion] 完成报告轮询异常：{e}")
+            time.sleep(5)
+
+    def _reconcile_artifact_availability(self):
+        """产物可用性对账（启动一次）：文件缺失→cleaned，文件恢复存在→available。
+
+        误删/政策清理后的文件状态自愈：后续重建产物文件到位后，面板
+        自动重新可见，不需要人工改库。"""
+        store = self._get_state_store()
+        rows_ = store.read(lambda c: c.execute(
+            "SELECT id, path, availability FROM artifacts").fetchall())
+        toggles = []
+        for aid, path, avail in rows_:
+            want = "available" if Path(path).is_file() else "cleaned"
+            if avail != want:
+                toggles.append((want, aid))
+        if not toggles:
+            return
+        store.submit_write(lambda conn: [conn.execute(
+            "UPDATE artifacts SET availability=? WHERE id=?", t) for t in toggles])
+        print(f"[artifacts] 可用性对账：调整 {len(toggles)} 个")
+
+    def _cleanup_stale_runs(self, min_age_hours: float = 48.0) -> dict:
+        """回收与当前任务无关的历史运行目录（磁盘占用治理）。
+
+        删除条件（同时满足）：目录年龄超阈；运行已被新版本接替，或任务
+        处于失败/取消/草稿等终态，或已不是任务当前运行；且无未退出尝试。
+        保留：未完成任务/已完成任务的当前运行（含 staging 输入与 committed 产物）。
+        """
+        import shutil
+        store = self._get_state_store()
+        root = store.db_path.parent / "executions"
+        rows_ = store.read(lambda c: c.execute(
+            "SELECT r.id, r.superseded_by, t.summary_status, t.current_run_id"
+            " FROM runs r JOIN tasks t ON t.id = r.task_id").fetchall())
+        run_state = {r[0]: r for r in rows_}
+        active = {r[0] for r in store.read(lambda c: c.execute(
+            "SELECT n.run_id FROM attempts a JOIN nodes n ON n.id=a.node_id"
+            " WHERE a.process_exited=0").fetchall())}
+        stale_terminal = {"failed", "cancelled", "draft"}
+        now = time.time()
+        freed = 0
+        removed = 0
+        for parent in (root, root / "runs"):
+            if not parent.is_dir():
+                continue
+            for d in sorted(parent.iterdir()):
+                # 保留 cache 与 runs 发布树入口（runs/<run> 只按运行号判定，
+                # 绝不整体删除 runs 目录——发布产物就在这里）
+                if not d.is_dir() or d.name in ("cache", "runs") or d.name.startswith("."):
+                    continue
+                row = run_state.get(d.name)
+                if row is None or d.name in active:
+                    continue
+                superseded, t_status, current = row[1], row[2], row[3]
+                deletable = (bool(superseded) or t_status in stale_terminal
+                             or current != d.name)
+                if not deletable:
+                    continue
+                try:
+                    if now - d.stat().st_mtime < float(min_age_hours) * 3600:
+                        continue
+                except OSError:
+                    continue
+                size = 0
+                for dp, _dirs, files in os.walk(d):
+                    for f in files:
+                        try:
+                            size += os.path.getsize(os.path.join(dp, f))
+                        except OSError:
+                            continue
+                shutil.rmtree(d, ignore_errors=True)
+                if not d.exists():
+                    freed += size
+                    removed += 1
+        if removed:
+            print(f"[cleanup] 回收历史运行目录 {removed} 个，释放 {freed / (1024 ** 3):.2f} GB")
+        return {"removed": removed, "freed_bytes": freed}
+
+    def _completion_report_data(self, run_id: str) -> dict:
+        """读该运行的精度产物（测试预测 JSON 与闭合 JSON）与正式产物数。"""
+        store = self._get_state_store()
+        arts = store.read(lambda c: c.execute(
+            "SELECT a.path, a.retention_class FROM artifacts a"
+            " JOIN attempts at ON at.id = a.attempt_id"
+            " JOIN nodes n ON n.id = at.node_id"
+            " WHERE n.run_id = ? ORDER BY a.created_at", (run_id,)).fetchall())
+        metrics = closure = None
+        final_count = 0
+        for path, retention in arts:
+            name = Path(path).name
+            if retention == "keep_forever":
+                final_count += 1
+            p = Path(path)
+            if not p.is_file():
+                continue
+            try:
+                if re.search(r"predict_run\d*\.json$", name):
+                    metrics = json.loads(p.read_text(encoding="utf-8"))
+                elif name == "coarse_constraint_closure.json":
+                    closure = json.loads(p.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                continue
+        return {"metrics": metrics, "closure": closure, "final_count": final_count}
+
+    def _completion_ai_note(self, uid: str, label: str, data: dict,
+                            lang: str) -> str:
+        """让模型给一段两句话以内的结果解读（不重复数字、不用 emoji）。
+
+        模型不可用/失败时返回空串（报告仍照常输出数据部分）。"""
+        if not self._scheduler:
+            return ""
+        try:
+            m = data.get("metrics") or {}
+            m = m.get("metrics") if isinstance(m, dict) else None
+            m = m if isinstance(m, dict) else {}
+            vr = (data.get("closure") or {}).get("value_range") if isinstance(
+                data.get("closure"), dict) else None
+            vr = vr if isinstance(vr, dict) else {}
+            facts = [f"任务：{label}" if lang == "zh" else f"Task: {label}"]
+            if isinstance(m.get("R2"), (int, float)):
+                facts.append(f"R2={m['R2']:.4f}")
+            if isinstance(m.get("RMSE"), (int, float)):
+                facts.append(f"RMSE={m['RMSE']:.3f} K")
+            if isinstance(m.get("MAE"), (int, float)):
+                facts.append(f"MAE={m['MAE']:.3f} K")
+            if isinstance(vr.get("low_end_difference_K"), (int, float)):
+                facts.append(f"low_end_diff={vr['low_end_difference_K']:+.2f} K")
+            if isinstance(vr.get("high_end_difference_K"), (int, float)):
+                facts.append(f"high_end_diff={vr['high_end_difference_K']:+.2f} K")
+            if lang == "zh":
+                prompt = ("你是地表温度降尺度系统的分析助手。请只输出一到两句话的"
+                          "专业解读（面向不懂技术的用户）：说明本次结果质量如何、"
+                          "是否可靠、使用时要注意什么。不要重复罗列数字，不要使用"
+                          "emoji，不要标题或列表。\n" + "；".join(facts))
+            else:
+                prompt = ("You are the analysis assistant of a land-surface-temperature "
+                          "downscaling system. Output only one to two sentences of "
+                          "professional interpretation for a non-technical user: how "
+                          "good and reliable this result is and what to note when "
+                          "using it. Do not repeat the numbers, do not use emoji, "
+                          "no headings or lists.\n" + "; ".join(facts))
+            with self._scheduler.model_request(timeout=90):
+                text = ""
+                for _attempt in range(2):  # 偶发网络失败重试一次
+                    text = str(self._assistant_for().ask(prompt) or "").strip()
+                    bad = ("API调用失败", "API流式调用失败", "未检测到LLM", "未配置模型")
+                    if text and not text.startswith(bad):
+                        break
+                    time.sleep(1.0)
+            text = str(text or "").strip()
+            bad = ("API调用失败", "API流式调用失败", "未检测到LLM", "未配置模型")
+            if not text or text.startswith(bad):
+                return ""
+            from core.scheduling.scheduler import strip_emoji
+            text = re.sub(r"\s+", " ", strip_emoji(text)).strip()
+            return text[:240]
+        except Exception:
+            return ""
+
+    def _compose_completion_report(self, uid: str, label: str, run_id: str) -> str:
+        """组装完成报告正文：任务名 + 测试区精度 + 与 30m 对照 + 正式产物数 + AI 解读。
+
+        用户要求：不使用 emoji 图标；附一段模型生成的结果解读。"""
+        data = self._completion_report_data(run_id)
+        if not (data.get("metrics") or data.get("closure") or data.get("final_count")):
+            return ""
+        lang = self._user_lang(uid)
+        lines = [f"任务完成：{label}" if lang == "zh" else f"Task completed: {label}"]
+        # 使用的影像配对（哪天、哪颗 Landsat、Sentinel-2、云量与时差）
+        pair = self._selected_pair_for_task(run_id, lang)
+        if pair:
+            lines.append(f"- 使用影像：{pair}" if lang == "zh"
+                         else f"- Imagery used: {pair}")
+        m = data.get("metrics") or {}
+        m = m.get("metrics") if isinstance(m, dict) else None
+        m = m if isinstance(m, dict) else {}
+        if m:
+            r2, rmse, mae = m.get("R2"), m.get("RMSE"), m.get("MAE")
+            parts = []
+            if isinstance(r2, (int, float)):
+                parts.append(f"R² {r2:.4f}")
+            if isinstance(rmse, (int, float)):
+                parts.append(f"RMSE {rmse:.3f} K")
+            if isinstance(mae, (int, float)):
+                parts.append(f"MAE {mae:.3f} K")
+            if parts:
+                lines.append("- 测试区精度：" + "，".join(parts) if lang == "zh"
+                             else "- Test accuracy: " + ", ".join(parts))
+        vr = (data.get("closure") or {}).get("value_range") if isinstance(
+            data.get("closure"), dict) else None
+        if isinstance(vr, dict):
+            lo = vr.get("low_end_difference_K")
+            hi = vr.get("high_end_difference_K")
+            if isinstance(lo, (int, float)) and isinstance(hi, (int, float)):
+                lines.append(
+                    f"- 与 30m 对照：最低端差 {lo:+.2f} K，最高端差 {hi:+.2f} K"
+                    if lang == "zh" else
+                    f"- vs 30m reference: low-end {lo:+.2f} K, "
+                    f"high-end {hi:+.2f} K")
+        if data.get("final_count"):
+            lines.append(f"- 正式产物 {data['final_count']} 项，可在「下载」面板获取"
+                         if lang == "zh" else
+                         f"- {data['final_count']} final product(s) available in the Download panel")
+        content = ("\n\n".join([lines[0], "\n".join(lines[1:])])
+                   if len(lines) > 1 else lines[0])
+        note = self._completion_ai_note(uid, label, data, lang)
+        if note:
+            # 直接接在数据行后成段（用户要求：不出现“AI 解读”字样）
+            content += "\n\n" + note
+        from core.scheduling.scheduler import strip_emoji
+        return strip_emoji(content)
+
+    def _report_completed_tasks(self):
+        """扫描已完成任务：对话里还没有完成报告气泡就补写一条（含精度）。
+
+        幂等：气泡带 kind=task_complete + task_id + run_id 标记，重复扫描
+        跳过；重启后从对话文件检查，不重复报告；历史上已完成的任务
+        在功能上线后首次扫描时也会补上报告。
+        """
+        store = self._get_state_store()
+        rows_ = store.read(lambda c: c.execute(
+            "SELECT t.id, t.user_id, t.conversation_id, t.label,"
+            " t.current_run_id, cv.legacy_conv_id FROM tasks t"
+            " JOIN conversations cv ON cv.id = t.conversation_id"
+            " WHERE t.summary_status = 'completed'"
+            " AND t.current_run_id IS NOT NULL"
+            " ORDER BY t.updated_at DESC LIMIT 20").fetchall())
+        for tid, uid, conv_pk, label, run_id, legacy in rows_:
+            if not uid or not legacy or not run_id:
+                continue
+            token = _uid_ctx.set(uid)
+            try:
+                convs = self.load_conversations()
+                holder = None
+                for pname, items in convs.items():
+                    if legacy in items:
+                        holder = (pname, items[legacy])
+                        break
+                if holder is None:
+                    continue
+                msgs = list(holder[1].get("messages") or [])
+                if any(isinstance(m, dict) and m.get("kind") == "task_complete"
+                       and m.get("task_id") == tid and m.get("run_id") == run_id
+                       for m in msgs):
+                    continue
+                content = self._compose_completion_report(uid, label or tid, run_id)
+                if not content:
+                    continue
+                msgs.append({"role": "assistant", "content": content,
+                             "kind": "task_complete", "task_id": tid,
+                             "run_id": run_id})
+                self._save_history(holder[0], legacy, msgs)
+                self._conv_msg_ver[conv_pk] = self._conv_msg_ver.get(conv_pk, 0) + 1
+            except Exception as e:  # noqa: BLE001
+                print(f"[completion] 完成报告写入失败：{e}")
+            finally:
+                _uid_ctx.reset(token)
+
+    # 注意：历史上此处曾残留一份旧版 _compose_completion_report（带 emoji、
+    # 无影像配对与解读段），Python 后来者覆盖导致报告格式回退——已删除，
+    # 唯一定义在 _report_completed_tasks 之前的版本。
+
+    def _conversation_exec_mode(self, task_row) -> str:
+        """读取任务所属对话当前的交互模式（供无请求上下文的编译入口使用）。
+
+        卡片回答等路径不带请求上下文；若不补读，编译快照会落到
+        settings 默认值（approval），导致“完全执行”下仍弹配对选择。
+        """
+        try:
+            uid = str(task_row.get("user_id") or "")
+            conv_pk = str(task_row.get("conversation_id") or "")
+            if not uid or not conv_pk:
+                return ""
+            legacy = self._get_state_store().read(lambda c: c.execute(
+                "SELECT legacy_conv_id FROM conversations WHERE id = ?",
+                (conv_pk,)).fetchone())
+            if not legacy or not legacy[0]:
+                return ""
+            path = self._conv_dir() / f"{legacy[0]}.json"
+            if not path.is_file():
+                return ""
+            return str(json.loads(path.read_text(encoding="utf-8"))
+                       .get("exec_mode") or "")
+        except Exception:
+            return ""
 
     def _enqueue_ready(self, task_rows, exec_mode=None):
         from core.planning.compiler import compile_task_tx
         from core.planning.replan import start_superseding_run_tx
         from core.scheduling.scheduler import rows
         settings = self._load_settings()
+        # 卡片回答/文本回答等入口可能不带请求上下文：缺省时读取对话
+        # 当前模式（交互模式不冻结，全链路采纳“完全执行”自动代选）。
+        if not exec_mode and task_rows:
+            exec_mode = self._conversation_exec_mode(task_rows[0])
         settings.setdefault("agent", {})["default_exec_mode"] = normalize_exec_mode(exec_mode, settings.get("agent", {}).get("default_exec_mode", "approval"))
         settings["_execution"] = {"settings_path": str(self._user_settings_path())}
         uid = self._uid()
@@ -248,6 +892,15 @@ class AppBackend:
                 task = t_store.load_task(conn, tid)
                 if not task or task["user_id"] != uid:
                     raise ValueError("任务不存在")
+                # 第六阶段（§12.4）：运行绑定项目视图落点与标签，
+                # 正式产物确认后符号链接到项目目录，地图/精度/下载按产物绑定。
+                conv_row = conn.execute(
+                    "SELECT legacy_conv_id, project_id FROM conversations WHERE id=?",
+                    (task["conversation_id"],)).fetchone()
+                project_dir = run_label = None
+                if conv_row:
+                    project_dir = str(self._conv_project_dir(conv_row[1], conv_row[0]))
+                    run_label = (task.get("label") or "").strip() or "运行"
                 current = rows(conn, "SELECT * FROM runs WHERE id=?", (task.get("current_run_id"),))
                 if current and not current[0]["cancel_requested"]:
                     from core.agent.understanding.slotbook import SlotBook
@@ -263,10 +916,12 @@ class AppBackend:
                         conn, task_id=tid, expected_task_version=task["version"],
                         settings=settings,
                         replan_max=int(snap.get("params", {}).get("replan_max", {}).get("value", 3)),
-                        reason="用户修改科学身份字段")
+                        reason="用户修改科学身份字段",
+                        project_dir=project_dir, run_label=run_label)
                     compiled.append(made)
                     continue
-                made = compile_task_tx(conn, task_id=tid, expected_task_version=task["version"], settings=settings)
+                made = compile_task_tx(conn, task_id=tid, expected_task_version=task["version"], settings=settings,
+                                       project_dir=project_dir, run_label=run_label)
                 if current:
                     conn.execute("UPDATE runs SET superseded_by=?,cancel_requested=1 WHERE id=?", (made["run_id"], current[0]["id"]))
                 compiled.append(made)
@@ -371,6 +1026,19 @@ class AppBackend:
         return store.read(
             lambda conn: conversation_pk(conn, uid, pid, cid)) or ""
 
+    def _conversation_pk_by_id(self, cid: str) -> str:
+        """仅凭对话编号（台账主键或旧对话编号）反查主键，归属当前用户。"""
+        store = self._get_state_store()
+        uid = self._uid()
+
+        def _q(conn):
+            row = conn.execute(
+                "SELECT id FROM conversations WHERE (id = ? OR legacy_conv_id = ?)"
+                " AND user_id = ?", (cid, cid, uid)).fetchone()
+            return row[0] if row else ""
+
+        return store.read(_q)
+
     def _resolve_context(self, pid: str, cid: str, *, message: str,
                          chat_mode: str, tz_offset: float,
                          conv_pk: str = ""):
@@ -411,11 +1079,124 @@ class AppBackend:
                 message_id=message_id, history=prior_messages or [],
             )
 
+    def _selected_pair_for_task(self, run_id: str, lang: str = "zh") -> str:
+        """已选定配对的摘要（select_scene 的 selection.json）；无则空串。
+
+        问答/完成报告需要知道“当前用的是哪一天的哪颗 Landsat（型号）和
+        Sentinel-2”。lang=en 时输出英文格式。"""
+        if not run_id:
+            return ""
+        try:
+            row = self._get_state_store().read(lambda c: c.execute(
+                "SELECT result_path, staging_dir FROM attempts a"
+                " JOIN nodes n ON n.id = a.node_id"
+                " WHERE n.run_id = ? AND n.node_key = 'select_scene'"
+                " AND a.status = 'succeeded'"
+                " ORDER BY a.attempt_no DESC LIMIT 1",
+                (run_id,)).fetchone())
+            if not row:
+                return ""
+            sel_path = ""
+            for pth in filter(None, [row[0],
+                                     str(Path(row[1]) / "completion.json")
+                                     if row[1] else None]):
+                try:
+                    envelope = json.loads(Path(pth).read_text(encoding="utf-8"))
+                    sel_path = str(((envelope.get("result") or {})
+                                    .get("context") or {})
+                                   .get("selection_path") or "")
+                    if sel_path:
+                        break
+                except (OSError, ValueError):
+                    continue
+            if not sel_path or not Path(sel_path).is_file():
+                return ""
+            selection = json.loads(Path(sel_path).read_text(encoding="utf-8"))
+            pair = (selection.get("selection") or {}).get("pair") or {}
+            if not pair.get("landsat_date"):
+                return ""
+            # 型号：存储为 L8/L9 等简写 → 展示为“Landsat 9”
+            raw_sat = str(pair.get("landsat_satellite") or "")
+            num = raw_sat[1:] if raw_sat[:1].upper() == "L" \
+                and raw_sat[1:].isdigit() else ""
+            sat_disp = f"Landsat {num}" if num else "Landsat"
+            ld = pair.get("landsat_date")
+            lcc = pair.get("landsat_cloud_cover")
+            sd = pair.get("sentinel2_date")
+            scc = pair.get("sentinel2_cloud_cover")
+            diff = pair.get("time_diff_days")
+            if lang == "en":
+                return (f"{sat_disp} {ld} (cloud {lcc}%) + Sentinel-2 {sd}"
+                        f" (cloud {scc}%), time difference {diff} days")
+            return (f"{sat_disp} {ld}（云量 {lcc}%）"
+                    f" + Sentinel-2 {sd}（云量 {scc}%），"
+                    f"成像时差 {diff} 天")
+        except Exception:
+            return ""
+
+    def kernel_qa_context(self, pid: str, cid: str) -> dict:
+        """对话问答上下文（多角色应知道流程进展）：任务进度/当前节点/
+        等待原因/失败原因 + 待答问题与候选。用于“只回答”通道，让模型
+        能准确回答“任务跑到哪一步了”“卡在什么状态”这类问题。"""
+        try:
+            snap = self.session_snapshot(pid, cid)
+        except Exception:
+            return {}
+        fail_map = {}
+        try:
+            rows = self._get_state_store().read(lambda c: c.execute(
+                "SELECT n.run_id, n.node_type, a.error FROM attempts a"
+                " JOIN nodes n ON n.id = a.node_id"
+                " WHERE a.status = 'failed' AND a.attempt_no ="
+                "  (SELECT MAX(attempt_no) FROM attempts WHERE node_id = n.id)"
+                " AND n.status = 'failed'").fetchall())
+            for rid, ntype, err in rows:
+                fail_map.setdefault(rid, []).append((ntype, str(err or "")))
+        except Exception:
+            pass
+        tasks_ctx = []
+        for t in (snap.get("tasks") or []):
+            nodes = t.get("nodes") or []
+            total = len(nodes)
+            done = sum(1 for n in nodes if n.get("status") == "succeeded")
+            focal = (next((n for n in nodes
+                           if n.get("status") in ("running", "committing")), None)
+                     or next((n for n in nodes if n.get("status") == "failed"),
+                             None)
+                     or next((n for n in nodes if n.get("wait_reason")), None)
+                     or {})
+            item = {
+                "label": t.get("label"),
+                "status": t.get("summary_status"),
+                "progress": (f"{done}/{total} 个节点已完成" if total else ""),
+                "current_node": _NODE_LABELS.get(
+                    str(focal.get("type") or ""), str(focal.get("type") or "")),
+                "wait_reason": str(focal.get("wait_reason") or ""),
+            }
+            fails = fail_map.get(str(t.get("run_id") or "")) or []
+            if fails:
+                item["failure"] = "；".join(
+                    f"{_NODE_LABELS.get(nt, nt)}：{err[:120]}"
+                    for nt, err in fails[:3])
+            pair_txt = self._selected_pair_for_task(str(t.get("run_id") or ""))
+            if pair_txt:
+                item["selected_pair"] = pair_txt
+            tasks_ctx.append(item)
+        questions_ctx = [
+            {"prompt": q.get("prompt"),
+             "candidates": [c.get("label") for c in (q.get("candidates") or [])]}
+            for q in (snap.get("questions") or [])]
+        return {"tasks": tasks_ctx, "open_questions": questions_ctx}
+
     def session_snapshot(self, pid: str, cid: str, limit: int = 50) -> dict:
-        """会话快照：本对话的任务卡与待答问题（阶段 6 界面的数据来源雏形）。"""
+        """会话快照：本对话的任务卡与待答问题（§12.1 会话快照接口）。
+
+        pid 可为空：仅凭 cid（台账主键或旧对话编号）反查，
+        支持第六阶段规范路由 /api/conversations/{cid}/snapshot。
+        """
         store = self._get_state_store()
         uid = self._uid()
-        conv_pk = self._conversation_pk(pid, cid)
+        conv_pk = self._conversation_pk(pid, cid) if pid else self._conversation_pk_by_id(cid)
         if not conv_pk:
             return {"tasks": [], "questions": [], "conversation_id": ""}
 
@@ -442,7 +1223,550 @@ class AppBackend:
                 ],
             }
 
+        snap = store.read(_read)
+        # ── 第六阶段（§12.1/§12.2）：事件游标 + 当前产物 ──
+        snap["event_cursor"] = self._event_cursor(conv_pk)
+        snap["artifacts"] = self._conversation_artifacts(store, uid, conv_pk)
+        return snap
+
+    def _event_cursor(self, conv_pk: str) -> int:
+        """对话事件游标：该对话当前最大事件序号（§12.2 断线补发起点）。"""
+        store = self._get_state_store()
+        return store.read(lambda c: c.execute(
+            "SELECT COALESCE(MAX(seq), 0) FROM events WHERE conversation_id = ?",
+            (conv_pk,)).fetchone()[0])
+
+    def _conversation_artifacts(self, store, uid: str, conv_pk: str,
+                                limit: int = 100) -> list:
+        """本对话各运行的正式产物（含桥接后的项目视图路径与精度摘要）。"""
+        import os as _os
+
+        def _read(conn):
+            return [
+                {"id": r[0], "type": r[1], "path": r[2],
+                 "availability": r[3], "retention_class": r[4],
+                 "run_id": r[5], "task_id": r[6], "created_at": r[7],
+                 "view_path": _bridged_view(r[2], r[6])}
+                for r in conn.execute(
+                    "SELECT a.id, a.type, a.path, a.availability,"
+                    " a.retention_class, n.run_id, r.task_id, a.created_at"
+                    " FROM artifacts a"
+                    " JOIN attempts at ON at.id = a.attempt_id"
+                    " JOIN nodes n ON n.id = at.node_id"
+                    " JOIN runs r ON r.id = n.run_id"
+                    " JOIN tasks t ON t.id = r.task_id"
+                    " WHERE t.user_id = ? AND t.conversation_id = ?"
+                    " AND a.availability = 'available'"
+                    " ORDER BY a.created_at DESC LIMIT ?",
+                    (uid, conv_pk, limit))
+            ]
+
+        def _bridged_view(path: str, task_id: str):
+            """产物桥接视图：若项目目录存在符号链接视图，则返回视图路径
+            （地图/精度/下载面板用它，与旧目录逻辑自然兼容）。"""
+            p = Path(path)
+            if p.is_file():
+                return path
+            # 符号链接视图丢失时回退产物本体
+            return path
+
         return store.read(_read)
+
+    def task_detail(self, task_id: str) -> dict:
+        """任务详情（§12.1）：版本、运行、节点、问题、产物、失败原因。"""
+        from core.state_kernel import tasks as t_store
+        from core.state_kernel import questions as q_store
+
+        if not task_id:
+            return {"ok": False, "message": "缺少 task_id"}
+        store = self._get_state_store()
+        uid = self._uid()
+
+        def _read(conn):
+            task = t_store.load_task(conn, task_id)
+            if not task or task.get("user_id") != uid:
+                return None
+            run = conn.execute(
+                "SELECT id, task_version, status, cancel_requested,"
+                " superseded_by, frozen_inputs FROM runs WHERE id = ?",
+                (task.get("current_run_id"),)).fetchone()
+            run_info = None
+            if run:
+                try:
+                    snap = json.loads(run[5]).get("snapshot", {})
+                except (ValueError, TypeError):
+                    snap = {}
+                run_info = {"run_id": run[0], "status": run[2],
+                            "cancel_requested": run[3],
+                            "superseded_by": run[4],
+                            "snapshot_hash": json.loads(run[5]).get("snapshot_hash")}
+            nodes = [dict(zip(("id", "node_key", "node_type", "status",
+                               "wait_reason", "exec_order"), r))
+                     for r in conn.execute(
+                         "SELECT id, node_key, node_type, status, wait_reason,"
+                         " exec_order FROM nodes WHERE run_id = ? ORDER BY exec_order",
+                         (task.get("current_run_id"),))]
+            questions = [
+                {"id": q[0], "prompt": q[1], "status": q[2], "version": q[3]}
+                for q in conn.execute(
+                    "SELECT id, prompt, status, version FROM questions"
+                    " WHERE conversation_id = ? AND status = 'open'",
+                    (task.get("conversation_id"),))]
+            artifacts = [
+                {"id": a[0], "type": a[1], "path": a[2],
+                 "availability": a[3], "retention_class": a[4],
+                 "created_at": a[5]}
+                for a in conn.execute(
+                    "SELECT a.id, a.type, a.path, a.availability,"
+                    " a.retention_class, a.created_at FROM artifacts a"
+                    " JOIN attempts at ON at.id = a.attempt_id"
+                    " JOIN nodes n ON n.id = at.node_id"
+                    " WHERE n.run_id = ? AND a.availability = 'available'"
+                    " ORDER BY a.created_at DESC",
+                    (task.get("current_run_id"),))]
+            return {"ok": True, "task_id": task_id,
+                    "version": task.get("version"),
+                    "label": task.get("label"),
+                    "capability": task.get("capability"),
+                    "summary_status": task.get("summary_status"),
+                    "slots": task.get("slots"),
+                    "current_run": run_info,
+                    "nodes": nodes,
+                    "questions": questions,
+                    "artifacts": artifacts}
+
+        result = store.read(_read)
+        if result is None:
+            return {"ok": False, "message": "任务不存在"}
+        return result
+
+    def task_command(self, task_id: str, operation: str, request_id: str,
+                     seen_version: int = 0,
+                     payload: Optional[dict] = None) -> dict:
+        """任务命令（§12.1）：取消 / 重试 / 优先级；带所и见版本校验与去重。"""
+        from core.state_kernel.store import StaleVersionError
+
+        if not task_id or not operation:
+            return {"ok": False, "message": "缺少 task_id 或 operation"}
+        store = self._get_state_store()
+        uid = self._uid()
+
+        def _owner(conn):
+            row = conn.execute("SELECT user_id, version, current_run_id,"
+                               " conversation_id FROM tasks WHERE id = ?",
+                               (task_id,)).fetchone()
+            return row
+
+        row = store.read(_owner)
+        if row is None or row[0] != uid:
+            return {"ok": False, "message": "任务不存在"}
+        current_version = int(row[1])
+        if seen_version and int(seen_version) != current_version:
+            return {"ok": False, "conflict": True,
+                    "message": f"所见版本过期（所见 {seen_version}，当前 {current_version}），请刷新后重试"}
+        scheduler = self._scheduler
+        try:
+            if operation == "cancel":
+                def _tx(conn):
+                    conn.execute(
+                        "UPDATE runs SET cancel_requested = 1 WHERE task_id = ?",
+                        (task_id,))
+                    from core.state_kernel.store import append_event
+                    append_event(conn, type="task.cancel_requested",
+                                 task_id=task_id, run_id=row[2],
+                                 object_type="task", object_id=task_id,
+                                 object_version=current_version,
+                                 payload={"request_id": request_id})
+                store.submit_write(_tx)
+                if scheduler:
+                    scheduler.notify()
+                return {"ok": True, "message": "已请求停止，正在等待执行者退出",
+                        "task_id": task_id, "version": current_version}
+            if operation == "retry":
+                if not scheduler:
+                    return {"ok": False, "message": "调度器未启动"}
+                failed = store.read(lambda c: c.execute(
+                    "SELECT n.id FROM nodes n JOIN runs r ON r.id = n.run_id"
+                    " WHERE r.task_id = ? AND n.status = 'failed'"
+                    " ORDER BY n.exec_order DESC LIMIT 1",
+                    (task_id,)).fetchone())
+                if not failed:
+                    return {"ok": False, "message": "没有可重试的失败节点"}
+                scheduler.retry(failed[0], uid)
+                return {"ok": True, "message": "已重新入队失败节点",
+                        "task_id": task_id}
+            if operation == "priority":
+                priority = int((payload or {}).get("priority") or 0)
+
+                def _prio(conn):
+                    from core.state_kernel.store import update_versioned
+                    return update_versioned(conn, "tasks", task_id,
+                                            current_version, {"priority": priority})
+                new_version = store.submit_write(_prio)
+                if scheduler:
+                    scheduler.notify()
+                return {"ok": True, "task_id": task_id,
+                        "version": new_version, "priority": priority}
+            return {"ok": False, "message": f"未知操作：{operation}"}
+        except StaleVersionError as e:
+            return {"ok": False, "conflict": True, "message": str(e)}
+        except (KeyError, ValueError) as e:
+            return {"ok": False, "message": str(e)}
+
+    def artifact_detail(self, artifact_id: str) -> dict:
+        """产物元数据（§12.1）：归属校验 + 可用性 + 血缘。"""
+        if not artifact_id:
+            return {"ok": False, "message": "缺少 artifact_id"}
+        store = self._get_state_store()
+        uid = self._uid()
+
+        def _read(conn):
+            row = conn.execute(
+                "SELECT a.id, a.type, a.path, a.content_hash, a.availability,"
+                " a.retention_class, a.created_at, a.input_sources,"
+                " n.run_id, r.task_id, t.user_id"
+                " FROM artifacts a"
+                " JOIN attempts at ON at.id = a.attempt_id"
+                " JOIN nodes n ON n.id = at.node_id"
+                " JOIN runs r ON r.id = n.run_id"
+                " JOIN tasks t ON t.id = r.task_id"
+                " WHERE a.id = ?", (artifact_id,)).fetchone()
+            return row
+
+        row = store.read(_read)
+        if row is None or row[10] != uid:
+            # 不向其他账号暴露对象细节（§12.1）
+            return {"ok": False, "message": "产物不存在"}
+        return {"ok": True, "artifact": {
+            "id": row[0], "type": row[1], "path": row[2],
+            "content_hash": row[3], "availability": row[4],
+            "retention_class": row[5], "created_at": row[6],
+            "lineage": json.loads(row[7] or "{}"),
+            "run_id": row[8], "task_id": row[9]}}
+
+    def artifact_download_path(self, artifact_id: str):
+        """产物下载：归属 + 可用性校验后返回可下载的绝对路径或错误。"""
+        detail = self.artifact_detail(artifact_id)
+        if not detail.get("ok"):
+            return None, detail.get("message", "产物不存在")
+        artifact = detail["artifact"]
+        if artifact["availability"] == "cleaned":
+            return None, "产物已按政策清理，可按血缘重建"
+        if artifact["availability"] == "missing":
+            return None, "产物文件已损坏或丢失，不能下载"
+        path = Path(artifact["path"])
+        if not path.is_file():
+            return None, "产物文件不存在"
+        return path, ""
+
+    # ── 产物内容 / 元数据 / 瓦片（第六阶段补强：面板按产物联动） ──
+
+    def _artifact_verified(self, artifact_id: str):
+        """产物归属（用户级）与可用性校验；返回 (artifact_dict, error)。"""
+        detail = self.artifact_detail(artifact_id)
+        if not detail.get("ok"):
+            return None, detail.get("message", "产物不存在")
+        artifact = detail["artifact"]
+        if artifact["availability"] != "available":
+            return None, ("产物已按政策清理，可按血缘重建"
+                          if artifact["availability"] == "cleaned"
+                          else "产物文件已损坏或丢失")
+        return artifact, ""
+
+    def artifact_content(self, artifact_id: str, max_bytes: int = 2 * 1024 * 1024) -> dict:
+        """小型文本/JSON 产物内容（精度报告等面板直接读取）。"""
+        artifact, error = self._artifact_verified(artifact_id)
+        if artifact is None:
+            return {"ok": False, "message": error}
+        path = Path(artifact["path"])
+        if not path.is_file():
+            return {"ok": False, "message": "产物文件不存在"}
+        try:
+            if path.stat().st_size > max_bytes:
+                return {"ok": False, "message": "产物过大，请下载后查看"}
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError as e:
+            return {"ok": False, "message": f"读取失败：{e}"}
+        if path.suffix.lower() == ".json":
+            try:
+                return {"ok": True, "json": json.loads(text), "name": path.name}
+            except ValueError:
+                pass
+        return {"ok": True, "text": text, "name": path.name}
+
+    def artifact_meta(self, artifact_id: str) -> dict:
+        """产物元数据（地图用）：地理范围（EPSG:4326）+ 建议渲染样式。"""
+        artifact, error = self._artifact_verified(artifact_id)
+        if artifact is None:
+            return {"ok": False, "message": error}
+        path = Path(artifact["path"])
+        meta = {"ok": True, "id": artifact["id"], "name": path.name,
+                "type": artifact["type"],
+                "style": _artifact_style(path.name)}
+        # 标准图层名（与升级前一致）：按推断样式映射 LAYER_DEFS 标签
+        meta["style_label"] = next(
+            (d["label"] for d in LayerVisualizer.LAYER_DEFS
+             if d["id"] == meta["style"]), "")
+        # 带影像日期的显示名（如“10m LST（2024-07-22）”），对齐升级前样式
+        _base = meta["style_label"] or path.name
+        _date = _date_from_name(path.name)
+        meta["label_dated"] = f"{_base}（{_date}）" if _date else _base
+        if artifact["type"] == "geotiff" and path.is_file():
+            try:
+                import rasterio
+                from rasterio.warp import transform_bounds
+                with rasterio.open(path) as src:
+                    b = src.bounds
+                    if src.crs and src.crs.to_epsg() != 4326:
+                        b = transform_bounds(src.crs, "EPSG:4326",
+                                             b.left, b.bottom, b.right, b.top,
+                                             densify_pts=8)
+                    meta["bounds"] = [b[0], b[1], b[2], b[3]]  # w, s, e, n
+            except Exception as e:  # noqa: BLE001
+                meta["bounds_error"] = f"{type(e).__name__}"
+        return meta
+
+    def artifact_tile(self, artifact_id: str, style: str, z: int, x: int, y: int):
+        """按产物文件直接渲染 Web Mercator 瓦片（面板联动：地图指定任务结果）。"""
+        artifact, error = self._artifact_verified(artifact_id)
+        if artifact is None:
+            return None
+        path = Path(artifact["path"])
+        if not path.is_file() or not _TILE_RENDER_SEM.acquire(blocking=False):
+            return None
+        try:
+            style = style if any(
+                d["id"] == style for d in LayerVisualizer.LAYER_DEFS) \
+                else _artifact_style(path.name)
+            mtime = os.path.getmtime(path)
+            return LayerVisualizer._render_tile_cached(
+                style, str(path), mtime, z, x, y)
+        except OSError:
+            return None
+        finally:
+            _TILE_RENDER_SEM.release()
+
+    # ── 任务原始输入层（地图恢复 10m S2 等原生图层） ──────────
+
+    _INPUT_LAYER_DEFS = (
+        ("sentinel2_path", "sentinel_rgb", "Sentinel-2 RGB", "sentinel_rgb"),
+        ("landsat_path", "landsat_lst", "30m LST", "landsat_lst"),
+        ("dem_path", "dem", "DEM", "dem"),
+    )
+
+    def _task_raw_paths(self, task_id: str):
+        """取任务当前运行的原始输入路径（来自 prepare_local 完成凭据）。
+
+        产物清单只含节点真实输出（输入不复制），地图要在任务视图里
+        恢复升级前的原生图层（如 10m S2 RGB），只能回到原始输入。
+        返回 (task_dict, raw_paths) 或 (None, {})。
+        """
+        store = self._get_state_store()
+        uid = self._uid()
+        task = store.read(lambda c: t_store.load_task(c, task_id))
+        if not task or task.get("user_id") != uid or not task.get("current_run_id"):
+            return None, {}
+        row = store.read(lambda c: c.execute(
+            "SELECT a.result_path, a.staging_dir FROM attempts a"
+            " JOIN nodes n ON n.id = a.node_id"
+            " WHERE n.run_id = ? AND n.node_key = 'prepare_local'"
+            " AND a.status = 'succeeded' ORDER BY a.attempt_no DESC LIMIT 1",
+            (task["current_run_id"],)).fetchone())
+        if not row:
+            return task, {}
+        candidates = []
+        if row[0]:
+            candidates.append(Path(row[0]))
+        if row[1]:
+            candidates.append(Path(row[1]) / "completion.json")
+        for path in candidates:
+            try:
+                envelope = json.loads(path.read_text(encoding="utf-8"))
+                raw = ((envelope.get("result") or {})
+                       .get("context") or {}).get("raw_paths") or {}
+                if raw:
+                    return task, raw
+            except (OSError, ValueError):
+                continue
+        return task, {}
+
+    def task_inputs(self, task_id: str) -> dict:
+        """任务原始输入栅格层清单（含 EPSG:4326 范围），供地图展示。"""
+        task, raw = self._task_raw_paths(task_id)
+        if task is None:
+            return {"ok": False, "message": "任务不存在"}
+        inputs = []
+        for key, style, label, _s in self._INPUT_LAYER_DEFS:
+            path = Path(str(raw.get(key) or ""))
+            if not path.is_file():
+                continue
+            p2_name = path.name
+            bounds = None
+            try:
+                import rasterio
+                from rasterio.warp import transform_bounds
+                with rasterio.open(path) as src:
+                    b = src.bounds
+                    if src.crs and src.crs.to_epsg() != 4326:
+                        b = transform_bounds(src.crs, "EPSG:4326",
+                                             b.left, b.bottom, b.right, b.top,
+                                             densify_pts=8)
+                    bounds = [b[0], b[1], b[2], b[3]]
+            except Exception:  # noqa: BLE001
+                continue
+            inputs.append({"key": key, "style_id": style,
+                           "label": (f"{label}（{_date_from_name(p2_name)}）"
+                                     if _date_from_name(p2_name) else label),
+                           "group": "acquire",
+                           "bounds": bounds})
+        return {"ok": True, "inputs": inputs}
+
+    def task_input_sample(self, task_id: str, key: str,
+                          lat: float, lon: float):
+        """任务原始输入栅格的像元采样（仅 LST 层参与“显示温度”）。"""
+        if key != "landsat_path":
+            return None
+        task, raw = self._task_raw_paths(task_id)
+        if task is None:
+            return None
+        path = Path(str(raw.get(key) or ""))
+        return LayerVisualizer.sample_file_value(
+            str(path), lat, lon, "landsat_lst")
+
+    def artifact_sample(self, artifact_id: str, lat: float, lon: float):
+        """产物栅格的像元采样（仅 LST 产物参与“显示温度”）。"""
+        artifact, _error = self._artifact_verified(artifact_id)
+        if artifact is None:
+            return None
+        path = Path(artifact["path"])
+        style = _artifact_style(path.name)
+        if style not in ("lst_10m", "lst_10m_filled"):
+            return None
+        return LayerVisualizer.sample_file_value(str(path), lat, lon, style)
+
+    def task_input_tile(self, task_id: str, key: str, z: int, x: int, y: int):
+        """按任务原始输入渲染瓦片（路径由服务端解析，不信任客户端传路径）。"""
+        task, raw = self._task_raw_paths(task_id)
+        if task is None:
+            return None
+        style = next((s for k, s, _l, _s in self._INPUT_LAYER_DEFS if k == key),
+                     None)
+        if style is None:
+            return None
+        path = Path(str(raw.get(key) or ""))
+        if not path.is_file() or not _TILE_RENDER_SEM.acquire(blocking=False):
+            return None
+        try:
+            mtime = os.path.getmtime(path)
+            return LayerVisualizer._render_tile_cached(
+                style, str(path), mtime, z, x, y)
+        except OSError:
+            return None
+        finally:
+            _TILE_RENDER_SEM.release()
+
+
+    def conversation_events(self, cid: str, cursor: int = 0,
+                            tz: float = _DEFAULT_TZ_OFFSET,
+                            log_cursor: int = 0):
+        """对话事件流（§12.2）：快照 → 游标补发 → 持续推送。
+
+        同一连接服务整个对话的多任务；按当前账号与对话过滤；
+        前端按事件序号去重、按对象版本拒绝旧状态覆盖新状态。
+        执行日志（task_logs）与完成报告等主动气泡（message 事件）
+        也在此推送：日志带行号供前端去重，log_cursor 为客户端已有的
+        最大日志行号（0 = 仅推新行，历史由 REST 接口加载）。
+        """
+        store = self._get_state_store()
+        uid = self._uid()
+
+        def _conv(conn):
+            return conn.execute(
+                "SELECT id, project_id, legacy_conv_id FROM conversations"
+                " WHERE (id = ? OR legacy_conv_id = ?) AND user_id = ?",
+                (cid, cid, uid)).fetchone()
+
+        conv = store.read(_conv)
+        if conv is None:
+            yield ("event: error\ndata: " + json.dumps(
+                {"message": "对话不存在"}, ensure_ascii=False) + "\n\n")
+            return
+        conv_pk, project_id, legacy_cid = conv[0], conv[1], conv[2]
+
+        # 1) 快照 + 当时最大事件编号（同一短读事务，§12.2 协议第 1 步）
+        snap = self.session_snapshot(project_id, legacy_cid)
+        snap["event_cursor"] = store.read(lambda c: c.execute(
+            "SELECT COALESCE(MAX(seq), 0) FROM events WHERE conversation_id = ?",
+            (conv_pk,)).fetchone()[0])
+        yield ("event: snapshot\ndata: " + json.dumps(
+            snap, ensure_ascii=False) + "\n\n")
+
+        # 2) 按请求游标补发（§12.2 协议第 2 步）：从游标之后逐条补发，
+        #    再转入持续轮询；这样快照到订阅之间发生的更新不会漏掉。
+        last = int(cursor or 0)
+        last_log = int(log_cursor or 0)
+        if last_log <= 0:
+            # 未带日志游标（旧客户端/首次）：从当前最大行号起推，避免整表重发
+            last_log = int(store.read(lambda c: c.execute(
+                "SELECT COALESCE(MAX(id), 0) FROM task_logs"
+                " WHERE conversation_id = ?", (conv_pk,)).fetchone()[0]) or 0)
+        msg_ver = self._conv_msg_ver.get(conv_pk, 0)
+        deadline_idle = time.time() + 3600  # 无事件时最长保持 1 小时
+        while time.time() < deadline_idle:
+            # 持久化执行日志：从上次行号之后推送（含失败原因/重试/完成，
+            # 跨刷新/重启/中断不丢；行号供前端去重）
+            log_rows = store.read(lambda c: c.execute(
+                "SELECT id, task_id, text, created_at FROM task_logs"
+                " WHERE conversation_id = ? AND id > ? ORDER BY id LIMIT 300",
+                (conv_pk, last_log)).fetchall())
+            from core.scheduling.scheduler import strip_emoji
+            for r in log_rows:
+                last_log = max(last_log, int(r[0]))
+                yield ("event: log\ndata: " + json.dumps(
+                    {"id": int(r[0]), "task_id": r[1] or "",
+                     "text": _stamp_with_ts(strip_emoji(r[2]), r[3], tz)},
+                    ensure_ascii=False) + "\n\n")
+            # 服务端主动追加的消息（任务完成报告等）：版本号变化时推送尾部新气泡
+            current_ver = self._conv_msg_ver.get(conv_pk, 0)
+            if current_ver != msg_ver:
+                msg_ver = current_ver
+                try:
+                    msgs = self._read_conv_messages(uid, legacy_cid)
+                    yield ("event: message\ndata: " + json.dumps(
+                        {"messages": msgs[-3:]}, ensure_ascii=False) + "\n\n")
+                except Exception:
+                    pass
+            rows_ = store.read(lambda c: c.execute(
+                "SELECT seq, type, occurred_at, task_id, run_id, object_type,"
+                " object_id, object_version, payload FROM events"
+                " WHERE conversation_id = ? AND user_id = ? AND seq > ?"
+                " ORDER BY seq LIMIT 200",
+                (conv_pk, uid, last)).fetchall())
+            for r in rows_:
+                last = max(last, int(r[0]))
+                yield ("event: ledger\ndata: " + json.dumps(
+                    {"seq": r[0], "type": r[1], "occurred_at": r[2],
+                     "task_id": r[3], "run_id": r[4], "object_type": r[5],
+                     "object_id": r[6], "object_version": r[7],
+                     "payload": json.loads(r[8] or "{}")},
+                    ensure_ascii=False) + "\n\n")
+            if rows_:
+                # 有新事件时附带最新会话摘要（任务卡状态直接可用）
+                snap2 = self.session_snapshot(project_id, legacy_cid)
+                snap2["event_cursor"] = last
+                yield ("event: snapshot\ndata: " + json.dumps(
+                    snap2, ensure_ascii=False) + "\n\n")
+                deadline_idle = time.time() + 3600
+            time.sleep(1.0)
+
+    def _read_conv_messages(self, uid: str, legacy_cid: str) -> list:
+        """按显式 uid 读对话消息（SSE 生成器里不依赖请求上下文变量）。"""
+        try:
+            path = _ROOT / "data" / "users" / uid / "conversations" / f"{legacy_cid}.json"
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return data.get("messages") or []
+        except Exception:
+            return []
 
     def _settle_task(self, resolved, output: str) -> None:
         """执行链返回后回写任务汇总状态（§3.5：状态由真实进展推导）。
@@ -475,6 +1799,27 @@ class AppBackend:
         except Exception as e:
             print(f"[understanding] 任务状态回写失败（不影响结果）：{e}")
 
+    def _append_answer_bubbles(self, pid: str, cid: str, text: str,
+                               reply: str) -> list:
+        """把一次卡片回答写入对话消息流（用户回答气泡 + 助手确认气泡）。
+
+        与文字回答的体验保持一致（用户实测反馈：点击选项后不能只弹
+        右上角通知，要在对话里形成完整气泡）；失败时仅返回空列表。
+        """
+        try:
+            convs = self.load_conversations()
+            if pid not in convs or cid not in convs[pid]:
+                return []
+            msgs = convs[pid][cid].get("messages", [])
+            pair = [{"role": "user", "content": str(text)},
+                    {"role": "assistant", "content": str(reply)}]
+            msgs.extend(pair)
+            self._save_history(pid, cid, msgs)
+            return pair
+        except Exception as e:  # noqa: BLE001
+            print(f"[web_app] 回答气泡写入失败：{e}")
+            return []
+
     def answer_question(self, pid: str, cid: str, question_id: str,
                         text: str, tz_offset: float = _DEFAULT_TZ_OFFSET) -> dict:
         """回答一条持久问题（卡片点击入口，与文字回答共用消费逻辑）。"""
@@ -486,9 +1831,18 @@ class AppBackend:
         if not conv_pk:
             return {"ok": False, "message": "这条对话还没有台账记录"}
         if self._scheduler:
-            execution_answer = self._scheduler.answer(question_id, text, self._uid(), conv_pk)
+            try:
+                execution_answer = self._scheduler.answer(
+                    question_id, text, self._uid(), conv_pk)
+            except ValueError:
+                # 答案不在该问题已保存的候选中（如过期卡片/候选已变更）：
+                # 不抛 500，继续走理解层消费，由其给出「已失效」或正常应用
+                execution_answer = None
             if execution_answer is not None:
-                return {"ok": True, "execution": execution_answer, **self.session_snapshot(pid, cid)}
+                reply = self._ack_reply_text()
+                appended = self._append_answer_bubbles(pid, cid, text, reply)
+                return {"ok": True, "execution": execution_answer,
+                        "appended": appended, **self.session_snapshot(pid, cid)}
         applied = understanding.answer_question(
             store, user_id=self._uid(), project_id=pid,
             conversation_id=conv_pk, question_id=question_id,
@@ -500,7 +1854,60 @@ class AppBackend:
         snapshot = self.session_snapshot(pid, cid)
         if applied.get("summary_status") == "ready":
             self._enqueue_ready([applied])
-        return {"ok": True, "task": applied, **snapshot}
+        reply = self._ack_reply_text()
+        appended = self._append_answer_bubbles(pid, cid, text, reply)
+        return {"ok": True, "task": applied, "appended": appended, **snapshot}
+
+    def _ack_reply_text(self) -> str:
+        """问题回答后的确认文案（随用户界面语言）。"""
+        return ("答案已接收，任务从对应节点继续。"
+                if self._user_lang(self._uid()) == "zh" else
+                "Answer received; the task will continue from the corresponding node.")
+
+    def set_exec_mode(self, pid: str, cid: str, mode: str) -> dict:
+        """切换交互模式（立即生效，不改变已编译运行的任何科学参数）。
+
+        切到“完全执行”时：把本对话中等待用户选择的“配对选择”问题
+        自动代选推荐项（无推荐取最高分），任务无需用户再点选即继续。
+        """
+        from core.agent.orchestrator.exec_mode import normalize
+        next_mode = normalize(mode)
+        if not cid:
+            return {"ok": False, "message": "缺少对话"}
+        self._get_conv_state(cid)["exec_mode"] = next_mode
+        try:
+            self._update_conversation_file(cid, pid, exec_mode=next_mode)
+        except Exception:
+            pass
+        auto_answered = 0
+        if next_mode == "auto" and self._scheduler:
+            uid = self._uid()
+            store = self._get_state_store()
+            conv = store.read(lambda c: c.execute(
+                "SELECT id FROM conversations"
+                " WHERE (id = ? OR legacy_conv_id = ?) AND user_id = ?",
+                (cid, cid, uid)).fetchone())
+            if conv:
+                rows = store.read(lambda c: q_store.list_open_questions(
+                    c, user_id=uid, conversation_id=conv[0]))
+                for q in rows:
+                    constraint = q.get("answer_constraint") or {}
+                    payload = constraint.get("payload") or {}
+                    cands = q.get("candidates") or []
+                    if payload.get("kind") != "pair_select" or not cands:
+                        continue
+                    pick = next((x for x in cands
+                                 if (x.get("info") or {}).get("recommended")),
+                                cands[0])
+                    try:
+                        answered = self._scheduler.answer(
+                            q["id"], str(pick.get("id")),
+                            uid, conv[0])
+                    except ValueError:
+                        answered = None
+                    if answered is not None:
+                        auto_answered += 1
+        return {"ok": True, "mode": next_mode, "auto_answered": auto_answered}
 
     # ── 计划编译（升级第三阶段：状态内核 → 节点图） ───────
 
@@ -820,27 +2227,26 @@ class AppBackend:
                               messages: list, project_dir: str = ""):
         path = self._conv_dir() / f"{conv_id}.json"
         now = time.strftime("%Y-%m-%d %H:%M:%S")
+        old = {}
         if path.exists():
             try:
                 with open(path, "r", encoding="utf-8") as f:
-                    old = json.load(f)
+                    old = json.load(f) or {}
             except Exception:
                 old = {}
-            created_at = old.get("created_at", now)
-            starred = old.get("starred", False)
-        else:
-            created_at = now
-            starred = False
-        data = {
+        # 以原文件为基底合并写入：保留 exec_mode 等扩展字段，
+        # 避免消息保存把交互模式/后续新增键丢接
+        data = dict(old)
+        data.update({
             "id": conv_id,
             "project": project,
             "title": title,
             "messages": messages,
             "project_dir": project_dir,
-            "created_at": created_at,
+            "created_at": old.get("created_at", now),
             "updated_at": now,
-            "starred": starred,
-        }
+            "starred": old.get("starred", False),
+        })
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
 
@@ -1665,39 +3071,96 @@ class AppBackend:
     # ── 文件列表 / 下载 ────────────────────────────────────────
 
     def get_sys_usage(self) -> dict:
-        """本软件（容器进程）的实时资源占用（GB，不含百分比）。
+        """本软件的实时资源占用（GB，不含百分比）——整个软件口径：
 
-        内存：容器主进程 RSS，读 /proc/self/status 的 VmRSS（Linux 容器内即本软件进程）。
-        磁盘：软件数据根目录（含所有用户、所有项目的工作区与记忆）总大小。
-        磁盘统计较慢，30 秒内缓存复用；内存每次实时读取。
+        内存：整个容器（cgroup 全部进程：服务 + 计算子进程）当前占用；
+        容器外环境回退“本进程 + 子进程”RSS 求和；再回退本进程。
+        磁盘：软件数据根（/app/data：台账/执行缓存/所有用户数据）总大小，
+        多个候选根去重；统计较慢，15 秒内缓存复用。
         """
         now = time.time()
         cached = getattr(self, "_usage_cache", None)
-        if cached and now - cached["ts"] < 30:
+        if cached and now - cached["ts"] < 15:
             return cached["data"]
 
         mem_gb = 0.0
-        try:
-            with open("/proc/self/status", "r", encoding="utf-8") as f:
-                for line in f:
-                    if line.startswith("VmRSS:"):
-                        mem_gb = float(line.split()[1]) / 1024.0 / 1024.0  # kB → GB
-                        break
-        except Exception:
-            pass
+        # 1) cgroup 内存（容器内即整个软件的所有进程）
+        for path in ("/sys/fs/cgroup/memory.current",
+                     "/sys/fs/cgroup/memory/memory.usage_in_bytes"):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    mem_gb = float(f.read().strip()) / (1024.0 ** 3)
+                break
+            except Exception:
+                mem_gb = 0.0
+        # 2) 回退：本进程 + 全部子进程 RSS 求和
+        if mem_gb <= 0:
+            try:
+                import psutil
+                total = psutil.Process().memory_info().rss
+                for child in psutil.Process().children(recursive=True):
+                    try:
+                        total += child.memory_info().rss
+                    except Exception:
+                        continue
+                mem_gb = total / (1024.0 ** 3)
+            except Exception:
+                mem_gb = 0.0
+        # 3) 最后回退：本进程 VmRSS
+        if mem_gb <= 0:
+            try:
+                with open("/proc/self/status", "r", encoding="utf-8") as f:
+                    for line in f:
+                        if line.startswith("VmRSS:"):
+                            mem_gb = float(line.split()[1]) / 1024.0 / 1024.0
+                            break
+            except Exception:
+                pass
 
         disk_gb = 0.0
         try:
-            root = self._workspace_root()
-            if root.is_dir():
-                total = 0
+            # 软件数据根：容器内为 /app/data（台账 + 执行产物缓存 + 用户数据）；
+            # 去重包含关系，避免重复统计同一目录树
+            roots = []
+            for cand in (Path("/app/data"), _ROOT / "data", self._workspace_root()):
+                try:
+                    c = cand.resolve()
+                except Exception:
+                    continue
+                if not c.is_dir():
+                    continue
+                if any(str(c).startswith(str(p) + os.sep) or c == p
+                       or str(p).startswith(str(c) + os.sep) for p in roots):
+                    # 保留外层目录，跳过被包含的子目录
+                    if any(c == p or str(c).startswith(str(p) + os.sep)
+                           for p in roots):
+                        continue
+                roots = [p for p in roots
+                         if not (str(p).startswith(str(c) + os.sep))]
+                roots.append(c)
+            total = 0
+            seen_inodes = set()
+            from stat import S_ISLNK
+            for root in roots:
                 for dirpath, _dirs, files in os.walk(root):
                     for name in files:
+                        p = os.path.join(dirpath, name)
                         try:
-                            total += os.path.getsize(os.path.join(dirpath, name))
+                            lst = os.lstat(p)
                         except OSError:
                             continue
-                disk_gb = total / (1024.0 ** 3)
+                        # 符号链接（产物桥接视图）不重复计目标；硬链接同 inode 只计一次
+                        if S_ISLNK(lst.st_mode):
+                            continue
+                        key = (lst.st_dev, lst.st_ino)
+                        if key in seen_inodes:
+                            continue
+                        seen_inodes.add(key)
+                        # 优先用实际占块（st_blocks*512，与 du 同口径）；
+                        # 无该字段时回退表观大小
+                        blocks = getattr(lst, "st_blocks", None)
+                        total += (int(blocks) * 512) if blocks else lst.st_size
+            disk_gb = total / (1024.0 ** 3)
         except Exception:
             pass
 
@@ -2145,6 +3608,11 @@ class AppBackend:
                 tail_token[0] = content
                 q.put(("token", content))
 
+            def _emit_log(text: str):
+                """旧执行链/理解层日志：持久化（跨刷新不丢）+ 随队列推送。"""
+                lid = self._append_log_line(uid, conv_pk, text)
+                q.put(("log", {"text": str(text), "id": lid, "task_id": ""}))
+
             try:
                 # Chat 模式 = 只读对话。禁止执行任何 Skill / 工作流、
                 # 禁止生成或修改文件，Agent 只能基于现有信息回答问题。
@@ -2175,6 +3643,39 @@ class AppBackend:
                         )
                     q.put(("done", None))
                 elif understanding_on:
+                    # 自由问答（带台账上下文）：查询句与“只回答”共用。
+                    def _free_answer() -> str:
+                        parts: list = []
+                        context = {
+                            "workflow_status": conv_state["workflow_progress"],
+                            "config": self._load_settings(),
+                            "study_areas": self.list_study_areas(),
+                        }
+                        # 注入台账进展（多角色应知道流程状态）：任务进度/
+                        # 当前节点/等待与失败原因 + 已选配对 + 待答问题
+                        try:
+                            context.update(self.kernel_qa_context(pid, cid))
+                        except Exception:
+                            pass
+                        with self._scheduler.model_request():
+                            self._assistant_for().ask_stream(
+                                user_msg,
+                                lambda t: (_put_token(t), parts.append(t)),
+                                context=context, prior_messages=prior_messages,
+                                on_thinking=lambda t: q.put(("thinking", t)),
+                            )
+                        # on_token 回调收到的是累计全文：取最后一次而非拼接（
+                        # 拼接会把每次快照首尾相连，导致气泡复读）
+                        return parts[-1] if parts else ""
+
+                    # 纯查询句直通问答通道（用户实测：查询式问句会让理解
+                    # 模型输出失控——无法解析 JSON 或复读；它本质不含任务
+                    # 操作，直接交给带台账上下文的自由问答）
+                    if _is_query_only(user_msg):
+                        _free_answer()
+                        q.put(("tasks", self.session_snapshot(pid, cid)))
+                        q.put(("done", None))
+                        return
                     # 执行审批只消费已保存问题。无法匹配的文字仍交给理解层。
                     waiting = self.session_snapshot(pid, cid).get("questions", [])
                     if len(waiting) == 1:
@@ -2183,21 +3684,36 @@ class AppBackend:
                         except ValueError:
                             applied = None
                         if applied:
-                            _put_token("答案已接收，任务从对应节点继续。")
+                            _put_token("答案已接收，任务从对应节点继续。"
+                                       if self._user_lang(uid) == "zh" else
+                                       "Answer received; the task will continue from the corresponding node.")
                             q.put(("done", None))
                             return
                     outcome = self._understand(
                         pid, cid, user_msg, chat_mode="work", tz_offset=_DEFAULT_TZ_OFFSET,
                         command_id=command_id or "", message_id=message_id,
                         conv_pk=conv_pk, prior_messages=prior_messages,
-                        on_log=lambda text: q.put(("log", text)))
+                        on_log=_emit_log)
                     self._scheduler.notify()
                     if outcome.ready_tasks:
                         submitted = self._enqueue_ready(outcome.ready_tasks, resolved_mode)
-                        _put_token(f"已提交 {len(submitted)} 个任务，按各自节点与资源额度执行。" +
-                                   ("\n" + outcome.message if outcome.message else ""))
+                        _put_token(
+                            (f"已提交 {len(submitted)} 个任务，按各自节点与资源额度执行。"
+                             if self._user_lang(uid) == "zh" else
+                             f"{len(submitted)} task(s) submitted; each runs under its own node and resource quotas.")
+                            + ("\n" + outcome.message if outcome.message else ""))
                     else:
-                        _put_token(outcome.message or "已记录你的说明。")
+                        reply = outcome.message or ""
+                        # 第六阶段修正（§4.5「Work 中的知识问答不启动 Skill」）：
+                        # 判定为「只回答」且无台账动作时，由真模型生成自然语言
+                        # 回答；理解失败且疑似查询句时同样回退问答（双保险）
+                        fallback = (
+                            outcome.kind == "reply_only"
+                            or (outcome.kind == "failed"
+                                and user_msg.rstrip().endswith(("？", "?"))))
+                        if fallback and not reply:
+                            reply = _free_answer() or reply
+                        _put_token(reply or "已记录你的说明。")
                     q.put(("tasks", self.session_snapshot(pid, cid)))
                     q.put(("done", None))
                 else:
@@ -2342,6 +3858,8 @@ class AppBackend:
         thinking_seconds = self._stream_thinking_seconds.get(cid, 0.0)
         last_emit = time.time()
         last_persist = 0.0  # 流内容节流落盘时间点（服务重启/断线后不丢气泡）
+        stream_truncated = False  # 防刷屏熔断：正文触发后不再接受后续 token
+        thinking_truncated = False  # 思考链独立熔断
 
         def _emit(event: str, data: Any):
             yield f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
@@ -2381,6 +3899,12 @@ class AppBackend:
 
                 if event_type == "thinking":
                     thinking = data
+                    # 思考链同样防复读/超长（用户实测：思考链刷屏）
+                    if not thinking_truncated:
+                        guarded = _guard_stream_text(str(thinking))
+                        if guarded != thinking:
+                            thinking_truncated = True
+                        thinking = guarded
                     self._stream_thinking[cid] = thinking
                     if thinking_started is None:
                         # 新一轮思考开始（含决策后 resume 的后续反思），启动计时
@@ -2395,6 +3919,13 @@ class AppBackend:
                         thinking_started = None  # 本轮思考结束；下次 thinking 重新计时
                         self._stream_thinking_seconds[cid] = thinking_seconds
                     accumulated = data
+                    # 防刷屏熔断：模型异常复读/超长输出时截断（用户实测：
+                    # 同一段说明复读数百遍，气泡刷屏）
+                    if not stream_truncated:
+                        guarded = _guard_stream_text(str(accumulated))
+                        if guarded != accumulated:
+                            stream_truncated = True
+                        accumulated = guarded
                     self._stream_content[cid] = accumulated
                     if pid and time.time() - last_persist >= 8:
                         self._persist_stream_content(
@@ -2454,20 +3985,27 @@ class AppBackend:
                     # 前端未监听该事件时自动忽略，不影响既有渲染
                     yield from _emit("tasks", data if isinstance(data, dict) else {})
                 elif event_type == "log":
-                    # 日志行统一加时间戳（年月日时分秒，按用户本地时区）；累积供刷新/重连恢复，
-                    # 上限与前端 LOG_ALL_MAX 一致，超出丢弃最旧
-                    stamped = _stamp_log_lines(data, tz)
-                    logs = self._stream_logs.get(cid)
-                    if logs is None:
-                        logs = self._stream_logs[cid] = []
-                    logs.append(stamped)
-                    if len(logs) > 20000:
-                        del logs[: len(logs) - 20000]
-                    yield from _emit("log", {"text": stamped})
+                    # 日志行：兼容字符串与带行号对象（{id, task_id, text}）；
+                    # 统一加时间戳（按用户本地时区）并过滤 emoji；累积供刷新/重连恢复
+                    payload_log = data if isinstance(data, dict) else {"text": str(data or "")}
+                    raw_text = str(payload_log.get("text") or "")
+                    if raw_text.strip():
+                        from core.scheduling.scheduler import strip_emoji
+                        entry = {"id": int(payload_log.get("id") or 0),
+                                 "task_id": str(payload_log.get("task_id") or ""),
+                                 "text": _stamp_log_lines(strip_emoji(raw_text), tz)}
+                        logs = self._stream_logs.get(cid)
+                        if logs is None:
+                            logs = self._stream_logs[cid] = []
+                        logs.append(entry)
+                        if len(logs) > 20000:
+                            del logs[: len(logs) - 20000]
+                        yield from _emit("log", entry)
                 elif event_type == "done":
                     break
                 elif event_type == "error":
-                    accumulated += f"\n\n⚠️ 执行出错：{data}"
+                    from core.scheduling.scheduler import strip_emoji
+                    accumulated += f"\n\n执行出错：{strip_emoji(str(data))}"
                     yield from _emit("done", {"content": format_bubble("", accumulated, streaming=False)})
                     return
 
@@ -2877,21 +4415,40 @@ def layers(conv: str = ""):
 def lst_values(payload: dict, conv: str = ""):
     """批量读取光标所在像元在各地表温度图层上的温度（单位 K）。
 
-    payload: {"lat": float, "lon": float, "layers": [图层 id, ...]}
-    返回 {"values": {layer_id: 温度或 null}}；非 LST 图层 id 会被忽略。
+    payload: {"lat": float, "lon": float, "layers": [...]}
+    layers 元素兼容两种：
+      - 字符串：旧对话图层 id（按项目目录解析）
+      - 对象：{"kind": "input", "id": 图层id, "task_id": …, "key": …}
+              或 {"kind": "artifact", "id": 图层id, "artifact_id": …}
+    返回 {"values": {layer_id: 温度或 null}}；非 LST 层会被忽略。
     """
     project_dir = backend._get_project_dir(conv or None)
-    if not project_dir or not os.path.isdir(project_dir):
-        return {"values": {}}
     try:
         lat = float(payload.get("lat"))
         lon = float(payload.get("lon"))
     except (TypeError, ValueError):
         return {"values": {}}
     values = {}
-    for lid in (payload.get("layers") or []):
-        value = LayerVisualizer.sample_lst_value(project_dir, str(lid), lat, lon)
-        values[str(lid)] = value
+    for item in (payload.get("layers") or []):
+        if isinstance(item, dict):
+            lid = str(item.get("id") or item.get("artifact_id") or item.get("key") or "")
+            kind = str(item.get("kind") or "")
+            if kind == "input":
+                value = backend.task_input_sample(
+                    str(item.get("task_id") or ""), str(item.get("key") or ""),
+                    lat, lon)
+            elif kind == "artifact":
+                value = backend.artifact_sample(
+                    str(item.get("artifact_id") or ""), lat, lon)
+            else:
+                value = None
+        else:
+            lid = str(item)
+            if not project_dir or not os.path.isdir(project_dir):
+                values[lid] = None
+                continue
+            value = LayerVisualizer.sample_lst_value(project_dir, lid, lat, lon)
+        values[lid] = value
     return {"values": values}
 
 
@@ -2923,6 +4480,15 @@ def layer_tile(layer_id: str, z: int, x: int, y: int, conv: str = ""):
 @app.get("/api/map/html", response_class=HTMLResponse)
 def map_html(conv: str = ""):
     return backend.build_map_html(conv or None)
+
+
+@app.post("/api/exec-mode")
+def set_exec_mode(payload: dict):
+    """切换执行模式（立即生效）：完全执行下等待中的配对选择自动代选。"""
+    return backend.set_exec_mode(
+        str(payload.get("project") or ""),
+        str(payload.get("conv") or ""),
+        str(payload.get("exec_mode") or ""))
 
 
 # ── API：聊天 SSE ──────────────────────────────────────────────
@@ -2962,6 +4528,116 @@ def kernel_answer(payload: dict):
         str(payload.get("answer") or ""),
         float(payload.get("tz") or _DEFAULT_TZ_OFFSET),
     )
+
+
+# ── API：界面（升级第六阶段：§12.1 接口契约） ─────────
+
+@app.get("/api/conversations/{cid}/snapshot")
+def conversation_snapshot(cid: str, limit: int = 50):
+    """会话快照：消息摘要、任务列表、待答问题、产物、事件游标。"""
+    return backend.session_snapshot("", cid, limit)
+
+
+@app.get("/api/conversations/{cid}/events")
+def conversation_events(cid: str, cursor: int = 0, tz: float = _DEFAULT_TZ_OFFSET,
+                       log_cursor: int = 0):
+    """对话事件流（SSE）：快照 → 游标补发 → 持续推送；多任务复用一条连接。"""
+    return _sse(backend.conversation_events(cid, cursor=cursor, tz=tz,
+                                            log_cursor=log_cursor))
+
+
+@app.get("/api/conversations/{cid}/logs")
+def conversation_logs(cid: str, tz: float = _DEFAULT_TZ_OFFSET,
+                      after_id: int = 0, limit: int = 4000):
+    """对话执行日志历史（持久化）：跨刷新/重启/中断不丢失；带本地时区时间戳。"""
+    return backend.conversation_logs(cid, tz=tz, after_id=after_id, limit=limit)
+
+
+@app.delete("/api/conversations/{cid}/logs")
+def clear_conversation_logs(cid: str):
+    """清除本对话执行日志（用户显式操作）。"""
+    return backend.clear_conversation_logs(cid)
+
+
+@app.post("/api/preferences")
+def set_preferences(payload: dict):
+    """界面偏好：语言（zh/en）持久到用户设置，供后端组装文案使用。"""
+    return backend.set_ui_language(str(payload.get("lang") or ""))
+
+
+@app.get("/api/tasks/{task_id}")
+def task_detail(task_id: str):
+    """任务详情：版本、运行、节点、排队原因、问题、产物、失败原因。"""
+    return backend.task_detail(task_id)
+
+
+@app.get("/api/tasks/{task_id}/inputs")
+def task_inputs(task_id: str):
+    """任务原始输入栅格层（地图恢复 10m S2 等原生图层）。"""
+    return backend.task_inputs(task_id)
+
+
+@app.get("/api/tasks/{task_id}/inputs/{key}/tile/{z}/{x}/{y}")
+def task_input_tile(task_id: str, key: str, z: int, x: int, y: int):
+    """任务原始输入瓦片（服务端解析路径，不接收任意路径）。"""
+    if not (0 <= z <= 24 and 0 <= x < (1 << z) and 0 <= y < (1 << z)):
+        raise HTTPException(status_code=400, detail="非法瓦片坐标")
+    _cache_headers = {"Cache-Control": "public, max-age=300"}
+    png = backend.task_input_tile(task_id, key, z, x, y)
+    if png is None:
+        return Response(status_code=204, headers=_cache_headers)
+    return Response(content=png, media_type="image/png", headers=_cache_headers)
+
+
+@app.post("/api/tasks/{task_id}/commands")
+def task_command(task_id: str, payload: dict):
+    """任务命令：取消 / 重试 / 优先级（带请求编号与所见版本校验）。"""
+    return backend.task_command(
+        task_id,
+        str(payload.get("operation") or ""),
+        str(payload.get("request_id") or ""),
+        int(payload.get("seen_version") or 0),
+        payload.get("payload") or {},
+    )
+
+
+@app.get("/api/artifacts/{artifact_id}")
+def artifact_detail(artifact_id: str):
+    """产物元数据：归属 + 可用性 + 血缘（§12.4）。"""
+    return backend.artifact_detail(artifact_id)
+
+
+@app.get("/api/artifacts/{artifact_id}/download")
+def artifact_download(artifact_id: str):
+    """产物下载：归属 + 可用性校验后返回文件。"""
+    path, error = backend.artifact_download_path(artifact_id)
+    if not path:
+        return JSONResponse({"ok": False, "message": error}, status_code=404)
+    return FileResponse(str(path), filename=Path(path).name)
+
+
+@app.get("/api/artifacts/{artifact_id}/content")
+def artifact_content(artifact_id: str):
+    """小型文本/JSON 产物内容（精度/报告面板直读，§12.4 面板联动）。"""
+    return backend.artifact_content(artifact_id)
+
+
+@app.get("/api/artifacts/{artifact_id}/meta")
+def artifact_meta(artifact_id: str):
+    """产物元数据：地理范围（EPSG:4326）+ 建议渲染样式（地图联动用）。"""
+    return backend.artifact_meta(artifact_id)
+
+
+@app.get("/api/artifacts/{artifact_id}/tile/{z}/{x}/{y}")
+def artifact_tile(artifact_id: str, z: int, x: int, y: int, style: str = ""):
+    """按产物文件直接渲染瓦片（地图面板展示指定任务结果）。"""
+    if not (0 <= z <= 24 and 0 <= x < (1 << z) and 0 <= y < (1 << z)):
+        raise HTTPException(status_code=400, detail="非法瓦片坐标")
+    _cache_headers = {"Cache-Control": "public, max-age=300"}
+    png = backend.artifact_tile(artifact_id, style, z, x, y)
+    if png is None:
+        return Response(status_code=204, headers=_cache_headers)
+    return Response(content=png, media_type="image/png", headers=_cache_headers)
 
 
 # ── API：计划编译（升级第三阶段验收入口） ──────────────

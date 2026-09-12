@@ -102,6 +102,6 @@ onBeforeUnmount(() => {
   </template>
 
   <div class="toast-wrap">
-    <div v-for="t in toasts" :key="t.id" class="toast" :class="`toast--${t.type}`">{{ t.msg }}</div>
+    <div v-for="toast in toasts" :key="toast.id" class="toast" :class="`toast--${toast.type}`">{{ toast.msg }}</div>
   </div>
 </template>

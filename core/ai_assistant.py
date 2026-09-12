@@ -270,39 +270,104 @@ class GeoThermoAI_Assistant:
         if json_mode:
             payload["response_format"] = {"type": "json_object"}
 
-        def _drain(resp) -> str:
-            """消费流式响应，返回完整正文；异常由调用方处理。"""
+        def _drain(resp, emit_token, emit_thinking) -> dict:
+            """消费流式响应，返回 {content, complete, error}；异常不再直接上抛——
+            断开时保留已产出的正文，供调用方续写或标记中断。
+            complete 判定：收到 [DONE] 或 finish_reason=stop；连接被提前关闭
+            （DeepSeek 偶发）时 complete=False，由调用方自动续写一次。"""
             full_content = ""
             full_thinking = ""
-            for line in resp.iter_lines():
-                if line:
-                    line_text = line.decode("utf-8").strip()
-                    if line_text.startswith("data: "):
-                        data = line_text[6:]
-                        if data == "[DONE]":
-                            break
-                        try:
-                            chunk = json.loads(data)
-                            delta = chunk.get("choices", [{}])[0].get("delta", {})
-                            # 思考过程：DeepSeek 等模型用 reasoning_content 字段输出
-                            thinking = delta.get("reasoning_content") or ""
-                            if thinking and on_thinking:
-                                full_thinking += thinking
-                                on_thinking(full_thinking)
-                            content = delta.get("content") or ""
-                            if content:
-                                full_content += content
-                                on_token(full_content)
-                        except json.JSONDecodeError:
-                            pass
-            return full_content
+            finish_reason = None
+            done_marker = False
+            error = None
+            try:
+                for line in resp.iter_lines():
+                    if line:
+                        line_text = line.decode("utf-8").strip()
+                        if line_text.startswith("data: "):
+                            data = line_text[6:]
+                            if data == "[DONE]":
+                                done_marker = True
+                                break
+                            try:
+                                chunk = json.loads(data)
+                                choice = (chunk.get("choices") or [{}])[0]
+                                if choice.get("finish_reason"):
+                                    finish_reason = str(choice["finish_reason"])
+                                delta = choice.get("delta", {})
+                                # 思考过程：DeepSeek 等模型用 reasoning_content 字段输出
+                                thinking = delta.get("reasoning_content") or ""
+                                if thinking and emit_thinking:
+                                    full_thinking += thinking
+                                    emit_thinking(full_thinking)
+                                content = delta.get("content") or ""
+                                if content:
+                                    full_content += content
+                                    emit_token(full_content)
+                            except json.JSONDecodeError:
+                                pass
+            except Exception as e:  # noqa: BLE001 —— 连接中断：保留半截正文
+                error = str(e)
+            complete = bool(done_marker) or finish_reason in ("stop", "tool_calls")
+            return {"content": full_content, "complete": complete,
+                    "error": error}
+
+        def _continue_once(messages_used, response_headers, base_content) -> dict:
+            """流提前结束时的自动续写（仅一次）：把已输出正文作为 assistant
+            轮次回送，要求从中断处继续；增量追加在原有正文之后回调，同一气泡。
+            失败不影响已有正文。"""
+            cont_messages = list(messages_used) + [
+                {"role": "assistant", "content": base_content},
+                {"role": "user",
+                 "content": "请直接从断点处继续输出剩余内容；不要重复已输出的部分，"
+                            "不要重新开头。"},
+            ]
+            base = base_content
+
+            def _emit_cont(full_new: str) -> None:
+                on_token(base + full_new)
+
+            try:
+                response = requests.post(
+                    api_url, headers=response_headers,
+                    json={**payload, "messages": cont_messages},
+                    stream=True, timeout=120,
+                )
+                response.raise_for_status()
+                partial = _drain(response, _emit_cont, on_thinking)
+            except Exception as e:  # noqa: BLE001
+                return {"content": base, "complete": False, "error": str(e)}
+            return {"content": base + partial.get("content", ""),
+                    "complete": partial.get("complete", False),
+                    "error": partial.get("error")}
 
         try:
             response = requests.post(
                 api_url, headers=headers, json=payload, stream=True, timeout=120
             )
             response.raise_for_status()
-            return _drain(response)
+            result = _drain(response, on_token, on_thinking)
+            content = result["content"]
+            # 流被提前掐断（未收到 [DONE]/stop）：自动续写一次，仍不完整时
+            # 在气泡尾部明确标注，避免用户看到静默截断的回复
+            if not result["complete"] and content and not json_mode:
+                cont = _continue_once(messages, headers, content)
+                content = cont.get("content") or content
+                if not cont.get("complete"):
+                    note = "\n\n（输出中断，内容可能不完整；可直接回复“继续”获取剩余内容）"
+                    on_token(content + note)
+                    return content + "\n\n（输出中断，内容可能不完整）"
+                return content
+            if result["error"] and content:
+                # 中途报错但已有正文：保留正文 + 备注，不整段替换为错误信息
+                merged = content + f"\n\n⚠️ 输出中断：{result['error']}"
+                on_token(merged)
+                return merged
+            if not content and result["error"]:
+                error_msg = f"API流式调用失败: {result['error']}"
+                on_token(error_msg)
+                return error_msg
+            return content
         except Exception as e:
             # 弱模型回退：网关/模型不支持 response_format 时去掉该参数重试一次
             if json_mode and "response_format" in payload:
@@ -312,7 +377,8 @@ class GeoThermoAI_Assistant:
                         api_url, headers=headers, json=payload, stream=True, timeout=120
                     )
                     response.raise_for_status()
-                    return _drain(response)
+                    result = _drain(response, on_token, on_thinking)
+                    return result["content"]
                 except Exception as e2:
                     error_msg = f"API流式调用失败: {str(e2)}"
                     on_token(error_msg)

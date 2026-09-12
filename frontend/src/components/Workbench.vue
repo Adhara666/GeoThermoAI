@@ -33,35 +33,52 @@ function onResizeStart(e) {
   resizing.value = true
   const startX = e.clientX
   const startW = panelWidth.value
+  const target = e.currentTarget
+  // 三重保险释放拖动状态：
+  //  1) pointerdown 事件的 pointerId 真实有效（mouse 事件上不可靠，
+  //     这是上一版没生效的根因）；
+  //  2) Pointer Capture：指针移出窗口/浏览器后释放也能收到 pointerup；
+  //  3) window 级 pointerup/cancel/blur 兑底，任何路径都能解除卡死。
   const onMove = (ev) => {
     // 面板在右侧：向左拖动（clientX 减小）→ 宽度增大
     const w = Math.max(MIN_PANEL_W, Math.min(MAX_PANEL_W, startW + (startX - ev.clientX)))
     panelWidth.value = w
   }
-  const onUp = () => {
+  const cleanup = () => {
+    target.removeEventListener('pointermove', onMove)
+    target.removeEventListener('pointerup', cleanup)
+    target.removeEventListener('pointercancel', cleanup)
+    window.removeEventListener('pointerup', cleanup, true)
+    window.removeEventListener('pointercancel', cleanup, true)
+    window.removeEventListener('blur', cleanup)
+    document.removeEventListener('pointerup', cleanup, true)
     resizing.value = false
     try { localStorage.setItem('gtai_panel_w', String(panelWidth.value)) } catch (_) {}
-    _dragCleanup?.()
+    document.body.style.cursor = ''
+    document.body.style.userSelect = ''
     _dragCleanup = null
   }
-  _dragCleanup = () => {
-    window.removeEventListener('mousemove', onMove)
-    window.removeEventListener('mouseup', onUp)
-  }
-  window.addEventListener('mousemove', onMove)
-  window.addEventListener('mouseup', onUp)
+  _dragCleanup = cleanup
+  try { target.setPointerCapture(e.pointerId) } catch (_) {}
+  target.addEventListener('pointermove', onMove)
+  target.addEventListener('pointerup', cleanup)
+  target.addEventListener('pointercancel', cleanup)
+  window.addEventListener('pointerup', cleanup, true)
+  window.addEventListener('pointercancel', cleanup, true)
+  window.addEventListener('blur', cleanup)
+  document.addEventListener('pointerup', cleanup, true)
   document.body.style.cursor = 'ew-resize'
   document.body.style.userSelect = 'none'
 }
 
 onBeforeUnmount(() => {
-  // 拖拽中组件被卸载时强制移除监听器
+  // 拖拽中组件被卸载时强制移除监听器与全局状态
   if (_dragCleanup) {
     _dragCleanup()
     _dragCleanup = null
-    document.body.style.cursor = ''
-    document.body.style.userSelect = ''
   }
+  document.body.style.cursor = ''
+  document.body.style.userSelect = ''
 })
 // 线性 SVG 图标（Feather/Lucide 风格，stroke 2），比 emoji 更简洁专业
 const tabs = computed(() => [
@@ -70,9 +87,9 @@ const tabs = computed(() => [
   { id: 'test', label: t('wb.test'), icon: '<polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>' },
   { id: 'studyarea', label: t('wb.studyarea'), icon: '<path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/><circle cx="12" cy="10" r="3"/>' },
   { id: 'params', label: t('wb.params'), icon: '<line x1="4" y1="21" x2="4" y2="14"/><line x1="4" y1="10" x2="4" y2="3"/><line x1="12" y1="21" x2="12" y2="12"/><line x1="12" y1="8" x2="12" y2="3"/><line x1="20" y1="21" x2="20" y2="16"/><line x1="20" y1="12" x2="20" y2="3"/><line x1="1" y1="14" x2="7" y2="14"/><line x1="9" y1="8" x2="15" y2="8"/><line x1="17" y1="16" x2="23" y2="16"/>' },
+  { id: 'workflow', label: t('wb.workflow'), icon: '<line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/>' },
   { id: 'download', label: t('wb.download'), icon: '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/>' },
   { id: 'map', label: t('wb.map'), icon: '<polygon points="1 6 1 22 8 18 16 22 23 18 23 2 16 6 8 2 1 6"/><line x1="8" y1="2" x2="8" y2="18"/><line x1="16" y1="6" x2="16" y2="22"/>' },
-  { id: 'workflow', label: t('wb.workflow'), icon: '<line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/>' },
   { id: 'log', label: t('wb.log'), icon: '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/>' },
   { id: 'accuracy', label: t('wb.accuracy'), icon: '<line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/>' },
 ])
@@ -93,24 +110,25 @@ const modelTag = computed(() =>
       class="workbench__resizer"
       :class="{ 'workbench__resizer--active': resizing }"
       :title="t('wb.resizeTitle')"
-      @mousedown.prevent="onResizeStart"
+      @pointerdown.prevent="onResizeStart"
     ></div>
     <div class="panel-tabs">
+      <!-- 循环变量不能叫 t（遮蔽翻译函数 t()）；标签文案已在脚本中用 t() 译好 -->
       <button
-        v-for="t in tabs"
-        :key="t.id"
+        v-for="tab in tabs"
+        :key="tab.id"
         class="panel-tab"
-        :class="{ 'panel-tab--active': active === t.id }"
-        @click="active = t.id"
+        :class="{ 'panel-tab--active': active === tab.id }"
+        @click="active = tab.id"
       >
         <svg
-          v-if="t.icon"
+          v-if="tab.icon"
           width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor"
           stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
           aria-hidden="true"
-          v-html="t.icon"
+          v-html="tab.icon"
         ></svg>
-        {{ t.label }}
+        {{ tab.label }}
       </button>
     </div>
 
