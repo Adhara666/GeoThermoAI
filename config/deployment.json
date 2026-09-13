@@ -1,0 +1,38 @@
+{
+  "_说明": "第七阶段部署配置。环境变量 GTAI_* 或 WORKSPACE_ROOT 优先于本文件。空路径使用程序默认值。",
+  "paths": {
+    "_说明": "data_root 保存账号、签名密钥、对话、边界、记忆和 SQLite。workspace_root 保存大体量项目栅格。state_db 必须位于本机持久文件系统。",
+    "data_root": "",
+    "workspace_root": "",
+    "temp_root": "",
+    "state_db": ""
+  },
+  "budget": {
+    "_说明": "所有账号共享同一部署预算。作业数、连接数和重试次数必须为正整数，CPU、内存、磁盘和超时必须为正数。",
+    "compute_jobs": 1,
+    "download_jobs": 1,
+    "download_connections": 8,
+    "prefetch_packages": 1,
+    "catalog_jobs": 2,
+    "model_jobs": 2,
+    "cpu_budget": null,
+    "memory_gib": null,
+    "disk_margin_gib": null,
+    "disk_cache_gib": 20,
+    "node_timeout_seconds": 7200,
+    "network_attempts": 3
+  },
+  "memory": {
+    "_说明": "用户 Agent 与记忆对象超过容量或闲置时间后释放。记忆写回失败按指数退避有限重试。",
+    "user_cache_capacity": 8,
+    "user_cache_ttl_seconds": 1800,
+    "writeback_attempts": 4,
+    "writeback_base_seconds": 2,
+    "writeback_poll_seconds": 1
+  },
+  "cache": {
+    "_说明": "目录搜索缓存同时受条目数与闲置秒数约束，过期条目会真实删除。",
+    "search_entries": 64,
+    "search_ttl_seconds": 600
+  }
+}

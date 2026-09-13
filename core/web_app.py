@@ -35,6 +35,7 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 from core import auth
+from core.deployment import DeploymentConfig
 from core.memtrim import release_rss_memory as _memtrim_release
 from core.ai_assistant import GeoThermoAI_Assistant
 from core.state_kernel import (
@@ -55,6 +56,7 @@ from core.agent.orchestrator import agent_config, approval as approval_proto
 from core.agent.orchestrator.exec_mode import DEFAULT_EXEC_MODE
 from core.agent.orchestrator.exec_mode import normalize as normalize_exec_mode
 from core.memory import MemoryManager
+from core.runtime_cache import BoundedTTLCache
 from core.visualization import LayerVisualizer
 from core.intermediate_cleanup import INTERMEDIATE_FILENAMES
 from core.geo_transform import (
@@ -309,6 +311,12 @@ class AppBackend:
         # 启动期启用 GDAL/OSR 异常模式：把静默返回 None/错误码的契约问题
         # 尽早转成可捕获的异常，而不是等到某次下载中途才发现坐标是 inf。
         enable_gdal_osr_exceptions()
+        # 部署配置在任何运行时目录或调度器创建前严格校验。配置错误必须
+        # 阻止启动，避免悄悄退回仓库目录或无上限资源模式。
+        self.deployment = DeploymentConfig.load()
+        self.deployment.prepare()
+        self.deployment.apply_process_defaults()
+        tempfile.tempdir = str(self.deployment.temp_root)
         settings = self._load_global_settings()
         api_config = settings.get("api", {})
 
@@ -325,10 +333,16 @@ class AppBackend:
         self._register_builtin_skills()
 
         # 每用户独立的 assistant / agent（凭据按用户隔离，禁止跨用户共用）
-        self._user_assistants: Dict[str, GeoThermoAI_Assistant] = {}
-        self._user_agents: Dict[str, GeoThermoAgent] = {}
+        self._user_assistants = BoundedTTLCache(
+            self.deployment.user_cache_capacity,
+            self.deployment.user_cache_ttl_seconds)
+        self._user_agents = BoundedTTLCache(
+            self.deployment.user_cache_capacity,
+            self.deployment.user_cache_ttl_seconds)
         # 每用户独立的记忆管理器（懒加载：首次使用该用户时初始化并播种领域知识）
-        self._user_memories: Dict[str, MemoryManager] = {}
+        self._user_memories = BoundedTTLCache(
+            self.deployment.user_cache_capacity,
+            self.deployment.user_cache_ttl_seconds)
 
         # 按对话隔离的运行时状态（与旧版一致）
         self._conv_states: Dict[str, dict] = {}
@@ -360,15 +374,38 @@ class AppBackend:
         # 单例惰性初始化；唯一写连接由内核内部写入者线程独占。
         self._state_store: Optional[StateStore] = None
         self._state_store_lock = threading.Lock()
+        self._runtime_cache_lock = threading.RLock()
         self._scheduler = None
+        self._memory_projection = None
+        self._legacy_importer = None
 
     def start_scheduler(self):
+        from dataclasses import asdict
+        from core.memory import ProjectionExecutor
+        from core.scheduling.resources import Budget
         from core.scheduling.scheduler import Scheduler
         store = self._get_state_store()
-        self._scheduler = Scheduler(store, store.db_path.parent / "executions")
+        execution_root = store.db_path.parent / "executions"
+        execution_root.mkdir(parents=True, exist_ok=True)
+        budget = Budget.detect(execution_root,
+                               self.deployment.budget_environment())
+        self._scheduler = Scheduler(
+            store, execution_root, budget=budget,
+            users_root=self.deployment.users_root)
+        logging.info("部署路径 %s", self.deployment.public_summary())
+        logging.info("调度资源预算 %s", asdict(budget))
         # 生命周期日志（失败/重试/完成）按行上用户的语言设置呈现
         self._scheduler._lang_lookup = self._user_lang
         self._scheduler.start()
+        self._memory_projection = ProjectionExecutor(
+            store, self._memory_for_uid,
+            max_attempts=self.deployment.memory_writeback_attempts,
+            base_seconds=self.deployment.memory_writeback_base_seconds,
+            poll_seconds=self.deployment.memory_writeback_poll_seconds)
+        self._memory_projection.start()
+        from core.compatibility import LegacyImporter
+        self._legacy_importer = LegacyImporter(store, self.deployment.users_root)
+        self._legacy_importer.start()
         # 历史台账事件回填为日志行（升级前的过程日志没持久化，从事件重建
         # 失败原因/重试/节点完成，让日志区从失败到重试恢复的完整过程可见）
         threading.Thread(target=self._backfill_logs_from_events,
@@ -467,7 +504,7 @@ class AppBackend:
             return cached
         lang = "zh"
         try:
-            path = _ROOT / "data" / "users" / uid / "settings.json"
+            path = self.deployment.users_root / uid / "settings.json"
             if path.is_file():
                 lang = str(json.loads(path.read_text(encoding="utf-8"))
                            .get("ui_lang") or "zh")
@@ -482,7 +519,7 @@ class AppBackend:
         """保存当前用户的界面语言（供后端组装文案使用）。"""
         next_lang = "en" if str(lang or "").lower().startswith("en") else "zh"
         uid = self._uid()
-        path = _ROOT / "data" / "users" / uid / "settings.json"
+        path = self.deployment.users_root / uid / "settings.json"
         try:
             data = {}
             if path.is_file():
@@ -985,13 +1022,10 @@ class AppBackend:
     # ── 状态内核（升级第一阶段：状态内核） ────────────────
 
     def _get_state_store(self) -> StateStore:
-        """台账单例：data/state_kernel/ledger.sqlite3，可用 GTAI_STATE_DB 覆盖。"""
+        """台账单例：位置由已校验的部署配置决定。"""
         with self._state_store_lock:
             if self._state_store is None:
-                db_path = os.environ.get("GTAI_STATE_DB", "").strip()
-                if not db_path:
-                    db_path = str(_ROOT / "data" / "state_kernel" / "ledger.sqlite3")
-                self._state_store = StateStore(Path(db_path))
+                self._state_store = StateStore(self.deployment.state_db)
             return self._state_store
 
     def ledger_snapshot(self, limit: int = 50) -> dict:
@@ -1369,6 +1403,15 @@ class AppBackend:
                     " WHERE n.run_id = ? AND a.availability = 'available'"
                     " ORDER BY a.created_at DESC",
                     (task.get("current_run_id"),))]
+            projections = [
+                {"target": p[0], "status": p[1], "attempts": p[2],
+                 "next_retry_at": p[3], "last_error": p[4],
+                 "finished_at": p[5]}
+                for p in conn.execute(
+                    "SELECT target,status,attempts_count,next_retry_at,last_error,"
+                    " finished_at FROM projection_jobs WHERE run_id=?"
+                    " ORDER BY created_at,target",
+                    (task.get("current_run_id"),))]
             return {"ok": True, "task_id": task_id,
                     "version": task.get("version"),
                     "label": task.get("label"),
@@ -1378,7 +1421,8 @@ class AppBackend:
                     "current_run": run_info,
                     "nodes": nodes,
                     "questions": questions,
-                    "artifacts": artifacts}
+                    "artifacts": artifacts,
+                    "memory_writeback": projections}
 
         result = store.read(_read)
         if result is None:
@@ -1810,7 +1854,8 @@ class AppBackend:
     def _read_conv_messages(self, uid: str, legacy_cid: str) -> list:
         """按显式 uid 读对话消息（SSE 生成器里不依赖请求上下文变量）。"""
         try:
-            path = _ROOT / "data" / "users" / uid / "conversations" / f"{legacy_cid}.json"
+            path = (self.deployment.users_root / uid / "conversations"
+                    / f"{legacy_cid}.json")
             data = json.loads(path.read_text(encoding="utf-8"))
             return data.get("messages") or []
         except Exception:
@@ -2021,7 +2066,7 @@ class AppBackend:
                 "nodes": get_run_graph(store, run_id)}
 
     def _user_dir(self) -> Path:
-        return _ROOT / "data" / "users" / self._uid()
+        return self.deployment.users_root / self._uid()
 
     def _conv_dir(self) -> Path:
         d = self._user_dir() / "conversations"
@@ -2037,23 +2082,8 @@ class AppBackend:
         return self._user_dir() / "settings.json"
 
     def _workspace_root(self) -> Path:
-        """项目数据根目录：环境变量 WORKSPACE_ROOT（可指向大容量盘）优先。
-
-        未显式配置时自动探测：
-        - ModelScope Studio 创空间持久卷 /mnt/workspace（重新发布不丢数据）；
-        - 本地 Docker 挂载卷 /app/data（docker run -v geothermoai_data:/app/data）；
-        - 最后兜底仓库内 data/users。
-        """
-        root = os.environ.get("WORKSPACE_ROOT", "").strip()
-        if root:
-            return Path(root)
-        for cand in ("/mnt/workspace", "/app/data"):
-            try:
-                if os.path.isdir(cand) and os.access(cand, os.W_OK):
-                    return Path(cand) / "users"
-            except OSError:
-                continue
-        return _ROOT / "data" / "users"
+        """项目数据根目录，由启动期已校验的部署配置唯一决定。"""
+        return self.deployment.workspace_root
 
     def _auto_project_dir(self, name: str) -> Path:
         """按用户隔离的项目目录：{WORKSPACE_ROOT}/{uid}/workspace/{name}
@@ -2141,42 +2171,49 @@ class AppBackend:
     def _assistant_for(self) -> GeoThermoAI_Assistant:
         """当前用户的 assistant（按用户凭据独立实例化并缓存，禁止跨用户共用）"""
         uid = self._uid()
-        ast = self._user_assistants.get(uid)
-        if ast is None:
-            api = self._load_settings().get("api", {})
-            ast = GeoThermoAI_Assistant(
-                model_type=api.get("model_type", "deepseek"),
-                api_key=api.get("api_key", ""),
-                api_base_url=api.get("api_base_url", ""),
-                model_id=api.get("model_id", ""),
-                api_format=api.get("api_format", "openai"),
-            )
-            ast.model_display_name = api.get("display_name", "") or api.get("model_id", "")
-            ast.system_prompt = ast._build_system_prompt()
-            self._user_assistants[uid] = ast
-        return ast
+        with self._runtime_cache_lock:
+            ast = self._user_assistants.get(uid)
+            if ast is None:
+                api = self._load_settings().get("api", {})
+                ast = GeoThermoAI_Assistant(
+                    model_type=api.get("model_type", "deepseek"),
+                    api_key=api.get("api_key", ""),
+                    api_base_url=api.get("api_base_url", ""),
+                    model_id=api.get("model_id", ""),
+                    api_format=api.get("api_format", "openai"),
+                )
+                ast.model_display_name = api.get("display_name", "") or api.get("model_id", "")
+                ast.system_prompt = ast._build_system_prompt()
+                self._user_assistants[uid] = ast
+            return ast
 
     def _agent_for(self) -> GeoThermoAgent:
         """当前用户的 agent（与用户 assistant 绑定）"""
         uid = self._uid()
-        ag = self._user_agents.get(uid)
-        if ag is None:
-            ag = GeoThermoAgent(self._assistant_for(), self.registry)
-            self._user_agents[uid] = ag
-        return ag
+        with self._runtime_cache_lock:
+            ag = self._user_agents.get(uid)
+            if ag is None:
+                ag = GeoThermoAgent(self._assistant_for(), self.registry)
+                self._user_agents[uid] = ag
+            return ag
+
+    def _memory_for_uid(self, uid: str) -> MemoryManager:
+        """显式用户的记忆管理器，供请求线程和后台写回线程安全复用。"""
+        uid = str(uid or "default")
+        with self._runtime_cache_lock:
+            mm = self._user_memories.get(uid)
+            if mm is None:
+                mm = MemoryManager(
+                    memory_root=str(self.deployment.users_root / uid / "memory"),
+                    embedding_model_dir=str(_ROOT / "models" / "bge-small-zh-v1.5"),
+                )
+                mm.ensure_seeded()
+                self._user_memories[uid] = mm
+            return mm
 
     def _memory_for(self) -> MemoryManager:
-        """当前用户的记忆管理器（懒加载 + 首次播种领域知识）"""
-        uid = self._uid()
-        mm = self._user_memories.get(uid)
-        if mm is None:
-            mm = MemoryManager(
-                memory_root=str(self._user_dir() / "memory"),
-                embedding_model_dir=str(_ROOT / "models" / "bge-small-zh-v1.5"),
-            )
-            mm.ensure_seeded()
-            self._user_memories[uid] = mm
-        return mm
+        """当前请求用户的记忆管理器。"""
+        return self._memory_for_uid(self._uid())
 
     def _agent_settings(self) -> dict:
         """解析角色编排配置：每用户 settings 的 agent 段 > 全局 config/settings.json > 代码默认。
@@ -2192,8 +2229,9 @@ class AppBackend:
     def _invalidate_user_runtime(self):
         """设置变更后重建该用户的 assistant/agent（凭据热更新）"""
         uid = self._uid()
-        self._user_assistants.pop(uid, None)
-        self._user_agents.pop(uid, None)
+        with self._runtime_cache_lock:
+            self._user_assistants.pop(uid, None)
+            self._user_agents.pop(uid, None)
 
     def _get_conv_state(self, conv_id: str) -> dict:
         if conv_id not in self._conv_states:
@@ -2567,20 +2605,20 @@ class AppBackend:
         所有影像/产物/清单都写在该子目录内，对话之间不共享文件、可并行执行。
         项目根未设置时返回空串（沿用旧行为：先设置项目目录才能执行）。
 
-        软件目录保护：项目名为历史相对名（如“测试阶段6”）时会拼到仓库
-        挂载点 /app 下，曾在软件目录里生成会话文件夹与符号链接视图；
-        运行数据只允许落在数据卷（/app/data）等其他位置，命中软件目录时
-        直接返回空串（不创建、不桥接）。
+        软件目录保护：历史相对项目名迁入当前用户的项目数据根；绝对路径
+        若命中软件目录而不在持久数据根中，则拒绝创建和桥接。
         """
         root = (project_root or "").strip()
         if not root:
             return ""
         try:
             base = Path(root)
-            resolved = (base if base.is_absolute()
-                        else Path("/app") / base).resolve()
-            app_root = Path("/app")
-            data_root = Path("/app/data").resolve()
+            if not base.is_absolute():
+                base = self._workspace_root() / self._uid() / "workspace" / base
+                root = str(base)
+            resolved = base.resolve()
+            app_root = _ROOT.resolve()
+            data_root = self.deployment.data_root.resolve()
             inside_app = resolved == app_root or app_root in resolved.parents
             inside_data = (resolved == data_root
                            or data_root in resolved.parents)
@@ -3450,7 +3488,7 @@ class AppBackend:
             # 软件数据根：容器内为 /app/data（台账 + 执行产物缓存 + 用户数据）；
             # 去重包含关系，避免重复统计同一目录树
             roots = []
-            for cand in (Path("/app/data"), _ROOT / "data", self._workspace_root()):
+            for cand in (self.deployment.data_root, self._workspace_root()):
                 try:
                     c = cand.resolve()
                 except Exception:
@@ -4454,7 +4492,12 @@ async def lifespan(app):
     try:
         yield
     finally:
-        backend._scheduler.close()
+        if backend._legacy_importer:
+            backend._legacy_importer.close()
+        if backend._memory_projection:
+            backend._memory_projection.close()
+        if backend._scheduler:
+            backend._scheduler.close()
         backend._get_state_store().close()
         backend = None
 

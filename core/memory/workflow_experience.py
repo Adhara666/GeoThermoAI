@@ -121,7 +121,16 @@ class WorkflowExperience:
     def add(self, record: Dict[str, Any]) -> None:
         with _lock:
             records = self._load()
-            records.append(record)
+            workflow_id = str(record.get("workflow_id") or "")
+            replaced = False
+            if workflow_id:
+                for index, existing in enumerate(records):
+                    if str(existing.get("workflow_id") or "") == workflow_id:
+                        records[index] = record
+                        replaced = True
+                        break
+            if not replaced:
+                records.append(record)
             self._save(records)
 
     def all(self) -> List[Dict[str, Any]]:

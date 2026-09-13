@@ -60,15 +60,28 @@ class ExperimentLog:
     # ── 写入 ───────────────────────────────────────────────────────
 
     def add(self, record: Dict[str, Any]) -> None:
-        """追加一条实验记录。若同 conv 已存在 paused 记录（暂停后续跑完），先移除再追加。"""
+        """按稳定实验编号幂等写入。
+
+        旧调用没有稳定编号时仍保持 append；第七阶段的新调度链使用由 run_id
+        派生的 experiment_id，重试或回执丢失后只会核对/更新同一条记录。
+        """
         with _lock:
             records = self._load()
             conv_id = record.get("conv_id", "")
+            experiment_id = str(record.get("experiment_id") or "")
             if conv_id:
                 records = [r for r in records if not (
                     r.get("conv_id") == conv_id and r.get("status") == "paused"
                 )]
-            records.append(record)
+            replaced = False
+            if experiment_id:
+                for index, existing in enumerate(records):
+                    if str(existing.get("experiment_id") or "") == experiment_id:
+                        records[index] = record
+                        replaced = True
+                        break
+            if not replaced:
+                records.append(record)
             self._save(records)
 
     def delete_by_conv(self, conv_id: str) -> int:

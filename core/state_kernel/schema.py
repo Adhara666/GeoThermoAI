@@ -17,7 +17,7 @@ from typing import List, Optional, Tuple
 
 # 当前数据库结构版本：每次结构变更（新增表/字段/约束）必须 +1，
 # 并在 MIGRATIONS 末尾追加对应的迁移条目。
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 
 # 建库时冻结的默认连接参数（§3.3）：
 #   - 默认回滚日志模式（不启用 WAL）
@@ -356,6 +356,33 @@ CREATE INDEX IF NOT EXISTS ix_task_logs_conv ON task_logs (conversation_id, id);
 """
 
 
+# ── 版本 6：记忆与部署（升级第七阶段）──
+# 写回待办补齐可恢复领取、错误和结果字段；旧数据导入单独留映射，保证
+# 重启后幂等，且不会把证据不足的旧文件伪造成完整成功运行。
+_DDL_V6 = """
+ALTER TABLE projection_jobs ADD COLUMN claimed_at TEXT;
+ALTER TABLE projection_jobs ADD COLUMN finished_at TEXT;
+ALTER TABLE projection_jobs ADD COLUMN last_error TEXT;
+ALTER TABLE projection_jobs ADD COLUMN result TEXT;
+CREATE INDEX IF NOT EXISTS ix_projection_jobs_due
+    ON projection_jobs (status, next_retry_at, created_at);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_projection_run_memory_target
+    ON projection_jobs (run_id, target)
+    WHERE target IN ('experiment_json', 'experiment_vector',
+                     'workflow_json', 'workflow_vector');
+
+CREATE TABLE IF NOT EXISTS legacy_imports (
+    source_path   TEXT NOT NULL,
+    kind          TEXT NOT NULL,
+    object_id     TEXT,
+    status        TEXT NOT NULL,
+    details       TEXT NOT NULL DEFAULT '{}',
+    imported_at   TEXT NOT NULL,
+    PRIMARY KEY (source_path, kind)
+);
+"""
+
+
 def _apply_connection_pragmas(conn: sqlite3.Connection) -> None:
     """按 §3.3 设置连接参数。读/写连接共用（默认回滚日志模式，不用 WAL）。"""
     conn.execute("PRAGMA foreign_keys=ON")
@@ -372,6 +399,7 @@ def migrations() -> List[Tuple[int, str, str]]:
         (3, "调度执行：节点尝试、唯一授权与资源预留", _DDL_V3),
         (4, "界面：运行的项目视图绑定（产物符号链接落点与运行标签）", _DDL_V4),
         (5, "界面：任务执行日志持久化（跨刷新/重启不丢失）", _DDL_V5),
+        (6, "记忆与部署：可靠写回状态及旧数据兼容映射", _DDL_V6),
     ]
 
 

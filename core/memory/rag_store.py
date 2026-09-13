@@ -12,11 +12,16 @@ ChromaDB 向量记忆封装（RAG 层）
 """
 
 import os
+import hashlib
 import logging
+import re
 import threading
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
+
+_SHARED_EMBEDDINGS: Dict[str, "EmbeddingFunction"] = {}
+_SHARED_EMBEDDINGS_LOCK = threading.Lock()
 
 # BGE 官方检索惯例：查询文本加前缀，效果更稳定
 BGE_QUERY_PREFIX = "为这个句子生成表示以用于检索相关文章："
@@ -25,6 +30,21 @@ BGE_QUERY_PREFIX = "为这个句子生成表示以用于检索相关文章："
 _DEFAULT_BGE_DIR = os.path.join("models", "bge-small-zh-v1.5")
 
 _METADATA_NUMERIC_TYPES = (int, float, bool)
+_SAFE_COLLECTION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{1,510}[A-Za-z0-9]$")
+
+
+def project_collection_name(project_id: str) -> str:
+    """Map arbitrary user project names to a stable Chroma-safe collection.
+
+    Existing ASCII identifiers retain their old name. Chinese names, punctuation,
+    and overlong identifiers use a collision-resistant digest instead of a lossy
+    character replacement.
+    """
+    legacy = f"project_{project_id}"
+    if len(legacy) <= 512 and _SAFE_COLLECTION.fullmatch(legacy):
+        return legacy
+    digest = hashlib.sha256(str(project_id).encode("utf-8")).hexdigest()
+    return f"project_{digest}"
 
 
 class _BGE_ONNXEmbedding:
@@ -82,6 +102,10 @@ class EmbeddingFunction:
     def __init__(self, model_dir: str = ""):
         self._bge: Optional[_BGE_ONNXEmbedding] = None
         self._fallback = None
+        # ONNX Runtime sessions are read-only during inference, while tokenizer
+        # implementations are not all documented as concurrently safe.  A shared
+        # bounded inference gate keeps one model copy without mixing user stores.
+        self._inference_lock = threading.RLock()
         # 候选目录：显式传入 > 环境变量 > 默认相对目录（Docker 内 WORKDIR=/app 可命中预下载模型）
         dirs = [d for d in (model_dir, os.environ.get("BGE_MODEL_DIR", ""), _DEFAULT_BGE_DIR) if d]
         for d in dirs:
@@ -106,9 +130,10 @@ class EmbeddingFunction:
     def __call__(self, input: List[str]) -> List[List[float]]:
         """chromadb 协议：对 documents 编码（不加查询前缀）。"""
         texts = [t if isinstance(t, str) else str(t) for t in input]
-        if self._bge is not None:
-            return self._bge.encode(texts, is_query=False)
-        return self._fallback(texts)
+        with self._inference_lock:
+            if self._bge is not None:
+                return self._bge.encode(texts, is_query=False)
+            return self._fallback(texts)
 
     def name(self) -> str:
         """chromadb 1.x 协议要求：embedding 函数名。"""
@@ -119,9 +144,10 @@ class EmbeddingFunction:
     def encode_query(self, texts: List[str]) -> List[List[float]]:
         """对查询文本编码（bge 模式自动加检索前缀）。"""
         texts = [t if isinstance(t, str) else str(t) for t in texts]
-        if self._bge is not None:
-            return self._bge.encode([BGE_QUERY_PREFIX + t for t in texts], is_query=True)
-        return self._fallback(texts)
+        with self._inference_lock:
+            if self._bge is not None:
+                return self._bge.encode([BGE_QUERY_PREFIX + t for t in texts], is_query=True)
+            return self._fallback(texts)
 
     def embed_query(self, input: List[str]) -> List[List[float]]:
         """chromadb 1.x 协议：query 编码（bge 模式带检索前缀）。"""
@@ -134,6 +160,17 @@ class EmbeddingFunction:
     @property
     def is_bge(self) -> bool:
         return self._bge is not None
+
+
+def shared_embedding(model_dir: str = "") -> EmbeddingFunction:
+    """Return one read-only embedding runtime per model directory."""
+    key = os.path.realpath(model_dir) if model_dir else "<default>"
+    with _SHARED_EMBEDDINGS_LOCK:
+        item = _SHARED_EMBEDDINGS.get(key)
+        if item is None:
+            item = EmbeddingFunction(model_dir=model_dir)
+            _SHARED_EMBEDDINGS[key] = item
+        return item
 
 
 def _clean_metadata(meta: Dict[str, Any]) -> Dict[str, Any]:
@@ -172,7 +209,7 @@ class RAGStore:
         )
 
     def project_collection(self, project_id: str):
-        return self._collection(f"project_{project_id}")
+        return self._collection(project_collection_name(project_id))
 
     def global_collection(self):
         return self._collection("global_knowledge")
@@ -180,42 +217,52 @@ class RAGStore:
     def delete_project_collection(self, project_id: str) -> None:
         with self._lock:
             try:
-                self._client.delete_collection(f"project_{project_id}")
+                self._client.delete_collection(project_collection_name(project_id))
             except Exception as e:
                 logger.warning(f"[memory] 删除 Collection project_{project_id} 失败: {e}")
 
     # ── 写入 ───────────────────────────────────────────────────────
 
     def save_experience(self, project_id: str, text: str,
-                        metadata: Optional[Dict[str, Any]] = None) -> None:
+                        metadata: Optional[Dict[str, Any]] = None,
+                        *, strict: bool = False) -> bool:
         """写入一条项目实验段落（metadata 需含唯一 source_conv + 检索键）。
 
         统一补 `kind="experiment"`，供规划 Agent 按 kind 区分实验与可复用工作流。
         """
         if not text:
-            return
+            return True
         meta = _clean_metadata({"kind": "experiment", **(metadata or {})})
         col = self.project_collection(project_id)
         doc_id = str(meta.get("source_exp", "")) or f"exp_{len(text)}"
         with self._lock:
             try:
-                col.add(ids=[doc_id], documents=[text], metadatas=[meta])
+                col.upsert(ids=[doc_id], documents=[text], metadatas=[meta])
+                return True
             except Exception as e:
                 logger.warning(f"[memory] ChromaDB 写入实验段落失败: {e}")
+                if strict:
+                    raise
+                return False
 
     def save_workflow(self, project_id: str, text: str,
-                      metadata: Optional[Dict[str, Any]] = None) -> None:
+                      metadata: Optional[Dict[str, Any]] = None,
+                      *, strict: bool = False) -> bool:
         """写入一条可复用工作流段落，metadata 带 kind="workflow"。"""
         if not text:
-            return
+            return True
         meta = _clean_metadata({"kind": "workflow", **(metadata or {})})
         col = self.project_collection(project_id)
         doc_id = str(meta.get("source_workflow", "")) or f"wf_{len(text)}"
         with self._lock:
             try:
-                col.add(ids=[doc_id], documents=[text], metadatas=[meta])
+                col.upsert(ids=[doc_id], documents=[text], metadatas=[meta])
+                return True
             except Exception as e:
                 logger.warning(f"[memory] ChromaDB 写入工作流段落失败: {e}")
+                if strict:
+                    raise
+                return False
 
     def save_knowledge(self, items: List[Dict[str, Any]]) -> None:
         """按 id 增量播种领域知识。

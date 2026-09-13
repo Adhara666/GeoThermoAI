@@ -72,12 +72,40 @@ def first(root: Path, pattern: str):
     return hits[0] if hits else None
 
 
+_STAGE_PRIORITY = {
+    "preprocess_split": 1,
+    "ttri": 2,
+    "rf_round": 3,
+    "tcr": 4,
+    "export": 5,
+    "closure_eval": 6,
+}
+
+
+def artifact(root: Path, rel: str) -> Path:
+    """Locate one logical artifact in old workspaces or committed node outputs."""
+    direct = root / rel
+    if direct.exists():
+        return direct
+    suffix = Path(rel).as_posix()
+    hits = [path for path in root.rglob(Path(rel).name)
+            if path.as_posix().endswith(suffix)]
+    if not hits:
+        return direct
+
+    def rank(path: Path):
+        stages = [_STAGE_PRIORITY.get(part, 0) for part in path.parts]
+        return max(stages or [0]), path.as_posix()
+
+    return max(hits, key=rank)
+
+
 def compare(a: Path, b: Path) -> None:
     import pyarrow.parquet as pq
 
     print("== 数据划分 ==")
-    sa = load_json(a / "for_train" / "split_info.json")
-    sb = load_json(b / "for_train" / "split_info.json")
+    sa = load_json(artifact(a, "for_train/split_info.json"))
+    sb = load_json(artifact(b, "for_train/split_info.json"))
     check("划分计数完全一致", sa["counts"] == sb["counts"],
           f"A={sa['counts']} B={sb['counts']}")
     for key in ("method", "seed", "block_size_px", "guard_buffer_m"):
@@ -88,7 +116,7 @@ def compare(a: Path, b: Path) -> None:
     for rel in ("30m_features_step2.parquet", "30m_constraint_grid.parquet",
                 "for_train/train.parquet", "for_train/validate.parquet",
                 "for_train/test.parquet"):
-        pa, pb = a / rel, b / rel
+        pa, pb = artifact(a, rel), artifact(b, rel)
         if not (pa.exists() and pb.exists()):
             check(f"{rel} 两侧都存在", False, f"A={pa.exists()} B={pb.exists()}")
             continue
@@ -98,14 +126,14 @@ def compare(a: Path, b: Path) -> None:
 
     print("\n== 训练集内容指纹（逐字节） ==")
     for rel in ("for_train/train.parquet", "for_train/test.parquet"):
-        pa, pb = a / rel, b / rel
+        pa, pb = artifact(a, rel), artifact(b, rel)
         if pa.exists() and pb.exists():
             ha, hb = sha256(pa), sha256(pb)
             check(f"{rel} 内容完全相同", ha == hb, f"A={ha[:16]} B={hb[:16]}")
 
     print("\n== TTRI ==")
-    ca = load_json(a / "for_train" / "ttri_coefficients.json")
-    cb = load_json(b / "for_train" / "ttri_coefficients.json")
+    ca = load_json(artifact(a, "for_train/ttri_coefficients.json"))
+    cb = load_json(artifact(b, "for_train/ttri_coefficients.json"))
     check("TTRI 系数逐位一致",
           (ca.get("coefficients") or ca.get("coef"))
           == (cb.get("coefficients") or cb.get("coef")),
@@ -119,7 +147,12 @@ def compare(a: Path, b: Path) -> None:
     print("\n== RF 指标 ==")
 
     def rf_metrics(root: Path):
-        for mf in sorted((root / "results" / "test").glob("*.json")):
+        direct = sorted((root / "results" / "test").glob("*.json"))
+        candidates = direct or [
+            path for path in sorted(root.rglob("*.json"))
+            if "/results/test/" in path.as_posix()
+        ]
+        for mf in candidates:
             metrics = (load_json(mf).get("metrics") or {})
             if metrics:
                 return {k.lower(): v for k, v in metrics.items()}

@@ -22,7 +22,9 @@ ENV LANG=C.UTF-8 \
     PIP_TRUSTED_HOST=$PIP_TRUSTED_HOST \
     HF_ENDPOINT=https://hf-mirror.com \
     MALLOC_ARENA_MAX=4 \
-    WORKSPACE_ROOT=/app/data
+    GTAI_DATA_ROOT=/app/data \
+    WORKSPACE_ROOT=/app/data/users \
+    GTAI_TEMP_ROOT=/app/data/tmp
 
 # 安装 pip 与编译工具（部分依赖需要编译）；git/git-lfs 用于模型缺失时从 ModelScope 拉取 bge 模型
 # tzdata：提供时区数据库；运行时通过 -v /etc/localtime:/etc/localtime:ro 或 -e TZ= 继承宿主机时区，
@@ -42,7 +44,8 @@ WORKDIR /app
 # --break-system-packages：Ubuntu 24.04 (PEP 668) 禁止 pip 直接装系统 Python，容器内可安全绕过
 # 注意：镜像 osgeo 绑定按 apt numpy 1.x 编译，requirements.txt 已锁 numpy<2，pip 不会升级 numpy
 COPY requirements.txt .
-RUN pip3 install --no-cache-dir --break-system-packages -r requirements.txt
+RUN pip3 install --no-cache-dir --break-system-packages --retries 5 --timeout 120 \
+    -r requirements.txt
 
 # 构建期自检：确认 osgeo 可导入、GDAL 版本正常（把潜在运行期故障提前到构建期暴露）
 RUN python3 -c "from osgeo import gdal; print('osgeo OK, GDAL', gdal.VersionInfo())"
@@ -99,6 +102,10 @@ PY
 
 # ModelScope 要求服务监听 7860 端口
 EXPOSE 7860
+
+# 账号、SQLite 台账、记忆库、执行清单和默认项目空间统一位于持久卷。
+# 生产环境必须显式挂载该卷；项目影像也可另用 WORKSPACE_ROOT 指向大容量盘。
+VOLUME ["/app/data"]
 
 # 启动 FastAPI 后端（托管 Vue 前端 + REST/SSE 接口）
 CMD ["python3", "server.py"]
