@@ -16,6 +16,7 @@
 import json
 import os
 import re
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -23,11 +24,16 @@ from pathlib import Path
 import bcrypt
 import jwt
 
+from core.atomic_io import atomic_write_json, atomic_write_text
+from core.deployment import current as current_deployment
+
 _ROOT = Path(__file__).resolve().parent.parent
 
-_USERS_ROOT = _ROOT / "data" / "users"
+_DEPLOYMENT = current_deployment()
+_USERS_ROOT = _DEPLOYMENT.users_root
 _INDEX_PATH = _USERS_ROOT / "index.json"
-_SECRET_PATH = _ROOT / "data" / ".jwt_secret"
+_SECRET_PATH = _DEPLOYMENT.data_root / ".jwt_secret"
+_REGISTRY_LOCK = threading.RLock()
 
 # 账号名：2-32 位，仅字母/数字/_/-
 USERNAME_RE = re.compile(r"^[A-Za-z0-9_-]{2,32}$")
@@ -51,16 +57,17 @@ def _jwt_secret() -> str:
     env_secret = os.environ.get("GTAI_JWT_SECRET", "").strip()
     if env_secret:
         return env_secret
-    if _SECRET_PATH.exists():
-        return _SECRET_PATH.read_text(encoding="utf-8").strip()
-    secret = uuid.uuid4().hex + uuid.uuid4().hex
-    _SECRET_PATH.parent.mkdir(parents=True, exist_ok=True)
-    _SECRET_PATH.write_text(secret, encoding="utf-8")
-    try:
-        os.chmod(_SECRET_PATH, 0o600)
-    except Exception:
-        pass
-    return secret
+    with _REGISTRY_LOCK:
+        if _SECRET_PATH.exists():
+            return _SECRET_PATH.read_text(encoding="utf-8").strip()
+        secret = uuid.uuid4().hex + uuid.uuid4().hex
+        _SECRET_PATH.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(str(_SECRET_PATH), secret)
+        try:
+            os.chmod(_SECRET_PATH, 0o600)
+        except Exception:
+            pass
+        return secret
 
 
 # ── 密码 ─────────────────────────────────────────────────────────
@@ -101,19 +108,19 @@ def decode_token(token: str):
 # ── 用户注册表 ───────────────────────────────────────────────────
 
 def load_users() -> list:
-    _ensure_dirs()
-    if not _INDEX_PATH.exists():
-        return []
-    try:
-        return json.loads(_INDEX_PATH.read_text(encoding="utf-8")).get("users", [])
-    except Exception:
-        return []
+    with _REGISTRY_LOCK:
+        _ensure_dirs()
+        if not _INDEX_PATH.exists():
+            return []
+        try:
+            return json.loads(_INDEX_PATH.read_text(encoding="utf-8")).get("users", [])
+        except Exception:
+            return []
 
 
 def _save_users(users: list):
     _ensure_dirs()
-    _INDEX_PATH.write_text(
-        json.dumps({"users": users}, ensure_ascii=False, indent=2), encoding="utf-8")
+    atomic_write_json(str(_INDEX_PATH), {"users": users})
 
 
 def find_by_username(username: str):
@@ -148,19 +155,20 @@ def register_user(username: str, password: str, nickname: str = "") -> dict:
         return {"ok": False, "message": "账号名仅允许 2-32 位字母/数字/_/-"}
     if not _valid_password(password or ""):
         return {"ok": False, "message": f"密码至少 {PASSWORD_MIN_LEN} 位，仅允许英文字母/数字/符号"}
-    if find_by_username(username):
-        return {"ok": False, "message": "账号名已存在"}
-    users = load_users()
-    user = {
-        "uid": username,  # 账号名 ASCII 安全，直接作为 uid / 目录名
-        "username": username,
-        "nickname": (nickname or "").strip() or username,
-        "password_hash": hash_password(password),
-        "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-    }
-    users.append(user)
-    _save_users(users)
-    (_USERS_ROOT / user["uid"]).mkdir(parents=True, exist_ok=True)
+    with _REGISTRY_LOCK:
+        users = load_users()
+        if any(u.get("username") == username for u in users):
+            return {"ok": False, "message": "账号名已存在"}
+        user = {
+            "uid": username,  # 账号名 ASCII 安全，直接作为 uid / 目录名
+            "username": username,
+            "nickname": (nickname or "").strip() or username,
+            "password_hash": hash_password(password),
+            "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        users.append(user)
+        _save_users(users)
+        (_USERS_ROOT / user["uid"]).mkdir(parents=True, exist_ok=True)
     return {"ok": True, "message": f"账号「{username}」注册成功", "user": public_user(user)}
 
 

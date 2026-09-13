@@ -4,6 +4,8 @@
   "resource_configuration": "platform/2v-cpu-16g-mem",
   "port": 7860,
   "environment_variables": {
-    "WORKSPACE_ROOT": "/mnt/workspace/data"
+    "GTAI_DATA_ROOT": "/mnt/workspace/data",
+    "WORKSPACE_ROOT": "/mnt/workspace/data/users",
+    "GTAI_TEMP_ROOT": "/mnt/workspace/data/tmp"
   }
 }

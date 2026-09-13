@@ -36,6 +36,8 @@ import numpy as np
 from ..base_skill import BaseSkill, SkillParameter, SkillResult
 from ...geo_transform import bbox_wgs84_to_utm_bounds, enable_gdal_osr_exceptions, utm_epsg_for_region
 from ...atomic_io import write_verified
+from ...deployment import current as current_deployment
+from ...runtime_cache import BoundedTTLCache
 from ... import manifest as run_manifest
 from . import sentinel2_calibration as s2cal
 
@@ -58,9 +60,21 @@ SAT_API_TIMEOUT = 30  # STAC API 请求超时(秒)
 
 # Data Space STAC 搜索结果短缓存：月度模式「搜索阶段 → 下载阶段」间隔仅数秒，
 # 两阶段查询完全一致，直接复用可彻底避免下载阶段的重复查询（CDSE 网关偶发 504）
-_DS_SEARCH_CACHE: Dict[str, tuple] = {}  # key -> (items, timestamp)
-_DS_SEARCH_CACHE_TTL = 600  # 10 分钟内复用
-_DS_SEARCH_CACHE_LOCK = threading.Lock()  # 模块级 dict 在请求线程间共享，读写加锁
+def _ds_search_cache_limits() -> tuple[int, float]:
+    """读取启动期已校验的缓存边界；独立导入也保持安全默认值。"""
+    try:
+        entries = int(os.environ.get("GTAI_SEARCH_CACHE_ENTRIES", "64"))
+        ttl = float(os.environ.get("GTAI_SEARCH_CACHE_TTL_SECONDS", "600"))
+    except (TypeError, ValueError):
+        entries, ttl = 64, 600.0
+    return max(1, entries), max(1.0, ttl)
+
+
+_DS_CACHE_CAPACITY, _DS_CACHE_TTL = _ds_search_cache_limits()
+_DS_SEARCH_CACHE = BoundedTTLCache(_DS_CACHE_CAPACITY, _DS_CACHE_TTL)
+# 保留外层锁，使“取值并写日志”仍是一个连贯临界区；缓存自身也可被其他
+# 维护调用安全地 sweep/clear。
+_DS_SEARCH_CACHE_LOCK = threading.RLock()
 
 
 def _ds_search_cache_key(bbox, datetime_range: str, cloud_threshold) -> str:
@@ -895,7 +909,7 @@ class DataAcquisitionSkill(BaseSkill):
         单用户部署取第一个非空配置即可。
         """
         try:
-            users_dir = _ROOT / "data" / "users"
+            users_dir = current_deployment().users_root
             if users_dir.is_dir():
                 for up in sorted(users_dir.iterdir()):
                     sp = up / "settings.json"
@@ -1920,11 +1934,11 @@ class DataAcquisitionSkill(BaseSkill):
         key = _ds_search_cache_key(bbox, datetime, _cloud_threshold_from_query(query))
         with _DS_SEARCH_CACHE_LOCK:
             hit = _DS_SEARCH_CACHE.get(key)
-            if hit and _time.time() - hit[1] < _DS_SEARCH_CACHE_TTL:
+            if hit:
                 if log_callback:
                     log_callback("INFO",
-                                 f"[Data Space] 使用缓存命中 {len(hit[0])} 景 {label} 影像")
-                return hit[0]
+                                 f"[Data Space] 使用缓存命中 {len(hit)} 景 {label} 影像")
+                return hit
         # 2) 未命中：带退避重试执行真实搜索
         last_err = None
         for attempt in range(retries):
@@ -1936,7 +1950,7 @@ class DataAcquisitionSkill(BaseSkill):
                 items = list(s.items())
                 if items:
                     with _DS_SEARCH_CACHE_LOCK:
-                        _DS_SEARCH_CACHE[key] = (items, _time.time())
+                        _DS_SEARCH_CACHE[key] = items
                 if log_callback:
                     log_callback("INFO", f"[Data Space] 找到 {len(items)} 景 {label} 影像")
                 return items

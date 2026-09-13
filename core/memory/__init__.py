@@ -11,19 +11,21 @@
 """
 
 from .memory_manager import MemoryManager, ROLE_RETRIEVAL
-from .rag_store import RAGStore, EmbeddingFunction
+from .rag_store import RAGStore, EmbeddingFunction, shared_embedding
 from .experiment_log import ExperimentLog
 from .knowledge_eval import EVAL_SEED_ITEMS
 from .preferences import Preferences
 from .session_state import SessionState
 from .workflow_experience import WORKFLOW_MIN_R2, WorkflowExperience
 from .seed_data import SEED_ITEMS
+from .projection import ProjectionExecutor, enqueue_run_memory_tx
 
 __all__ = [
     "MemoryManager",
     "ROLE_RETRIEVAL",
     "RAGStore",
     "EmbeddingFunction",
+    "shared_embedding",
     "ExperimentLog",
     "Preferences",
     "SessionState",
@@ -31,4 +33,6 @@ __all__ = [
     "WORKFLOW_MIN_R2",
     "SEED_ITEMS",
     "EVAL_SEED_ITEMS",
+    "ProjectionExecutor",
+    "enqueue_run_memory_tx",
 ]

@@ -19,7 +19,7 @@ import shutil
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from .rag_store import RAGStore, EmbeddingFunction
+from .rag_store import RAGStore, shared_embedding
 from .experiment_log import ExperimentLog
 from .knowledge_eval import EVAL_IDS
 from .preferences import Preferences
@@ -58,7 +58,7 @@ class MemoryManager:
         self._projects_dir = self._root / "projects"
         self._sessions_dir = self._root / "sessions"
         self._rag = RAGStore(str(self._chroma_dir),
-                             embedding=EmbeddingFunction(model_dir=embedding_model_dir))
+                             embedding=shared_embedding(embedding_model_dir))
 
     # ── 目录 / 对象工厂 ────────────────────────────────────────────
 
@@ -168,6 +168,36 @@ class MemoryManager:
             )
         except Exception as e:
             logger.warning(f"[memory] ChromaDB 实验入库失败: {e}")
+
+    def write_experiment_json(self, project_id: str,
+                              record: Dict[str, Any]) -> Dict[str, Any]:
+        """Strict target adapter used by the reliable projection executor."""
+        if not project_id or not record.get("experiment_id"):
+            raise ValueError("实验写回缺少 project_id 或稳定 experiment_id")
+        self.experiment_log(project_id).add(record)
+        return {"experiment_id": record["experiment_id"],
+                "path": str(self.experiment_log(project_id).path)}
+
+    def write_experiment_vector(self, project_id: str,
+                                record: Dict[str, Any]) -> Dict[str, Any]:
+        if not project_id or not record.get("experiment_id"):
+            raise ValueError("实验向量写回缺少稳定来源编号")
+        metrics = record.get("metrics", {}) or {}
+        test_metrics = metrics.get("test", {}) or {}
+        r2 = test_metrics.get("R2")
+        self._rag.save_experience(
+            project_id, self._record_to_paragraph(record), strict=True,
+            metadata={
+                "source_exp": record["experiment_id"],
+                "source_run": record.get("run_id", ""),
+                "source_conv": record.get("conv_id", ""),
+                "region": record.get("region", ""),
+                "model": record.get("model", ""),
+                "r2": r2 if isinstance(r2, (int, float)) else -999.0,
+                "date": (record.get("date_range") or ["", ""])[0],
+                "status": record.get("status", ""),
+            })
+        return {"experiment_id": record["experiment_id"]}
 
     @staticmethod
     def _record_to_paragraph(record: Dict[str, Any]) -> str:
@@ -409,6 +439,34 @@ class MemoryManager:
             )
         except Exception as e:
             logger.warning(f"[memory] ChromaDB 工作流入库失败: {e}")
+
+    def write_workflow_json(self, project_id: str,
+                            record: Dict[str, Any]) -> Dict[str, Any]:
+        if not project_id or not record.get("workflow_id"):
+            raise ValueError("流程写回缺少 project_id 或稳定 workflow_id")
+        self.workflows(project_id).add(record)
+        return {"workflow_id": record["workflow_id"],
+                "path": str(self.workflows(project_id).path)}
+
+    def write_workflow_vector(self, project_id: str,
+                              record: Dict[str, Any]) -> Dict[str, Any]:
+        if not project_id or not record.get("workflow_id"):
+            raise ValueError("流程向量写回缺少稳定来源编号")
+        metrics = record.get("metrics") or {}
+        self._rag.save_workflow(
+            project_id, record_to_paragraph(record), strict=True,
+            metadata={
+                "source_workflow": record["workflow_id"],
+                "source_exp": record.get("experiment_id", ""),
+                "source_run": record.get("run_id", ""),
+                "source_conv": record.get("conv_id", ""),
+                "region": record.get("region", ""),
+                "date": (record.get("date_range") or ["", ""])[0],
+                "test_r2": metrics.get("test_r2") if isinstance(
+                    metrics.get("test_r2"), (int, float)) else -999.0,
+                "verdict": record.get("verdict", ""),
+            })
+        return {"workflow_id": record["workflow_id"]}
 
     def search_workflows(self, project_id: str, query: str, n: int = 3) -> List[Dict[str, Any]]:
         """只检索可复用工作流段落（按 kind 过滤）。"""

@@ -105,12 +105,15 @@ def strip_emoji(text: str) -> str:
 
 
 class Scheduler:
-    def __init__(self, store, root, budget=None, *, handler=None):
+    def __init__(self, store, root, budget=None, *, handler=None,
+                 users_root=None):
         self.store, self.root = store, Path(root).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         self.budget = budget or Budget.detect(self.root)
         self.ledger = ResourceLedger(self.budget, self.root)
         self.handler = handler
+        self.users_root = (Path(users_root).resolve() if users_root else
+                           self.store.db_path.parent.parent / "users")
         self.batch = new_id()
         self.ctx = multiprocessing.get_context("spawn")
         self.progress = self.ctx.Queue(maxsize=128)
@@ -318,6 +321,18 @@ class Scheduler:
                                     conversation_id=run["conversation_id"],
                                     task_id=run["task_id"], run_id=run["id"],
                                     text=tpl.format(label=label or run["task_id"]))
+                    if status == "completed":
+                        # Phase 7: completion remains authoritative even if any
+                        # optional memory projection later fails.
+                        event_seq = append_event(
+                            conn, type="run.completed", user_id=run["user_id"],
+                            conversation_id=run["conversation_id"],
+                            task_id=run["task_id"], run_id=run["id"],
+                            object_type="run", object_id=run["id"],
+                            payload={"label": run["label"] or run["task_id"]})
+                        from core.memory.projection import enqueue_run_memory_tx
+                        enqueue_run_memory_tx(conn, event_seq=event_seq,
+                                              run_id=run["id"], now=utcnow_iso())
         self.store.submit_write(tx)
 
     def _context(self, row):
@@ -550,7 +565,7 @@ class Scheduler:
                 (conv_pk,)).fetchone())
             if not legacy or not legacy[0]:
                 return ""
-            conv_file = (self.store.db_path.parent.parent / "users" / uid
+            conv_file = (self.users_root / uid
                          / "conversations" / f"{legacy[0]}.json")
             if not conv_file.is_file():
                 return ""
