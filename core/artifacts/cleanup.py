@@ -97,9 +97,16 @@ def mark_missing_tx(conn, *, artifact_id: str, detail: str) -> None:
     )
 
 
-def sweep_missing_tx(conn, *, limit: int = 200) -> List[Dict[str, Any]]:
-    """启动/巡检对账：只检查数据库登记过的正式产物（不扫全仓库、
-    不整库哈希，§11.1 第 4 条），缺失或校验不一致的标 missing。"""
+def sweep_missing_tx(conn, *, limit: int = 200,
+                     max_hash_bytes: int = 8 * 1024 * 1024) -> List[Dict[str, Any]]:
+    """启动/巡检对账：只检查数据库登记过的正式产物（不扫全仓库，§11.1 第 4 条），
+    缺失的标 missing。
+
+    内容哈希只为不超过 max_hash_bytes（默认 8MB）的文件计算——
+    写事务绝不做长时间 IO。踩坑记录：曾对全部产物做整文件 SHA-256，
+    新导出的全图 LST 栅格（几百 MB）把唯一写线程钉死数分钟，后续所有
+    写入排队 30s 超时，服务无法启动；大文件校验请走事务外的后台巡检。
+    """
     rows = conn.execute(
         "SELECT id, path, content_hash FROM artifacts"
         " WHERE availability = ? LIMIT ?",
@@ -115,6 +122,12 @@ def sweep_missing_tx(conn, *, limit: int = 200) -> List[Dict[str, Any]]:
                              "problem": "missing"})
             continue
         if content_hash:
+            try:
+                if p.stat().st_size > max_hash_bytes:
+                    # 大文件跳过内容校验：写事务内禁止长 IO（见 docstring）
+                    continue
+            except OSError:
+                continue
             import hashlib
             h = hashlib.sha256()
             with p.open("rb") as f:

@@ -93,6 +93,23 @@ function tileUrl(l, ts) {
   return `/api/layer/${encodeURIComponent(id)}/tile/{z}/{x}/{y}?conv=${encodeURIComponent(conv.value || '')}&t=${ts}&token=${encodeURIComponent(getToken())}`
 }
 
+// 瓦片偶发失败（并发排队超时等）自动退避重试：204/网络错误都触发 tileerror；
+// 加随机参数绕过失败缓存，最多重试 3 次（用户实测：风暴期 204 会让整屏空白）
+function bindTileRetry(layer) {
+  layer.on('tileerror', (e) => {
+    const tile = e && e.tile
+    if (!tile) return
+    tile._gtaiRetry = (tile._gtaiRetry || 0) + 1
+    if (tile._gtaiRetry > 3) return
+    const base = String(tile.src || '').replace(/[?&]r=\d+/g, '')
+    setTimeout(() => {
+      const sep = base.includes('?') ? '&' : '?'
+      tile.src = base + sep + 'r=' + Date.now()
+    }, 800 * tile._gtaiRetry)
+  })
+  return layer
+}
+
 function setBase(id) {
   currentBase.value = id
   if (!map) return
@@ -165,7 +182,7 @@ async function refresh() {
   for (const l of layers.value) {
     if (!l.available || !l.bounds) continue
     // 瓦片金字塔渲染：按原生分辨率加载，bounds 限定图层地理范围
-    const overlay = L.tileLayer(tileUrl(l, ts), {
+    const overlay = bindTileRetry(L.tileLayer(tileUrl(l, ts), {
       opacity: l.opacity,
       zIndex: 500, // 数据图层始终高于底图，切换底图不被覆盖
       bounds: [
@@ -179,7 +196,7 @@ async function refresh() {
       tileSize: 256,
       keepBuffer: 2,
       updateWhenIdle: false,
-    })
+    }))
     overlayMap[l.id] = overlay
     if (l.visible) overlay.addTo(map)
     if (!fitted) {
@@ -225,7 +242,8 @@ async function refreshFromTask(tid, seq) {
   for (const a of arts) {
     try {
       const meta = await api.get(`/api/artifacts/${a.id}/meta`)
-      if (meta.ok && meta.bounds) metas.push({ art: a, meta })
+      // 空洞掩膜不上图层（用户不需要；仅保留为内部产物）
+      if (meta.ok && meta.bounds && !meta.mask) metas.push({ art: a, meta })
     } catch (_) { /* 单个产物失败不影响其他 */ }
   }
   if (seq !== _refreshSeq) return
@@ -239,7 +257,8 @@ async function refreshFromTask(tid, seq) {
       label: meta.label_dated || meta.style_label || meta.name,
       group: 'result',
       available: true,
-      visible: true,
+      // 辅助图层（空洞掩膜）默认不勾选，避免与温度层重复显示
+      visible: meta.default_off !== true,
       opacity: 0.7,
       opacityPct: 70,
       // LST 产物层参与“显示温度”（lst_10m / lst_10m_filled）
@@ -252,12 +271,12 @@ async function refreshFromTask(tid, seq) {
   taskEmptyHint.value = layers.value.length ? "" : t('map.noTaskLayers')
   let fitted = false
   for (const l of layers.value) {
-    const overlay = L.tileLayer(tileUrl(l, ts), {
+    const overlay = bindTileRetry(L.tileLayer(tileUrl(l, ts), {
       opacity: l.opacity, zIndex: 500,
       bounds: [[l.bounds[0][0], l.bounds[0][1]], [l.bounds[1][0], l.bounds[1][1]]],
       minZoom: 0, maxNativeZoom: l.max_native_zoom || 14, maxZoom: 20,
       noWrap: true, tileSize: 256, keepBuffer: 2, updateWhenIdle: false,
-    })
+    }))
     overlayMap[l.id] = overlay
     if (l.visible) overlay.addTo(map)
     if (!fitted) {

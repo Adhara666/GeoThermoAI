@@ -21,6 +21,7 @@ from core.agent.understanding import binding, capabilities, operations as ops
 from core.agent.understanding import timeparse
 from core.agent.understanding.slotbook import (
     SRC_ANSWER,
+    SRC_CONFIRMED,
     SRC_DEFAULT,
     SRC_USER,
     SlotBook,
@@ -36,7 +37,9 @@ ACT_UPDATE = "update"
 ACT_CANCEL = "cancel"
 ACT_CONTINUE = "continue"
 ACT_RETRY = "retry"
+ACT_PAUSE = "pause"
 ACT_PRIORITY = "priority"
+ACT_POSTPROCESS = "postprocess"   # 结果后处理：同一任务下的续跑（填洞）
 
 
 @dataclass
@@ -72,6 +75,8 @@ class DraftChange:
     questions: List[QuestionSpec] = field(default_factory=list)
     notes: List[str] = field(default_factory=list)
     priority: Optional[int] = None
+    # 结果后处理续跑所需的外部绑定（如 main_tif：要填洞的主产品路径）
+    execution: Dict[str, Any] = field(default_factory=dict)
 
     @property
     def ready(self) -> bool:
@@ -99,6 +104,8 @@ class ResolveContext:
     active_study_area_paths: Sequence[Path] = ()
     open_tasks: Sequence[Dict[str, Any]] = ()
     open_questions: Sequence[Dict[str, Any]] = ()
+    # 本对话最近完成的完整生产结果（补洞/延续类请求的默认目标来源）
+    recent_results: Sequence[Dict[str, Any]] = ()
     default_product: str = "lst_10m"
     default_model: str = "rf"
 
@@ -182,10 +189,15 @@ def resolve(batch: ops.CandidateBatch,
                 outcome.reply_only = True
             continue
         if op.op in (ops.OP_CANCEL, ops.OP_CONTINUE, ops.OP_RETRY,
-                     ops.OP_PRIORITY):
+                     ops.OP_PRIORITY, ops.OP_PAUSE):
             change = _resolve_task_command(op, ctx)
             if change is not None:
-                outcome.changes.append(change)
+                # 同一批候选里相同 (动作, 目标) 只保留一条：模型偶尔重复输出
+                # 同一操作，若不去重会被提交两次（第二次必撞版本冲突报“迟到结果”）
+                _key = (change.action, str(change.task_id or ""))
+                if not any((c.action, str(c.task_id or "")) == _key
+                           for c in outcome.changes):
+                    outcome.changes.append(change)
             continue
 
         change = _resolve_draft_op(op, ctx, fresh, negated)
@@ -237,10 +249,11 @@ def _bind_question(op: ops.CandidateOperation, ctx: ResolveContext) -> str:
 
 def _resolve_task_command(op: ops.CandidateOperation,
                           ctx: ResolveContext) -> Optional[DraftChange]:
-    """继续 / 重试 / 取消 / 调整优先级：必须唯一绑定到一个已有任务。"""
+    """继续 / 重试 / 取消 / 暂停 / 调整优先级：必须唯一绑定到一个已有任务。"""
     result = binding.bind_task(op.target_ref, list(ctx.open_tasks))
     action = {ops.OP_CANCEL: ACT_CANCEL, ops.OP_CONTINUE: ACT_CONTINUE,
-              ops.OP_RETRY: ACT_RETRY, ops.OP_PRIORITY: ACT_PRIORITY}[op.op]
+              ops.OP_RETRY: ACT_RETRY, ops.OP_PAUSE: ACT_PAUSE,
+              ops.OP_PRIORITY: ACT_PRIORITY}[op.op]
 
     if result.kind == binding.BIND_UNIQUE and result.task:
         task = result.task
@@ -255,7 +268,7 @@ def _resolve_task_command(op: ops.CandidateOperation,
         )
 
     verb = {ACT_CANCEL: "取消", ACT_CONTINUE: "继续", ACT_RETRY: "重试",
-            ACT_PRIORITY: "调整顺序"}[action]
+            ACT_PAUSE: "暂停", ACT_PRIORITY: "调整顺序"}[action]
     if result.kind == binding.BIND_EMPTY:
         return DraftChange(action=action, capability="", label="", slots={},
                            notes=[f"现在没有可以{verb}的任务"])
@@ -315,6 +328,14 @@ def _resolve_draft_op(op: ops.CandidateOperation, ctx: ResolveContext,
 # ── 字段处理与校验 ───────────────────────────────────────────────
 
 
+def _same_region_target(book: SlotBook, rec: Dict[str, Any]) -> bool:
+    """当前绑定的研究区文件与最近完成结果是否同一个（文件级比对）。"""
+    detail = book.get(ops.F_REGION).get("detail") or {}
+    cur = str(detail.get("path") or "")
+    ref = str((rec.get("region_detail") or {}).get("path") or "")
+    return bool(cur) and cur == ref
+
+
 def _apply_and_validate(change: DraftChange, op: ops.CandidateOperation,
                         ctx: ResolveContext,
                         in_place: bool = False,
@@ -330,13 +351,36 @@ def _apply_and_validate(change: DraftChange, op: ops.CandidateOperation,
             continue
         book, _ = apply_patch(book, patch, ctx.message, source=source)
 
-    book, questions, notes = _validate(book, change.capability, ctx)
+    book, questions, notes, recent_used = _validate(book, change.capability, ctx)
     change.slots = book.to_bundle()
     change.questions = (change.questions + questions) if in_place else questions
     change.notes = list(dict.fromkeys(change.notes + notes))
     change.missing = _missing_fields(book, change.capability)
     change.ambiguity = list(op.ambiguity)
     change.label = _label_for(book, change.capability, _lang_of(ctx.message))
+    # 结果后处理：不新建任务，改为“同一任务下的填洞续跑”。
+    # 两种路径都归一到后处理：
+    #  a) 程序按最近完成结果自动绑定（recent_used 非空）；
+    #  b) 模型自行引用了 region/time，且绑定的研究区与“唯一最近完成结果”
+    #     是同一个文件（模型学会了引用，不应因此退回新建任务）。
+    recent_rec = None
+    if recent_used and recent_used.get("task_id"):
+        recent_rec = recent_used
+    elif (change.action == ACT_CREATE
+          and change.capability == ops.CAP_GAPFILL
+          and len(ctx.recent_results) == 1
+          and ctx.recent_results[0].get("task_id")
+          and _same_region_target(book, ctx.recent_results[0])):
+        recent_rec = ctx.recent_results[0]
+    if (recent_rec and change.action == ACT_CREATE
+            and change.capability == ops.CAP_GAPFILL
+            and not change.questions and not change.missing):
+        change.action = ACT_POSTPROCESS
+        change.task_id = str(recent_rec.get("task_id") or "")
+        change.execution = {
+            "main_tif": str(recent_rec.get("main_tif") or ""),
+            "source_task_id": str(recent_rec.get("task_id") or ""),
+        }
     return change
 
 
@@ -345,6 +389,10 @@ def _validate(book: SlotBook, capability: str, ctx: ResolveContext):
     questions: List[QuestionSpec] = []
     notes: List[str] = []
     lang = _lang_of(ctx.message)
+
+    book, recent_note, recent_used = _bind_recent_result(book, capability, ctx, lang)
+    if recent_note:
+        notes.append(recent_note)
 
     book, region_q, region_note = _resolve_region(book, ctx, lang)
     if region_q:
@@ -382,7 +430,9 @@ def _validate(book: SlotBook, capability: str, ctx: ResolveContext):
         questions = [head]
     elif questions:
         questions[0].missing_fields = [questions[0].field]
-    return book, questions, notes
+    if questions:
+        return book, questions, notes, None
+    return book, questions, notes, recent_used
 
 
 def _active_first(options, ctx) -> list:
@@ -393,6 +443,59 @@ def _active_first(options, ctx) -> list:
     head = [o for o in options if o.get("label") in stems]
     tail = [o for o in options if o.get("label") not in stems]
     return head + tail
+
+
+def _bind_recent_result(book: SlotBook, capability: str, ctx: ResolveContext,
+                        lang: str = "zh"):
+    """补洞类请求的默认目标：最近完成的结果（对话上下文内的业务裁决）。
+
+    「继续/接着/无空洞」这类延续请求本质是对**刚刚产出的结果**再加工；
+    当用户没有点名研究区、且本对话恰有一个最近完成的 full_lst 结果时，
+    直接将该结果的 region/time 绑定为目标（来源如实记为 confirmed）。
+    多个结果或无可引时不猜测，保持原有追问行为。
+    返回 (book, note, rec)：rec 非空表示确实按“最近完成结果”绑定了目标。
+    """
+    if capability != ops.CAP_GAPFILL or not ctx.recent_results:
+        return book, "", None
+    raw = book.value(ops.F_REGION)
+    name = ""
+    if isinstance(raw, dict):
+        name = str(raw.get("display") or raw.get("value") or "").strip()
+    elif raw is not None:
+        name = str(raw).strip()
+    if name:
+        # 垃圾回显防：模型有时把整句用户消息原样塞进 region
+        # （实测出现「没有找到名为「继续生成无空洞的结果」的研究区」）。
+        # 整句不可能是一个地名：丢弃该槽位后按“未点名”继续走最近结果绑定。
+        _strip = "。.!！?？,，、 "
+        if name.strip(_strip) == ctx.message.strip().strip(_strip):
+            book = book.drop(ops.F_REGION)
+            name = ""
+    if name:
+        return book, "", None        # 用户点名了研究区，按显式理解走
+    if len(ctx.recent_results) != 1:
+        return book, "", None        # 多个结果可引：不猜，走原有追问
+    rec = ctx.recent_results[0]
+    display = str(rec.get("region_display") or "")
+    detail = dict(rec.get("region_detail") or {})
+    time_value = dict(rec.get("time_value") or {})
+    if not display or not detail.get("path"):
+        return book, "", None
+    if book.is_negated(ops.F_REGION, display):
+        return book, "", None
+    if book.value(ops.F_REGION) in (None, ""):
+        book = book.set(ops.F_REGION, display, SRC_CONFIRMED,
+                        evidence="来自最近完成的任务",
+                        detail=detail, override=True)
+    cur_time = book.value(ops.F_TIME)
+    time_missing = not (isinstance(cur_time, dict)
+                        and cur_time.get("start") and cur_time.get("end"))
+    if time_missing and time_value.get("start") and time_value.get("end"):
+        book = book.set(ops.F_TIME, time_value, SRC_CONFIRMED,
+                        evidence="来自最近完成的任务", override=True)
+    note = (f"本次针对最近完成的结果：{display}" if lang == "zh"
+            else f"Using the most recently completed result: {display}")
+    return book, note, rec
 
 
 def _resolve_region(book: SlotBook, ctx: ResolveContext, lang: str = "zh"):

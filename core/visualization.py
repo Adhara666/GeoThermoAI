@@ -240,6 +240,20 @@ class LayerVisualizer:
             "visible": False,
             "temperature": True,
         },
+        {
+            # 结果后处理（填洞）的空洞掩膜：辅助图层，默认不勾选；
+            # 1 = 填补像元，0 = 原始有效（不参与“显示温度”采样）
+            "id": "gapfill_mask",
+            "label": "空洞掩膜",
+            "group": "结果",
+            "file": "results/gapfill_mask.tif",
+            "band": 1,
+            "colormap": "Greys",
+            "opacity": 0.6,
+            "visible": False,
+            "default_off": True,
+            "mask": True,
+        },
     ]
 
     # ── 内部工具 ───────────────────────────────────────────────

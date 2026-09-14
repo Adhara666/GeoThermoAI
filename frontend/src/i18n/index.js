@@ -212,6 +212,11 @@ const zh = {
   'wf.waitAnswer': '等待回答：',
   'wf.cancel': '取消',
   'wf.retry': '重试',
+  'wf.pause': '暂停',
+  'wf.resume': '继续',
+  'wf.pauseRequested': '已请求暂停，当前节点完成本步后停下',
+  'wf.resumeRequested': '已恢复执行，将从暂停处继续',
+  'wf.opFailed': '操作失败',
   'wf.stopRequested': '已请求停止，正在等待执行者退出',
   'wf.retrySubmitted': '已提交重试，任务将重新排队执行',
   // 任务卡状态
@@ -223,6 +228,7 @@ const zh = {
   'task.status.completed': '已完成',
   'task.status.failed': '失败',
   'task.status.cancelled': '已取消',
+  'task.status.paused': '已暂停',
   // 调度节点名/状态（任务卡详情行）
   'node.search_scene': '检索场景候选', 'node.select_scene': '配对选择或场景确定',
   'node.acquire_asset': '网络资产获取', 'node.prepare_local': '本地定标对齐准备',
@@ -585,12 +591,17 @@ const en = {
   'wf.status.queued': 'Queued',
   'wf.progressOf': 'Execution progress (Task {n})',
   'wf.waitAnswer': 'Waiting for answer: ', 'wf.cancel': 'Cancel', 'wf.retry': 'Retry',
+  'wf.pause': 'Pause', 'wf.resume': 'Resume',
+  'wf.pauseRequested': 'Pause requested; the running node stops at the next boundary',
+  'wf.resumeRequested': 'Resumed; execution continues from where it paused',
+  'wf.opFailed': 'Operation failed',
   'wf.stopRequested': 'Stop requested; waiting for the executor to exit',
   'wf.retrySubmitted': 'Retry submitted; the task will be re-queued',
   'task.status.draft': 'Draft', 'task.status.ready': 'Ready',
   'task.status.queued': 'Queued', 'task.status.running': 'Running',
   'task.status.awaiting_info': 'Awaiting answer', 'task.status.completed': 'Completed',
   'task.status.failed': 'Failed', 'task.status.cancelled': 'Cancelled',
+  'task.status.paused': 'Paused',
   'node.search_scene': 'Scene candidates', 'node.select_scene': 'Pair / scene selection',
   'node.acquire_asset': 'Asset acquisition', 'node.prepare_local': 'Local calibration & alignment',
   'node.data_check': 'Raw package check', 'node.preprocess_split': 'Preprocessing & split',
@@ -929,13 +940,15 @@ export function translateApprovalPayload(payload) {
   return out
 }
 
-// ── 工作流步骤标签（英文态）：按 step id 映射 ──────────────────
+// ── 工作流步骤标签：按 step id 解析（中英双语） ────────────────
+// 说明：此前只在英文态按 id 映射，中文态直接返回 fallback——当兜底步骤
+// （无项目/无对话时的骨架）的 fallback 恰是英文 id 时，中文界面会显示英文；
+// 现当 fallback 缺失或就是原始 id（纯小写英文串）时，两种语言都按 id 翻译。
 export function wfStepLabel(id, fallback) {
-  if (lang.value === 'en') {
-    const k = `wf.${id}`
-    const v = t(k)
-    if (v !== k) return v
-  }
+  const k = `wf.${id}`
+  const v = t(k)
+  const isRawId = !fallback || fallback === id || /^[a-z][a-z0-9_]*$/.test(fallback)
+  if (v !== k && (lang.value === 'en' || isRawId)) return v
   return fallback
 }
 

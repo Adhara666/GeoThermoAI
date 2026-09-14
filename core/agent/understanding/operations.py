@@ -28,18 +28,19 @@ OP_ANSWER = "answer"          # 回答一个待答问题
 OP_CONTINUE = "continue"      # 继续某个任务
 OP_RETRY = "retry"            # 重试某个任务
 OP_CANCEL = "cancel"          # 取消某个任务
+OP_PAUSE = "pause"            # 暂停某个任务（软暂停：停在节点边界，可恢复）
 OP_PRIORITY = "priority"      # 调整优先级
 OP_REPLY_ONLY = "reply_only"  # 只回答，不动任何任务
 
 ALL_OPS: Tuple[str, ...] = (
     OP_CREATE, OP_SET, OP_CLEAR, OP_CORRECT, OP_ANSWER,
-    OP_CONTINUE, OP_RETRY, OP_CANCEL, OP_PRIORITY, OP_REPLY_ONLY,
+    OP_CONTINUE, OP_RETRY, OP_CANCEL, OP_PAUSE, OP_PRIORITY, OP_REPLY_ONLY,
 )
 
 # 会新建或修改任务草稿的操作（Chat 模式一律禁止，§4.5）
 PRODUCTION_OPS: Tuple[str, ...] = (
     OP_CREATE, OP_SET, OP_CLEAR, OP_CORRECT, OP_CONTINUE, OP_RETRY,
-    OP_CANCEL, OP_PRIORITY,
+    OP_CANCEL, OP_PAUSE, OP_PRIORITY,
 )
 
 # ── 能力（§4.1「能力」行：搜索、下载子集、预处理、训练、完整 LST、

@@ -205,41 +205,11 @@ _NODE_LABELS = {
 }
 
 
-_QUERY_HINTS = ("哪一天", "哪天", "是什么", "什么是", "为什么", "怎么",
-                "哪些", "哪一个", "哪几个", "多少", "几点", "是不是",
-                "有没有", "状态", "进度")
-_ACTION_HINTS = ("生成", "处理", "执行", "开始", "重试", "取消",
-                 "改成", "换成", "下载", "导出", "训练", "重建",
-                 "重发", "提交", "新建", "上传", "继续", "建个", "停",
-                 "帮我跑", "跑一下", "跑起来")
-_STRONG_Q = ("哪一天", "哪天", "哪一步", "是什么", "什么是", "为什么",
-             "怎么", "哪些", "哪一个", "哪几个", "多少", "几点", "是不是")
-
-
-def _is_query_only(message: str) -> bool:
-    """判断是否“纯查询句”（走问答通道，不进理解层 JSON 操作通道）。
-
-    用户实测：查询式问句（如“我当前武汉市的配对用的是哪一天？”）会让
-    理解模型输出失控（无法解析 JSON 或复读）——它不含任务操作意图，
-    应直接交给带台账上下文的自由问答。保守策略：
-      - 含操作词且无强疑问点 → 操作句（如“帮我重试一下？”）
-      - “帮我/把…”式确认句 → 操作句
-      - “…吗？”结尾且无强疑问词 → 可能是想做任务（如“武汉 7 月做
-        LST 吗？”），保守走理解层
-      - 其余“问号结尾或含强疑问词”才命中查询
-    """
-    m = (message or "").strip()
-    if not m or len(m) > 80:
-        return False
-    strong_q = any(h in m for h in _STRONG_Q)
-    if any(h in m for h in _ACTION_HINTS) and not strong_q:
-        return False
-    if (m.startswith(("帮我", "给我")) or m.startswith("把") or "帮我" in m) \
-            and not strong_q:
-        return False
-    if m.endswith(("吗？", "吗?")) and not strong_q:
-        return False
-    return m.endswith(("？", "?")) or strong_q
+# 关键词查询快路径已移除（2026-09-13）：同一意图因措辞不同会走出两条
+# 可靠性不同的路径（命中关键词→直通问答；未命中→进理解层且可能解析失败
+# 报错——用户实测“现在进度如何/那现在呢”反复翻车）。现统一走理解层，由
+# 模型判定 reply_only；解析失败则降级为问答（见 runner 的 degraded 分支），
+# 不再依赖词表预判意图。
 
 
 def _date_from_name(name: str) -> str:
@@ -261,6 +231,11 @@ def _artifact_style(name: str) -> str:
         return "dem"
     if "sentinel" in n or "_s2" in n or n.startswith("s2"):
         return "sentinel_rgb"
+    # 空洞掩膜（gapfill_mask）是辅助图层：必须优先识别，
+    # 否则文件名里的 gapfill 关键词会让它被当成第二张“无空洞”温度层
+    # （用户实测：图层控制出现两条重复的「10m LST（无空洞）」）。
+    if "gapfill_mask" in n or ("mask" in n and "gapfill" in n):
+        return "gapfill_mask"
     if "gapfill" in n or "filled" in n or "nofill" in n or "no_hole" in n or "无空洞" in n:
         return "lst_10m_filled"
     if "10m" in n:
@@ -391,7 +366,8 @@ class AppBackend:
                                self.deployment.budget_environment())
         self._scheduler = Scheduler(
             store, execution_root, budget=budget,
-            users_root=self.deployment.users_root)
+            users_root=self.deployment.users_root,
+            exec_mode_reader=self._live_exec_mode)
         logging.info("部署路径 %s", self.deployment.public_summary())
         logging.info("调度资源预算 %s", asdict(budget))
         # 生命周期日志（失败/重试/完成）按行上用户的语言设置呈现
@@ -904,12 +880,68 @@ class AppBackend:
     # 注意：_compose_completion_report 全库唯一；若出现重复定义，后定义会
     # 覆盖先定义（验证脚本含唯一性断言）。
 
+    def _conv_mode_variants(self, cid: str) -> list:
+        """同一对话的可能键（前端 id / 内核 pk / legacy id）：模式读写都用它们对齐。"""
+        keys = [str(cid or "")]
+        try:
+            row = self._get_state_store().read(lambda c: c.execute(
+                "SELECT id, legacy_conv_id FROM conversations"
+                " WHERE id = ? OR legacy_conv_id = ? LIMIT 1",
+                (cid, cid)).fetchone())
+            if row:
+                keys.extend([str(row[0] or ""), str(row[1] or "")])
+        except Exception:
+            pass
+        out: list = []
+        for k in keys:
+            if k and k not in out:
+                out.append(k)
+        return out
+
+    def _live_exec_mode(self, cid: str) -> str:
+        """读取对话当前执行模式（会话内存态优先；运行时/编译时共用）。
+
+        必要性：kernel 专属对话没有 legacy JSON 文件时，旧实现读不到模式
+        而回退到编译快照，用户中途切换“完全执行/由我批准”不生效。
+        读取顺序：内存态多键 → 该对话 JSON 文件（服务重启后的二级回退）。
+        """
+        from core.agent.orchestrator.exec_mode import normalize as _normalize
+        variants = self._conv_mode_variants(cid)
+        for key in variants:
+            state = self._conv_states.get(key)
+            if state and state.get("exec_mode"):
+                return _normalize(state.get("exec_mode"))
+        try:
+            for key in variants:
+                path = self._conv_dir() / f"{key}.json"
+                if path.is_file():
+                    data = json.loads(path.read_text(encoding="utf-8"))
+                    mode = str(data.get("exec_mode") or "")
+                    if mode:
+                        return _normalize(mode)
+        except Exception:
+            pass
+        return ""
+
+    def _write_conv_mode(self, cid: str, mode: str) -> None:
+        """把模式写入该对话的所有键（内存态），保证任何读取路径都能命中。"""
+        for key in self._conv_mode_variants(cid):
+            self._get_conv_state(key)["exec_mode"] = mode
+
     def _conversation_exec_mode(self, task_row) -> str:
         """读取任务所属对话当前的交互模式（供无请求上下文的编译入口使用）。
 
         卡片回答等路径不带请求上下文；若不补读，编译快照会落到
         settings 默认值（approval），导致“完全执行”下仍弹配对选择。
+        读取顺序：会话内存态（含中途切换，实时生效）→ 对话 JSON 文件。
         """
+        try:
+            conv_pk = str(task_row.get("conversation_id") or "")
+            mode = self._live_exec_mode(conv_pk) if conv_pk else ""
+            if mode:
+                return mode
+        except Exception:
+            pass
         try:
             uid = str(task_row.get("user_id") or "")
             conv_pk = str(task_row.get("conversation_id") or "")
@@ -957,6 +989,27 @@ class AppBackend:
                     project_dir = str(self._conv_project_dir(conv_row[1], conv_row[0]))
                     run_label = (task.get("label") or "").strip() or "运行"
                 current = rows(conn, "SELECT * FROM runs WHERE id=?", (task.get("current_run_id"),))
+                if candidate.get("postprocess"):
+                    # 结果后处理续跑：同一任务下只含 gapfill 节点的运行；
+                    # 已有未完成的同类续跑直接复用，避免重复编译
+                    if current and not current[0]["cancel_requested"]:
+                        fi = json.loads(current[0]["frozen_inputs"] or "{}")
+                        if fi.get("capability") == "gapfill" and current[0]["status"] not in (
+                                "completed", "failed", "cancelled", "superseded"):
+                            compiled.append({"run_id": current[0]["id"],
+                                             "task_id": tid, "reused": True})
+                            continue
+                    local = dict(settings)
+                    local["_execution"] = {
+                        **dict(settings.get("_execution") or {}),
+                        **dict(candidate.get("execution") or {}),
+                    }
+                    made = compile_task_tx(conn, task_id=tid,
+                                           expected_task_version=task["version"],
+                                           settings=local, project_dir=project_dir,
+                                           run_label=run_label, postprocess=True)
+                    compiled.append(made)
+                    continue
                 if current and not current[0]["cancel_requested"]:
                     from core.agent.understanding.slotbook import SlotBook
                     snap = json.loads(current[0]["frozen_inputs"])["snapshot"]
@@ -965,7 +1018,10 @@ class AppBackend:
                         # 继续/优先级命令不创建第二条相同生产链。
                         if candidate.get("action") == "retry":
                             conn.execute("UPDATE nodes SET status='pending',retry_at=NULL WHERE run_id=? AND status='failed' AND NOT EXISTS(SELECT 1 FROM attempts a WHERE a.node_id=nodes.id AND a.process_exited=0)", (current[0]["id"],))
-                        compiled.append({"run_id": current[0]["id"], "task_id": tid})
+                        compiled.append({"run_id": current[0]["id"], "task_id": tid,
+                                         "reused": True,
+                                         "resumed": bool(candidate.get("resumed")),
+                                         "label": str(task.get("label") or "")})
                         continue
                     made = start_superseding_run_tx(
                         conn, task_id=tid, expected_task_version=task["version"],
@@ -1136,6 +1192,24 @@ class AppBackend:
         self._auto_activate_bound_regions(result)
         return result
 
+    def _archive_understanding_failure(self, uid: str, cid: str, conv_pk: str,
+                                       message: str, outcome) -> None:
+        """解析失败样本归档（JSONL）：供复盘与回归金样采集；失败不影响主流程。"""
+        try:
+            path = self._user_dir() / "understanding_failures.jsonl"
+            rec = {
+                "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "conversation": cid,
+                "conversation_pk": conv_pk,
+                "message": (message or "")[:500],
+                "candidate_log": (getattr(outcome, "candidate_log", "") or "")[:500],
+                "raw_output": (getattr(outcome, "raw_model_output", "") or "")[:8000],
+            }
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+        except Exception:
+            pass
+
     def _auto_activate_bound_regions(self, result) -> None:
         """绑定到真实文件的研究区自动并入启用集（指定未启用 → 自动启用）。
 
@@ -1292,7 +1366,9 @@ class AppBackend:
                     {**understanding.ResolvedTask(t).to_summary(),
                      "summary_status": t.get("summary_status"),
                      "run_id": t.get("current_run_id"),
-                     "nodes": [dict(zip(("id", "type", "status", "wait_reason"), r)) for r in conn.execute("SELECT id,node_type,status,wait_reason FROM nodes WHERE run_id=? ORDER BY exec_order", (t.get("current_run_id"),))],
+                     # 跨任务全部运行取节点：结果后处理续跑会把 current_run 切到
+                     # 只含 gapfill 节点的运行，只看当前运行会让主链步骤全变“等待”
+                     "nodes": [dict(zip(("id", "type", "status", "wait_reason"), r)) for r in conn.execute("SELECT n.id,n.node_type,n.status,n.wait_reason FROM nodes n JOIN runs r ON r.id=n.run_id WHERE r.task_id=? ORDER BY n.rowid", (t["id"],))],
                      "negations": (t.get("slots") or {}).get("negations") or []}
                     for t in t_store.list_tasks(conn, user_id=uid,
                                                 conversation_id=conv_pk,
@@ -1382,9 +1458,10 @@ class AppBackend:
             nodes = [dict(zip(("id", "node_key", "node_type", "status",
                                "wait_reason", "exec_order"), r))
                      for r in conn.execute(
-                         "SELECT id, node_key, node_type, status, wait_reason,"
-                         " exec_order FROM nodes WHERE run_id = ? ORDER BY exec_order",
-                         (task.get("current_run_id"),))]
+                         "SELECT n.id, n.node_key, n.node_type, n.status, n.wait_reason,"
+                         " n.exec_order FROM nodes n JOIN runs r ON r.id = n.run_id"
+                         " WHERE r.task_id = ? ORDER BY n.rowid",
+                         (task_id,))]
             questions = [
                 {"id": q[0], "prompt": q[1], "status": q[2], "version": q[3]}
                 for q in conn.execute(
@@ -1400,9 +1477,10 @@ class AppBackend:
                     " a.retention_class, a.created_at FROM artifacts a"
                     " JOIN attempts at ON at.id = a.attempt_id"
                     " JOIN nodes n ON n.id = at.node_id"
-                    " WHERE n.run_id = ? AND a.availability = 'available'"
+                    " WHERE n.run_id IN (SELECT id FROM runs WHERE task_id = ?)"
+                    " AND a.availability = 'available'"
                     " ORDER BY a.created_at DESC",
-                    (task.get("current_run_id"),))]
+                    (task_id,))]
             projections = [
                 {"target": p[0], "status": p[1], "attempts": p[2],
                  "next_retry_at": p[3], "last_error": p[4],
@@ -1460,6 +1538,10 @@ class AppBackend:
                     conn.execute(
                         "UPDATE runs SET cancel_requested = 1 WHERE task_id = ?",
                         (task_id,))
+                    # 取消优先于暂停：撤销暂停标记，避免残留
+                    conn.execute(
+                        "UPDATE tasks SET pause_requested = 0"
+                        " WHERE id = ? AND pause_requested = 1", (task_id,))
                     from core.state_kernel.store import append_event
                     append_event(conn, type="task.cancel_requested",
                                  task_id=task_id, run_id=row[2],
@@ -1471,6 +1553,53 @@ class AppBackend:
                     scheduler.notify()
                 return {"ok": True, "message": "已请求停止，正在等待执行者退出",
                         "task_id": task_id, "version": current_version}
+            if operation in ("pause", "resume"):
+                # 暂停=软停（当前节点跑完即停在节点边界）；恢复=清标记从断点继续。
+                # 与取消严格分离：取消仍是终止，不可从断点恢复。
+                from core.state_kernel.store import append_event, update_versioned
+
+                def _pause(conn):
+                    st = conn.execute(
+                        "SELECT summary_status FROM tasks WHERE id = ?",
+                        (task_id,)).fetchone()
+                    cur = str(st[0]) if st else ""
+                    if cur not in ("running", "queued", "ready"):
+                        raise ValueError(f"当前状态（{cur or '未知'}）不可暂停")
+                    new_version = update_versioned(
+                        conn, "tasks", task_id, current_version,
+                        {"pause_requested": 1, "summary_status": "paused"})
+                    append_event(conn, type="task.pause_requested",
+                                 task_id=task_id, run_id=row[2],
+                                 object_type="task", object_id=task_id,
+                                 object_version=new_version,
+                                 payload={"request_id": request_id})
+                    return new_version
+
+                def _resume(conn):
+                    st = conn.execute(
+                        "SELECT pause_requested FROM tasks WHERE id = ?",
+                        (task_id,)).fetchone()
+                    if not st or not int(st[0] or 0):
+                        raise ValueError("任务未处于暂停状态")
+                    new_version = update_versioned(
+                        conn, "tasks", task_id, current_version,
+                        {"pause_requested": 0, "summary_status": "running"})
+                    append_event(conn, type="task.resume_requested",
+                                 task_id=task_id, run_id=row[2],
+                                 object_type="task", object_id=task_id,
+                                 object_version=new_version,
+                                 payload={"request_id": request_id})
+                    return new_version
+
+                new_version = store.submit_write(
+                    _pause if operation == "pause" else _resume)
+                if scheduler:
+                    scheduler.notify()
+                msg = ("已暂停，当前节点完成本步骤后停下；恢复后从这里继续。"
+                       if operation == "pause" else
+                       "已恢复，将从暂停处继续。")
+                return {"ok": True, "message": msg, "task_id": task_id,
+                        "version": new_version}
             if operation == "retry":
                 if not scheduler:
                     return {"ok": False, "message": "调度器未启动"}
@@ -1592,10 +1721,13 @@ class AppBackend:
         meta = {"ok": True, "id": artifact["id"], "name": path.name,
                 "type": artifact["type"],
                 "style": _artifact_style(path.name)}
-        # 标准图层名（与升级前一致）：按推断样式映射 LAYER_DEFS 标签
-        meta["style_label"] = next(
-            (d["label"] for d in LayerVisualizer.LAYER_DEFS
-             if d["id"] == meta["style"]), "")
+        # 标准图层名（与升级前一致）：按推断样式映射 LAYER_DEFS 标签；
+        # 辅助图层（如空洞掩膜）透传默认不勾选标记，避免主列表刷屏
+        _def = next((d for d in LayerVisualizer.LAYER_DEFS
+                     if d["id"] == meta["style"]), {})
+        meta["style_label"] = _def.get("label", "")
+        meta["default_off"] = bool(_def.get("default_off"))
+        meta["mask"] = bool(_def.get("mask"))
         # 带影像日期的显示名（如“10m LST（2024-07-22）”），对齐升级前样式
         _base = meta["style_label"] or path.name
         _date = _date_from_name(path.name)
@@ -1621,7 +1753,11 @@ class AppBackend:
         if artifact is None:
             return None
         path = Path(artifact["path"])
-        if not path.is_file() or not _TILE_RENDER_SEM.acquire(blocking=False):
+        if not path.is_file():
+            return None
+        # 短时排队而非立即放弃：并发瓦片风暴时“拿不到就返回空”的旧策略
+        # 会让整屏图层空白（且空响应曾被缓存，清不掉）；等待 10s 基本都能轮到
+        if not _TILE_RENDER_SEM.acquire(timeout=10.0):
             return None
         try:
             style = style if any(
@@ -1644,23 +1780,27 @@ class AppBackend:
     )
 
     def _task_raw_paths(self, task_id: str):
-        """取任务当前运行的原始输入路径（来自 prepare_local 完成凭据）。
+        """取任务原始输入路径（来自最近一次 prepare_local 完成凭据）。
 
         产物清单只含节点真实输出（输入不复制），地图要在任务视图里
         恢复升级前的原生图层（如 10m S2 RGB），只能回到原始输入。
+        注意：必须**跨该任务全部运行**回溯——结果后处理（填洞续跑）
+        等运行不含 prepare_local 节点，若只看当前运行会让输入图层全部消失
+        （用户实测：任务完成后加跑填洞，RGB/30m/DEM 图层不见了）。
         返回 (task_dict, raw_paths) 或 (None, {})。
         """
         store = self._get_state_store()
         uid = self._uid()
         task = store.read(lambda c: t_store.load_task(c, task_id))
-        if not task or task.get("user_id") != uid or not task.get("current_run_id"):
+        if not task or task.get("user_id") != uid:
             return None, {}
         row = store.read(lambda c: c.execute(
             "SELECT a.result_path, a.staging_dir FROM attempts a"
             " JOIN nodes n ON n.id = a.node_id"
-            " WHERE n.run_id = ? AND n.node_key = 'prepare_local'"
-            " AND a.status = 'succeeded' ORDER BY a.attempt_no DESC LIMIT 1",
-            (task["current_run_id"],)).fetchone())
+            " JOIN runs r ON r.id = n.run_id"
+            " WHERE r.task_id = ? AND n.node_key = 'prepare_local'"
+            " AND a.status = 'succeeded' ORDER BY a.rowid DESC LIMIT 1",
+            (task_id,)).fetchone())
         if not row:
             return task, {}
         candidates = []
@@ -1746,7 +1886,10 @@ class AppBackend:
         if style is None:
             return None
         path = Path(str(raw.get(key) or ""))
-        if not path.is_file() or not _TILE_RENDER_SEM.acquire(blocking=False):
+        if not path.is_file():
+            return None
+        # 短时排队而非立即放弃（同 artifact_tile 的说明）
+        if not _TILE_RENDER_SEM.acquire(timeout=10.0):
             return None
         try:
             mtime = os.path.getmtime(path)
@@ -1946,7 +2089,11 @@ class AppBackend:
                                "请按最新状态重新操作"}
         snapshot = self.session_snapshot(pid, cid)
         if applied.get("summary_status") == "ready":
-            self._enqueue_ready([applied])
+            # 卡片回答通道编译：显式带上该对话的实时执行模式——
+            # applied 字典不含 user_id/conversation_id，_enqueue_ready 的
+            # 对话兜底读不到，会静默落回设置默认值（用户实测：选“完全执行”
+            # 完成卡片选择后，运行仍冻结为 approval，调优节点继续弹卡）。
+            self._enqueue_ready([applied], self._live_exec_mode(cid) or None)
         reply = self._ack_reply_text()
         appended = self._append_answer_bubbles(pid, cid, text, reply)
         return {"ok": True, "task": applied, "appended": appended, **snapshot}
@@ -1978,14 +2125,16 @@ class AppBackend:
     def set_exec_mode(self, pid: str, cid: str, mode: str) -> dict:
         """切换交互模式（立即生效，不改变已编译运行的任何科学参数）。
 
-        切到“完全执行”时：把本对话中等待用户选择的“配对选择”问题
-        自动代选推荐项（无推荐取最高分），任务无需用户再点选即继续。
+        切到“完全执行”时：把本对话中等待用户选择的审批问题（配对选择、
+        调优决定、调优轮次等）自动作答——配对选择取推荐项（无推荐取排序
+        第一），通用审批取 default_option（与模型本该直接进入的自动分支
+        语义一致），任务无需用户再点选即继续。
         """
         from core.agent.orchestrator.exec_mode import normalize
         next_mode = normalize(mode)
         if not cid:
             return {"ok": False, "message": "缺少对话"}
-        self._get_conv_state(cid)["exec_mode"] = next_mode
+        self._write_conv_mode(cid, next_mode)
         try:
             self._update_conversation_file(cid, pid, exec_mode=next_mode)
         except Exception:
@@ -2005,19 +2154,29 @@ class AppBackend:
                     constraint = q.get("answer_constraint") or {}
                     payload = constraint.get("payload") or {}
                     cands = q.get("candidates") or []
-                    if payload.get("kind") != "pair_select" or not cands:
+                    answer_text = ""
+                    if payload.get("kind") == "pair_select" and cands:
+                        pick = next((x for x in cands
+                                     if (x.get("info") or {}).get("recommended")),
+                                    cands[0])
+                        answer_text = str(pick.get("id"))
+                    elif (payload.get("type") == "approval"
+                          and str(payload.get("default_option") or "")):
+                        # 通用审批（调优决定/调优轮次等）：取载荷默认项作答，
+                        # 与“完全执行”下模型本应直接走的自动分支语义一致
+                        answer_text = str(payload.get("default_option"))
+                    if not answer_text:
                         continue
-                    pick = next((x for x in cands
-                                 if (x.get("info") or {}).get("recommended")),
-                                cands[0])
                     try:
                         answered = self._scheduler.answer(
-                            q["id"], str(pick.get("id")),
-                            uid, conv[0])
+                            q["id"], answer_text, uid, conv[0])
                     except ValueError:
                         answered = None
                     if answered is not None:
                         auto_answered += 1
+        if self._scheduler:
+            # 切换后唤醒调度：等待中的节点会用新运行时模式重新判定
+            self._scheduler.notify()
         return {"ok": True, "mode": next_mode, "auto_answered": auto_answered}
 
     # ── 计划编译（升级第三阶段：状态内核 → 节点图） ───────
@@ -3394,11 +3553,12 @@ class AppBackend:
         地图平移/缩放/切图层的风暴式请求会把 FastAPI 线程池占满，导致
         bootstrap/layers/files/current 等轻量请求排队超时——前端表现为
         "图层消失、下载列表为空"。
-        用非阻塞信号量限制同时渲染的瓦片数（默认 3）：信号量满时瓦片立即返回空
-        （前端视为透明），而不是排队等待——避免等待线程继续占用线程池。
+        用短时等待（≤ 10s）的信号量限制同时渲染的瓦片数：并发风暴时
+        请求排队而非立即返回空——直接丢空会让整屏图层空白（用户实测），
+        且空响应曾被缓存；10s 内等不到才放弃（前端另有错误重试兜底）。
         """
         project_dir = self._get_project_dir(cid)
-        if not _TILE_RENDER_SEM.acquire(blocking=False):
+        if not _TILE_RENDER_SEM.acquire(timeout=10.0):
             return None
         try:
             return LayerVisualizer.render_layer_tile(layer_id, project_dir, z, x, y)
@@ -3898,7 +4058,7 @@ class AppBackend:
             exec_mode,
             normalize_exec_mode(conv_state.get("exec_mode"), agent_cfg["default_exec_mode"]),
         )
-        conv_state["exec_mode"] = resolved_mode
+        self._write_conv_mode(cid, resolved_mode)
         try:
             self._update_conversation_file(cid, pid, exec_mode=resolved_mode)
         except Exception:
@@ -4010,7 +4170,7 @@ class AppBackend:
                     q.put(("done", None))
                 elif understanding_on:
                     # 自由问答（带台账上下文）：查询句与“只回答”共用。
-                    def _free_answer() -> str:
+                    def _free_answer(note: str = "") -> str:
                         parts: list = []
                         context = {
                             "workflow_status": conv_state["workflow_progress"],
@@ -4018,6 +4178,9 @@ class AppBackend:
                             "study_areas": self.list_study_areas(),
                             "active_study_areas": self.get_active_study_areas(),
                         }
+                        if note:
+                            # 降级路径说明（理解失败转问答）：让回答模型知情
+                            context["understanding_note"] = note
                         # 注入台账进展（多角色应知道流程状态）：任务进度/
                         # 当前节点/等待与失败原因 + 已选配对 + 待答问题
                         try:
@@ -4035,14 +4198,10 @@ class AppBackend:
                         # 拼接会把每次快照首尾相连，导致气泡复读）
                         return parts[-1] if parts else ""
 
-                    # 纯查询句直通问答通道（用户实测：查询式问句会让理解
-                    # 模型输出失控——无法解析 JSON 或复读；它本质不含任务
-                    # 操作，直接交给带台账上下文的自由问答）
-                    if _is_query_only(user_msg):
-                        _free_answer()
-                        q.put(("tasks", self.session_snapshot(pid, cid)))
-                        q.put(("done", None))
-                        return
+                    # 统一走理解层：查询句由理解层判 reply_only 后交给问答
+                    # 通道；解析失败则降级为问答（degraded）。不再按关键词
+                    # 预判“纯查询”直通——那会让同一意图因措辞不同走出两条
+                    # 不同可靠性的路径（用户实测：换个说法就翻车）。
                     # 执行审批只消费已保存问题。无法匹配的文字仍交给理解层。
                     waiting = self.session_snapshot(pid, cid).get("questions", [])
                     if len(waiting) == 1:
@@ -4062,24 +4221,62 @@ class AppBackend:
                         conv_pk=conv_pk, prior_messages=prior_messages,
                         on_log=_emit_log)
                     self._scheduler.notify()
+                    if getattr(outcome, "degraded", False):
+                        # 解析失败样本归档（JSONL）：供复盘与回归金样采集
+                        self._archive_understanding_failure(
+                            uid, cid, conv_pk, user_msg, outcome)
                     if outcome.ready_tasks:
                         submitted = self._enqueue_ready(outcome.ready_tasks, resolved_mode)
-                        _put_token(
-                            (f"已提交 {len(submitted)} 个任务，按各自节点与资源额度执行。"
-                             if self._user_lang(uid) == "zh" else
-                             f"{len(submitted)} task(s) submitted; each runs under its own node and resource quotas.")
-                            + ("\n" + outcome.message if outcome.message else ""))
+                        _zh = self._user_lang(uid) == "zh"
+                        _post = [t for t in outcome.ready_tasks
+                                 if t.get("postprocess")]
+                        if _post and len(_post) == len(outcome.ready_tasks):
+                            # 结果后处理：属于当前任务，不表述为“提交了新任务”；
+                            # 文案直白说明完成后的行为，避免“自动继续”引发歧义
+                            _head = ("已开始对当前任务执行结果后处理（空洞填补）；"
+                                     "完成后会自动登记产物并更新任务状态。"
+                                     if _zh else
+                                     "Result post-processing (gap filling) has started "
+                                     "under the current task; artifacts will be registered "
+                                     "and the task status updated when it finishes.")
+                        elif submitted and all(isinstance(x, dict) and x.get("reused")
+                                               for x in submitted):
+                            # 复用了已有运行：区分“恢复暂停”与“本来就已在执行”
+                            _resumed = next((x for x in submitted
+                                             if isinstance(x, dict) and x.get("resumed")),
+                                            None)
+                            if _resumed:
+                                _lb = str(_resumed.get("label") or "")
+                                _head = (f"已恢复「{_lb}」的执行，将从暂停处继续。" if _zh else
+                                         f'Resumed "{_lb}"; execution continues from where it paused.')
+                            else:
+                                _head = ("该任务已在执行中，无需重复提交。" if _zh else
+                                         "This task is already running; no resubmission was needed.")
+                        else:
+                            _head = (f"已提交 {len(submitted)} 个任务，按各自节点与资源额度执行。"
+                                     if _zh else
+                                     f"{len(submitted)} task(s) submitted; each runs under its own node and resource quotas.")
+                        _put_token(_head + ("\n" + outcome.message if outcome.message else ""))
                     else:
                         reply = outcome.message or ""
-                        # 第六阶段修正（§4.5「Work 中的知识问答不启动 Skill」）：
-                        # 判定为「只回答」且无台账动作时，由真模型生成自然语言
-                        # 回答；理解失败且疑似查询句时同样回退问答（双保险）
-                        fallback = (
-                            outcome.kind == "reply_only"
-                            or (outcome.kind == "failed"
-                                and user_msg.rstrip().endswith(("？", "?"))))
+                        # 「只回答」或理解层降级（解析失败但模型可用）时，
+                        # 由真模型带台账上下文生成自然语言回答（§4.5）；
+                        # 降级路径零执行副作用，不再抛“请分开说”式套话
+                        fallback = (outcome.kind == "reply_only"
+                                    or getattr(outcome, "degraded", False))
                         if fallback and not reply:
-                            reply = _free_answer() or reply
+                            reply = _free_answer(
+                                "本轮理解没有得到可解析的操作结果。"
+                                "请按普通询问尽力回答；如果用户其实是在提出"
+                                "执行请求，请简短提示他再明确说一次。"
+                                if getattr(outcome, "degraded", False) else ""
+                            ) or reply
+                        if not reply and getattr(outcome, "degraded", False):
+                            reply = ("我暂时没能理解这句（模型响应异常），"
+                                     "请稍后再说一次。"
+                                     if self._user_lang(uid) == "zh" else
+                                     "I couldn't interpret that message "
+                                     "(model response error); please try again.")
                         _put_token(reply or "已记录你的说明。")
                     q.put(("tasks", self.session_snapshot(pid, cid)))
                     q.put(("done", None))
@@ -4097,6 +4294,9 @@ class AppBackend:
                     q.put(("done", None))
             except Exception as e:
                 runner_failed[0] = True
+                # 让气泡也显示可读的失败原因（避免只剩空气泡、只有 toast）
+                _put_token(("⚠️ 执行出错：" if self._user_lang(uid) == "zh"
+                            else "⚠️ Execution error: ") + str(e))
                 q.put(("error", str(e)))
                 if command_id:
                     try:
@@ -4463,7 +4663,7 @@ class AppBackend:
 # 占满 FastAPI 线程池、饿死其他 API 请求（见 render_layer_tile）。
 # 后端已有 lru_cache（同瓦片重复请求直接命中），并发从 3 提高到 8，
 # 显著加速首次平移/缩放时的冷瓦片加载。
-_TILE_RENDER_SEM = threading.BoundedSemaphore(8)
+_TILE_RENDER_SEM = threading.BoundedSemaphore(12)
 
 # 登录失败限速（内存态，进程重启清零）
 _LOGIN_MAX_FAIL = 5
@@ -4872,7 +5072,9 @@ def layer_tile(layer_id: str, z: int, x: int, y: int, conv: str = ""):
     _cache_headers = {"Cache-Control": "public, max-age=300"}
     png = backend.render_layer_tile(layer_id, conv or None, z, x, y)
     if png is None:
-        return Response(status_code=204, headers=_cache_headers)
+        # 失败不缓存：并发高峰期的 204 若被浏览器缓存 5 分钟，
+        # 之后即使渲染恢复也会被缓存挡住（用户实测“全都加载不出来”）
+        return Response(status_code=204, headers={"Cache-Control": "no-store"})
     return Response(content=png, media_type="image/png", headers=_cache_headers)
 
 
@@ -4990,7 +5192,9 @@ def task_input_tile(task_id: str, key: str, z: int, x: int, y: int):
     _cache_headers = {"Cache-Control": "public, max-age=300"}
     png = backend.task_input_tile(task_id, key, z, x, y)
     if png is None:
-        return Response(status_code=204, headers=_cache_headers)
+        # 失败不缓存：并发高峰期的 204 若被浏览器缓存 5 分钟，
+        # 之后即使渲染恢复也会被缓存挡住（用户实测“全都加载不出来”）
+        return Response(status_code=204, headers={"Cache-Control": "no-store"})
     return Response(content=png, media_type="image/png", headers=_cache_headers)
 
 
@@ -5041,7 +5245,9 @@ def artifact_tile(artifact_id: str, z: int, x: int, y: int, style: str = ""):
     _cache_headers = {"Cache-Control": "public, max-age=300"}
     png = backend.artifact_tile(artifact_id, style, z, x, y)
     if png is None:
-        return Response(status_code=204, headers=_cache_headers)
+        # 失败不缓存：并发高峰期的 204 若被浏览器缓存 5 分钟，
+        # 之后即使渲染恢复也会被缓存挡住（用户实测“全都加载不出来”）
+        return Response(status_code=204, headers={"Cache-Control": "no-store"})
     return Response(content=png, media_type="image/png", headers=_cache_headers)
 
 

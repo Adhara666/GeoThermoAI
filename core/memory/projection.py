@@ -12,7 +12,6 @@ import hashlib
 import json
 import logging
 import threading
-import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
@@ -126,7 +125,6 @@ def build_memory_records(store, run_id: str) -> Dict[str, dict]:
     frozen = _decode(bundle["frozen_inputs"])
     snapshot = frozen.get("snapshot") or frozen
     scenario = _decode(bundle["scenario_binding"])
-    slots = _decode(bundle["slots"])
     region_value = _param(snapshot, "region", "")
     if isinstance(region_value, dict):
         region = (region_value.get("name") or region_value.get("label")

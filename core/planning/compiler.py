@@ -120,6 +120,7 @@ def compile_task_tx(
     settings: Dict[str, Any],
     project_dir: Optional[str] = None,
     run_label: Optional[str] = None,
+    postprocess: bool = False,
 ) -> Dict[str, Any]:
     """「编译任务」原子操作：快照 → 运行 → 节点图 → 任务状态推进。
 
@@ -134,9 +135,16 @@ def compile_task_tx(
     if task_row is None:
         raise CompileError(f"任务不存在：{task_id}")
     capability = str(task_row.get("capability") or "")
+    template_capability = capability
     template = CAPABILITY_TEMPLATES.get(capability)
     if template is None:
         raise CompileError(f"未知能力，拒绝编译：{capability}")
+    if postprocess:
+        # 结果后处理续跑：同一任务下只含 gapfill 节点的独立运行
+        # （不覆盖主图，产物为单独的“填洞后”产品）；
+        # main_tif 等外部绑定由 settings["_execution"] 随快照冻结。
+        template_capability = "gapfill"
+        template = CAPABILITY_TEMPLATES[template_capability]
     if template["chain"] is None:
         raise CompileError(f"能力 {template['label']} 只查询，不建计算图")
 
@@ -165,7 +173,7 @@ def compile_task_tx(
 
     # 3) 参数快照（进队前冻结，存 runs.frozen_inputs，含逐项来源）
     snapshot = build_snapshot(task_row, settings)
-    _validate_params(capability, snapshot)
+    _validate_params(template_capability, snapshot)
 
     # 4) 创建运行（排队态；模板版本 + 快照指纹随运行留档）
     run_id = new_id()
@@ -176,8 +184,9 @@ def compile_task_tx(
             "frozen_inputs": {
                 "snapshot": snapshot,
                 "snapshot_hash": snapshot_hash(snapshot),
-                "capability": capability,
+                "capability": template_capability,
                 "steps": steps,
+                "postprocess": bool(postprocess),
             },
             "status": "queued",
     }
@@ -240,11 +249,12 @@ def compile_task_tx(
         task_id=task_id, run_id=run_id,
         object_type="run", object_id=run_id,
         payload={
-            "capability": capability,
+            "capability": template_capability,
             "template_version": TEMPLATE_VERSION,
             "snapshot_hash": snapshot_hash(snapshot),
             "node_count": exec_order,
             "steps": steps,
+            "postprocess": bool(postprocess),
         },
     )
 
@@ -252,7 +262,7 @@ def compile_task_tx(
         "run_id": run_id,
         "task_id": task_id,
         "task_version": int(task_row.get("version") or 1) + 1,
-        "capability": capability,
+        "capability": template_capability,
         "template_version": TEMPLATE_VERSION,
         "snapshot_hash": snapshot_hash(snapshot),
         "nodes": [{"node_key": t, "node_id": ids[0], "type": t,

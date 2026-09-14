@@ -145,7 +145,11 @@ def _train_decision(spec, context, report):
     train.rounds = list(context.get("rounds", []))
     node_params = json.loads(spec["node"]["params"])
     answer = node_params.get("execution_answer")
-    hooks = SimpleNamespace(exec_mode=normalize(params.get("exec_mode")), run_state=None, ranked_pairs=[],
+    # 交互模式取运行时值优先（不随编译冻结）：“完全执行”下调优决定节点
+    # 不再弹卡，直接进入七规则调优循环；与 acquisition 的运行时判定口径一致。
+    # （用户实测：冻结值为 approval 时，中途切“完全执行”仍会弹调优卡）
+    runtime_mode = spec.get("runtime_exec_mode") or params.get("exec_mode")
+    hooks = SimpleNamespace(exec_mode=normalize(runtime_mode), run_state=None, ranked_pairs=[],
                             ask=lambda payload: answer)
     # TrainAgent._ask 调用 hooks._ask，返回 None 就立刻落持久问题，绝不阻塞。
     hooks._ask = lambda payload: answer

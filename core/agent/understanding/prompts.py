@@ -19,9 +19,10 @@ _OPS_TABLE = """\
 | clear | 用户否定了某个信息（「不是武汉」「不要 7 月」） |
 | correct | 用户纠正上一轮的理解（先否定旧值，同时给出新值） |
 | answer | 用户在回答系统正在等待的问题 |
-| continue | 用户要求继续某个已有任务 |
+| continue | 用户要求继续/恢复某个已有任务（含恢复已暂停的任务） |
 | retry | 用户要求重试某个已有任务 |
-| cancel | 用户要求取消某个已有任务 |
+| cancel | 用户要求取消某个已有任务（终止，不是暂停） |
+| pause | 用户要求暂停某个正在进行中的任务（停在节点边界，可再恢复） |
 | priority | 用户要求调整某个任务的先后顺序 |
 | reply_only | 用户只是在问问题/闲聊，不需要动任何任务 |"""
 
@@ -39,7 +40,7 @@ _CAP_TABLE = """\
 _FIELD_TABLE = """\
 | 字段 | 值怎么写 |
 |---|---|
-| region | 用户原话里的地名，例如「武汉」；不要写文件路径 |
+| region | 用户原话里的地名，例如「武汉」；不要写文件路径；绝不能把整句话或请求短语（如「继续生成无空洞的结果」）当作地名写进来 |
 | time | 用户原话里的时间表达，例如「7 月」「去年七月」「2025-07-15」；原样抄，不要自己换算 |
 | product_mode | 只能是 pair（配对模式）或 monthly（月度合成） |
 | datasets | 数组，取值只能是 landsat / sentinel2 / dem |
@@ -83,7 +84,8 @@ def understand_prompt(*, anchor_date: str, tz_label: str, chat_mode: str,
                       study_areas: Sequence[str],
                       open_tasks: Sequence[str],
                       open_questions: Sequence[str],
-                      recent_summary: str = "") -> str:
+                      recent_summary: str = "",
+                      recent_completed: Sequence[str] = ()) -> str:
     """候选理解器的系统提示词。"""
     mode_line = (
         "当前是 Chat 只读模式：你**只能**输出 reply_only，"
@@ -112,6 +114,25 @@ def understand_prompt(*, anchor_date: str, tz_label: str, chat_mode: str,
    程序会整条丢弃，不会替你做组合。
 6. 禁止输出枚举表以外的操作类型、能力或字段名。
 
+## 历史对话的使用规范（重要）
+
+历史对话只用于两件事：
+1. 理解指代：如「那现在呢」「继续刚才的」「第二个」指的是上文已经聊过的事情；
+2. 判断延续或修改：判断用户是在补充、修改还是追问已有任务。
+
+硬性约束：
+- **意图只来自最新一条用户消息**。历史消息不是新的指令，绝不要把历史里的旧消息重新翻译成操作。
+- **禁止重放历史里已执行过的操作**：历史中出现过的 create / set / clear / continue 等都已经处理过了，
+  除非最新一条消息明确要求对它们做新动作，否则一条也不准重复输出。
+- 最新消息没有提出新的执行意图时（追问进度、闲聊、问知识），只能输出 reply_only。
+- 要引用历史里的任务时，用上方「未完成任务」清单里的 id 或 label 匹配；清单里的任务已经在执行或等待中，
+  不要对它们再次 create。
+- **允许引用、不算重放**：当最新消息是对最近完成结果的延续（如「继续生成无空洞的结果」）时，
+  可以把上方「最近完成的结果」里的 region / time 写进 patches 作为新操作的参数
+  （evidence 注明「来自最近完成的任务」）；区别在于：重放=重复执行旧操作，引用=为新操作定目标。
+  若用户没有点名地名，**宁可完全不写 region**（程序会按最近完成的结果自动绑定），
+  绝不能把整句消息当地区名。
+
 ## 允许的操作类型
 
 {_OPS_TABLE}
@@ -130,10 +151,13 @@ def understand_prompt(*, anchor_date: str, tz_label: str, chat_mode: str,
 - 模式：{mode_line}
 - 已上传的研究区文件：
 {_bullet(study_areas, "还没有上传任何研究区")}
-- 台账里未完成的任务（label 可用于 target_ref 匹配）：
+- 台账里未完成的任务（已在执行/等待中；label 可用于 target_ref 匹配，不要重复创建）：
 {_bullet(open_tasks, "没有未完成的任务")}
 - 正在等待用户回答的问题：
 {_bullet(open_questions, "没有待答问题")}
+- 最近完成的结果（「继续/接着/无空洞/补洞/再导出一份」这类延续请求以此为默认目标；
+  可以在 patches 里引用它的 region/time，并注明「来自最近完成的任务」）：
+{_bullet(recent_completed, "本对话还没有刚完成的结果")}
 {("- 最近对话摘要：" + recent_summary) if recent_summary else ""}
 
 ## 输出格式（严格遵守）
@@ -155,3 +179,20 @@ def repair_hint() -> str:
     return ("\n\n## 强制要求\n上一次输出无法解析。只输出一个 JSON 对象，"
             "不要任何解释文字、标题或代码块标记；operations 必须是数组；"
             "op / capability / 字段名只能取上面枚举表里的值。")
+
+
+def repair_request(user_message: str, raw_output: str) -> str:
+    """修复重试的用户内容：把上次不合格的原始输出回传给模型做结构化修复。
+
+    空手重问等于让模型原地再错一次；带上原始输出能显著提高修复成功率。
+    """
+    raw = (raw_output or "").strip()
+    if not raw:
+        return (f"原始消息：{user_message}\n\n"
+                "你上一次没有返回任何内容。请按格式要求，只输出一个 JSON 对象。")
+    if len(raw) > 4000:
+        raw = raw[:4000] + "\n…（截断）"
+    return (f"原始消息：{user_message}\n\n"
+            "你上一次的输出如下（它无法解析为规定的 JSON）：\n"
+            f"---\n{raw}\n---\n"
+            "请把它修正为符合格式的唯一一个 JSON 对象；不要输出任何解释文字。")

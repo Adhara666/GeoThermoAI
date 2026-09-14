@@ -106,12 +106,14 @@ def strip_emoji(text: str) -> str:
 
 class Scheduler:
     def __init__(self, store, root, budget=None, *, handler=None,
-                 users_root=None):
+                 users_root=None, exec_mode_reader=None):
         self.store, self.root = store, Path(root).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
         self.budget = budget or Budget.detect(self.root)
         self.ledger = ResourceLedger(self.budget, self.root)
         self.handler = handler
+        # 运行时交互模式读取器（web 层注入，含会话内存态；不随编译快照冻结）
+        self._exec_mode_reader = exec_mode_reader
         self.users_root = (Path(users_root).resolve() if users_root else
                            self.store.db_path.parent.parent / "users")
         self.batch = new_id()
@@ -253,7 +255,7 @@ class Scheduler:
         return rows(conn, "SELECT n.*, r.task_id, r.task_version, r.frozen_inputs, r.scenario_binding,"
                     " r.cancel_requested, r.superseded_by, r.created_at AS run_created,"
                     " t.user_id, t.project_id, t.conversation_id, t.priority, t.current_run_id,"
-                    " t.version AS current_version, t.summary_status, t.slots"
+                    " t.version AS current_version, t.summary_status, t.slots, t.pause_requested"
                     " FROM nodes n JOIN runs r ON r.id=n.run_id JOIN tasks t ON t.id=r.task_id WHERE " + where, args)
 
     @staticmethod
@@ -288,13 +290,18 @@ class Scheduler:
                     conn.execute("UPDATE nodes SET status=?, wait_reason=?, ready_at=CASE WHEN ?='ready' THEN COALESCE(ready_at,?) ELSE ready_at END WHERE id=?",
                                  (state, reason, state, utcnow_iso(), row["id"]))
                     _event(conn, row, "node.state", {"status": state, "reason": reason})
-            for run in rows(conn, "SELECT r.id,r.task_id,t.current_run_id,t.summary_status,"
+            for run in rows(conn, "SELECT r.id,r.task_id,r.cancel_requested,t.current_run_id,"
+                            " t.summary_status,t.pause_requested,"
                             " t.user_id,t.conversation_id,t.label FROM runs r JOIN tasks t ON t.id=r.task_id"
                             " WHERE r.status NOT IN ('completed','cancelled')"):
                 states = [r[0] for r in conn.execute("SELECT status FROM nodes WHERE run_id=?", (run["id"],))]
                 if not states:
                     continue
-                if "running" in states:
+                if run["pause_requested"] and not run["cancel_requested"]:
+                    # 用户暂停优先于常规推导；但不掩盖“刚好全部完成”
+                    status = ("completed" if all(s == "succeeded" for s in states)
+                              else "paused")
+                elif "running" in states:
                     status = "running"
                 elif "waiting_input" in states:
                     status = "awaiting_info"
@@ -403,6 +410,9 @@ class Scheduler:
             " AND EXISTS (SELECT 1 FROM nodes p WHERE p.run_id=a.run_id AND p.node_type='prepare_local' AND p.status IN ('pending','ready','waiting_resource'))").fetchone()[0])
         for row in candidates:
             if not self._valid(row):
+                continue
+            if row["pause_requested"]:
+                # 任务已暂停：不派发新节点（已就绪的节点保持待命，恢复后立即接上）
                 continue
             context = self._context(row)
             peak = self.store.read(lambda c: c.execute("SELECT MAX(a.peak_memory_bytes) FROM attempts a JOIN nodes n ON n.id=a.node_id WHERE n.node_type=? AND a.status='succeeded'", (row["node_type"],)).fetchone()[0]) or 0
@@ -552,9 +562,18 @@ class Scheduler:
     def _runtime_exec_mode(self, row) -> str:
         """读取该对话当前的交互模式（交互模式不随编译快照冻结）。
 
-        “完全执行”下暂停点（如配对选择）自动代选；读取失败返回空串，
-        调用方回退到编译快照里的值（保守行为不变）。
+        优先级：web 层注入的实时读取器（含会话内存态，中途切换立即生效）
+        → 对话 JSON 文件；读取失败返回空串，调用方回退到编译快照里的值
+        （保守行为不变）。
         """
+        reader = getattr(self, "_exec_mode_reader", None)
+        if reader:
+            try:
+                mode = str(reader(str(row.get("conversation_id") or "")) or "")
+                if mode:
+                    return mode
+            except Exception:
+                pass
         try:
             uid = str(row.get("user_id") or "")
             conv_pk = str(row.get("conversation_id") or "")
@@ -704,7 +723,14 @@ class Scheduler:
                 from core.state_kernel.questions import create_question
                 q = result["question"]
                 question_version = current["current_version"] + 1
-                conn.execute("UPDATE tasks SET summary_status='awaiting_info',version=?,updated_at=? WHERE id=?", (question_version, now, row["task_id"]))
+                # 暂停中的任务不覆盖为 awaiting_info：卡片照常生成，任务保持
+                # paused（恢复后由 _refresh 推回 awaiting_info）；消除“审批卡
+                # 把暂停状态顶掉”的竞态
+                conn.execute(
+                    "UPDATE tasks SET summary_status=CASE WHEN"
+                    " COALESCE(pause_requested,0)=1 THEN 'paused' ELSE"
+                    " 'awaiting_info' END,version=?,updated_at=? WHERE id=?",
+                    (question_version, now, row["task_id"]))
                 qid = create_question(conn, user_id=row["user_id"], conversation_id=row["conversation_id"], qtype="execution_approval", prompt=q["prompt"],
                                       targets=[{"task_id": row["task_id"], "task_version": question_version, "run_id": row["run_id"], "field": "execution"}],
                                       candidates=q.get("candidates", []), answer_constraint={"node_id": row["id"], "execution": True, "payload": q.get("payload")})

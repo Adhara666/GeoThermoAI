@@ -678,6 +678,14 @@ export const useChatStore = defineStore('chat', {
       this.logLines = []
       this.logMaxId = 0
       this.workflowSteps = [] // 复位进度面板为"等待"（删除项目/对话后立即变等待，不再残留旧进度）
+      // 任务卡/问题卡/产物清单同样复位：否则删除项目后任务卡仍显示旧"已完成"状态
+      this.kernelTasks = {}
+      this.kernelTasksOrder = []
+      this.kernelQuestions = {}
+      this.kernelQuestionsOrder = []
+      this.kernelArtifacts = []
+      this.kernelActive = false
+      this.eventCursor = 0
     },
   },
 })

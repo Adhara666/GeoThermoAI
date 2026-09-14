@@ -25,7 +25,7 @@ function taskQuestion(taskId) {
 const STATUS_TEXT = {
   draft: '草稿', ready: '就绪', queued: '排队中', running: '执行中',
   awaiting_info: '等待回答', completed: '已完成', failed: '失败',
-  cancelled: '已取消',
+  cancelled: '已取消', paused: '已暂停',
 }
 function taskStatusText(s) {
   // 任务卡状态标签随界面语言（英文模式下不再残留中文）
@@ -61,6 +61,18 @@ async function onRetry(taskId, version) {
   // 失败任务重试：后端把失败节点按现行预算重新排队（不新建任务）
   const r = await chat.taskCommand(taskId, 'retry', {}, version)
   if (r.ok) toast.info(t('wf.retrySubmitted'))
+}
+async function onPause(taskId, version) {
+  // 暂停：软暂停（当前节点跑完停在节点边界）；可再恢复，不是取消
+  const r = await chat.taskCommand(taskId, 'pause', {}, version)
+  if (r.ok) toast.info(t('wf.pauseRequested'))
+  else toast.error(r.message || t('wf.opFailed'))
+}
+async function onResume(taskId, version) {
+  // 恢复：清暂停标记，从断点继续
+  const r = await chat.taskCommand(taskId, 'resume', {}, version)
+  if (r.ok) toast.info(t('wf.resumeRequested'))
+  else toast.error(r.message || t('wf.opFailed'))
 }
 
 const FALLBACK_STEPS = [
@@ -241,6 +253,14 @@ watch(() => project.currentConv, (cid) => {
           </div>
         </div>
         <div class="kernel-task__ops">
+          <button
+            v-if="task.summary_status === 'running' || task.summary_status === 'queued'"
+            class="btn btn--sm" @click.stop="onPause(task.task_id, task.version)"
+          >{{ t('wf.pause') }}</button>
+          <button
+            v-if="task.summary_status === 'paused'"
+            class="btn btn--sm btn--primary" @click.stop="onResume(task.task_id, task.version)"
+          >{{ t('wf.resume') }}</button>
           <button
             v-if="task.summary_status === 'running' || task.summary_status === 'queued'"
             class="btn btn--sm" @click.stop="onCancel(task.task_id, task.version)"

@@ -48,6 +48,7 @@ class CandidateUnderstander(RoleAgent):
         open_questions: Sequence[str],
         history: Optional[List[dict]] = None,
         recent_summary: str = "",
+        recent_completed: Optional[Sequence[str]] = None,
     ) -> ops.CandidateBatch:
         """返回候选批次。模型不可用时返回 `source=unavailable` 的空批次。"""
         system = prompts.understand_prompt(
@@ -58,6 +59,7 @@ class CandidateUnderstander(RoleAgent):
             open_tasks=open_tasks,
             open_questions=open_questions,
             recent_summary=recent_summary,
+            recent_completed=list(recent_completed or []),
         )
         raw = self.call_text(system, message, temperature=0.0,
                              max_tokens=_MAX_TOKENS, history=history,
@@ -72,9 +74,11 @@ class CandidateUnderstander(RoleAgent):
         if batch.valid:
             return ops.apply_shared_modifiers(batch)
 
-        # 一次格式修复（§4.1「最多一次格式修复」）
+        # 一次格式修复（§4.1「最多一次格式修复」）：把不合格的原始输出
+        # 回传给模型做结构化修复（空手重问等于原地再错一次）
         self.log(f"候选输出无效，进行一次格式修复：{'；'.join(batch.errors[:3])}")
-        repaired = self.call_text(system + prompts.repair_hint(), message,
+        repaired = self.call_text(system + prompts.repair_hint(),
+                                  prompts.repair_request(message, batch.raw_output),
                                   temperature=0.0, max_tokens=_MAX_TOKENS,
                                   history=history, thinking=_THINKING_OFF,
                                   json_mode=True)
@@ -84,7 +88,11 @@ class CandidateUnderstander(RoleAgent):
         repaired_batch = self._to_batch(repaired)
         if repaired_batch.valid:
             return ops.apply_shared_modifiers(repaired_batch)
-        # 两次都无效：保留第二次的原始输出与错误，交由上层如实说明
+        # 两次都无效：留痕（日志面板可见 + 由上层归档），保留第二次的
+        # 原始输出与错误，交由上层决定（现为“降级为问答”而非报错）
+        snippet = (repaired_batch.raw_output or batch.raw_output or "").strip()
+        self.log(f"两次输出均无法解析为操作 JSON；原始输出前300字："
+                 f"{snippet[:300] or '（空）'}")
         repaired_batch.errors = list(dict.fromkeys(
             batch.errors + repaired_batch.errors))
         return repaired_batch

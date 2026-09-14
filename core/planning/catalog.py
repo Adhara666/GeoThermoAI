@@ -171,6 +171,9 @@ def validate_step_names(steps) -> Tuple[bool, List[str]]:
     """
     from core.agent.plan_schema import WORKFLOW_STEPS
 
-    known = set(WORKFLOW_STEPS) | {"lst_gapfill"}
+    # 允许集合 = 7 步主链 + 填洞：gapfill 节点在旧链路里的技能名是
+    # postprocess（结果后处理），必须一并认可，否则填洞计划永远编译失败
+    # （实测报错：计划包含未知步骤，校验失败：['postprocess']）。
+    known = set(WORKFLOW_STEPS) | {"lst_gapfill", "postprocess"}
     unknown = [s for s in steps if s not in known]
     return (not unknown), unknown

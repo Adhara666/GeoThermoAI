@@ -41,13 +41,14 @@ TASK_AWAITING_INFO = "awaiting_info"    # 有阻塞语义问题，等用户补�
 TASK_READY = "ready"                    # 信息齐全，等待编译/派发（阶段 3 起改写为 queued）
 TASK_QUEUED = "queued"                  # 已就绪，等待资源
 TASK_RUNNING = "running"                # 当前运行至少有一个执行中的节点
+TASK_PAUSED = "paused"                  # 用户暂停：当前节点跑完后停在节点边界，恢复后从断点继续
 TASK_COMPLETED = "completed"
 TASK_FAILED = "failed"
 TASK_CANCELLED = "cancelled"
 
 # 未结束的任务状态：绑定「唯一合理未完成任务」时的候选范围（§4.2 绑定优先级）
 OPEN_STATUSES = (TASK_DRAFT, TASK_AWAITING_INFO, TASK_READY, TASK_QUEUED,
-                 TASK_RUNNING)
+                 TASK_RUNNING, TASK_PAUSED)
 
 
 def empty_slots() -> Dict[str, Any]:
@@ -198,7 +199,8 @@ def patch_task(
 _TASK_COLUMNS = (
     "id, user_id, project_id, conversation_id, capability, version, slots,"
     " ambiguity, summary_status, priority, current_run_id, accumulated,"
-    " created_at, updated_at, label, origin_message_id, origin_command_id"
+    " created_at, updated_at, label, origin_message_id, origin_command_id,"
+    " pause_requested"
 )
 _TASK_FIELDS = [c.strip() for c in _TASK_COLUMNS.split(",")]
 

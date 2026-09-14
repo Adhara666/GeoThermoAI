@@ -15,6 +15,7 @@
 """
 
 import datetime
+import json
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -28,6 +29,7 @@ from core.agent.understanding import resolution as res
 from core.agent.understanding import timeparse
 from core.agent.understanding.understander import (
     CandidateUnderstander,
+    SOURCE_UNAVAILABLE,
     enforce_chat_mode,
     summarize_for_log,
 )
@@ -52,6 +54,8 @@ class UnderstandingResult:
     notes: List[str] = field(default_factory=list)
     candidate_log: str = ""
     raw_model_output: str = ""
+    # 解析失败降级：模型可用但两次都吐不出合法操作 JSON，已按“只回答”处理
+    degraded: bool = False
 
     @property
     def should_execute(self) -> bool:
@@ -70,9 +74,69 @@ def load_ledger_context(store, *, user_id: str,
                                              conversation_id=conversation_id),
             "questions": q_store.list_open_questions(
                 conn, user_id=user_id, conversation_id=conversation_id),
+            "recent_results": _recent_completed_results(
+                conn, user_id=user_id, conversation_id=conversation_id),
         }
 
     return store.read(_read)
+
+
+def _recent_completed_results(conn, *, user_id: str, conversation_id: str,
+                              limit: int = 3) -> List[Dict[str, Any]]:
+    """本对话最近完成的完整生产结果（补洞/延续类请求的默认目标来源）。"""
+    rows = conn.execute(
+        "SELECT id, label, slots, updated_at FROM tasks"
+        " WHERE user_id = ? AND conversation_id = ?"
+        " AND capability = 'full_lst' AND summary_status = 'completed'"
+        " ORDER BY updated_at DESC, rowid DESC LIMIT ?",
+        (user_id, conversation_id, int(limit))).fetchall()
+    out: List[Dict[str, Any]] = []
+    for task_id, label, slots_raw, updated in rows:
+        try:
+            slots = (json.loads(slots_raw) if isinstance(slots_raw, str)
+                     else slots_raw or {})
+            fields = (slots or {}).get("fields") or {}
+        except Exception:  # noqa: BLE001
+            fields = {}
+        region = fields.get(ops.F_REGION) or {}
+        detail = (dict(region.get("detail") or {})
+                  if isinstance(region, dict) else {})
+        value = region.get("value") if isinstance(region, dict) else ""
+        if isinstance(value, dict):
+            value = value.get("display") or value.get("value") or ""
+        display = str(value or detail.get("display")
+                      or Path(str(detail.get("path") or "")).stem or "")
+        time_v = (fields.get(ops.F_TIME) or {}).get("value") or {}
+        # 结果后处理（填洞）需要的主产品：该任务最新一次导出的可用 GeoTIFF
+        art = conn.execute(
+            "SELECT a.path FROM artifacts a"
+            " JOIN attempts x ON x.id = a.attempt_id"
+            " JOIN nodes n ON n.id = x.node_id"
+            " JOIN runs r ON r.id = n.run_id"
+            " WHERE r.task_id = ? AND n.node_type = 'export'"
+            " AND a.type = 'geotiff' AND a.availability = 'available'"
+            " ORDER BY a.rowid DESC LIMIT 1", (task_id,)).fetchone()
+        out.append({
+            "task_id": str(task_id or ""),
+            "label": str(label or ""),
+            "region_display": display,
+            "region_detail": detail,
+            "time_value": dict(time_v) if isinstance(time_v, dict) else {},
+            "main_tif": str(art[0]) if art and art[0] else "",
+            "updated_at": str(updated or ""),
+        })
+    return out
+
+
+def _recent_line(rec: Dict[str, Any]) -> str:
+    """给理解模型看的最近完成结果行（label｜研究区｜时间区间）。"""
+    rng = rec.get("time_value") or {}
+    span = ""
+    if rng.get("start") and rng.get("end"):
+        span = f"{rng['start']}~{rng['end']}"
+    return "｜".join(x for x in (str(rec.get("label") or ""),
+                                 str(rec.get("region_display") or ""),
+                                 span) if x)
 
 
 def build_resolve_context(*, message: str, received_at: datetime.datetime,
@@ -91,6 +155,7 @@ def build_resolve_context(*, message: str, received_at: datetime.datetime,
         active_study_area_paths=list(active_study_area_paths),
         open_tasks=list(ledger.get("tasks") or []),
         open_questions=list(ledger.get("questions") or []),
+        recent_results=list(ledger.get("recent_results") or []),
         default_product=default_product,
         default_model=default_model,
     )
@@ -121,6 +186,7 @@ def handle_message(
         study_areas=[p.stem for p in ctx.study_area_paths],
         open_tasks=[_task_line(t) for t in ctx.open_tasks],
         open_questions=[_question_line(q) for q in ctx.open_questions],
+        recent_completed=[_recent_line(r) for r in ctx.recent_results],
         history=history,
     )
     if ctx.chat_mode == "chat":
@@ -135,8 +201,17 @@ def handle_message(
     )
 
     if outcome.failure:
-        result.kind = KIND_FAILED
-        result.message = outcome.failure
+        if batch.source == SOURCE_UNAVAILABLE:
+            # 模型真不可用：如实说明（换种说法也无济于事）
+            result.kind = KIND_FAILED
+            result.message = outcome.failure
+            return result
+        # 模型可用但两次都没给出可解析的操作：语义降级为“只回答”，
+        # 不再抛面向“新任务指令”的套话报错；回答文本由 runner 交回答
+        # 模型生成（零执行副作用，最坏情况是多一段说明，用户可重发）
+        result.kind = KIND_REPLY_ONLY
+        result.degraded = True
+        result.notes.append("解析失败已降级为问答")
         return result
 
     # 1) 先消费答案（§3.4 消费答案事务）
@@ -357,7 +432,12 @@ def _compose_noop(changed: List[Dict[str, Any]], lang: str = "zh") -> str:
     for task in changed:
         status = str(task.get("summary_status") or "")
         label = str(task.get("label") or ("该任务" if lang == "zh" else "the task"))
-        if status == t_store.TASK_CANCELLED:
+        if status == t_store.TASK_PAUSED:
+            parts.append(f"已暂停「{label}」，正在执行的节点会在当前步骤完成后停下；"
+                         f"恢复后从这里继续。" if lang == "zh"
+                         else f'Paused "{label}"; the running node stops at the '
+                              f'next node boundary and resumes from here.')
+        elif status == t_store.TASK_CANCELLED:
             parts.append(f"已取消「{label}」。" if lang == "zh"
                          else f'Cancelled "{label}".')
         elif status == t_store.TASK_AWAITING_INFO:
@@ -373,6 +453,8 @@ def _compose_noop(changed: List[Dict[str, Any]], lang: str = "zh") -> str:
 def _status_for(change: res.DraftChange) -> str:
     if change.action == res.ACT_CANCEL:
         return t_store.TASK_CANCELLED
+    if change.action == res.ACT_PAUSE:
+        return t_store.TASK_PAUSED
     if change.questions or change.missing:
         return t_store.TASK_AWAITING_INFO
     return t_store.TASK_READY
@@ -384,6 +466,16 @@ def _commit_change(store, change: res.DraftChange, *, user_id: str,
     status = _status_for(change)
 
     def _tx(conn):
+        resumed = False
+        eff_status = status
+        if change.action == res.ACT_POSTPROCESS:
+            # 结果后处理（补洞）：不新建任务、不改任务本体；
+            # 由编译入口以 postprocess 标记在同一任务下建“填洞续跑”。
+            task = t_store.load_task(conn, change.task_id)
+            if not task or task["conversation_id"] != conversation_id:
+                raise ValueError("结果后处理的目标任务不存在")
+            return {"task_id": change.task_id, "version": int(task.get("version") or 1),
+                    "question_ids": []}
         if change.action == res.ACT_CREATE:
             task_id = t_store.create_task(
                 conn, user_id=user_id, project_id=project_id,
@@ -395,16 +487,33 @@ def _commit_change(store, change: res.DraftChange, *, user_id: str,
             version = 1
         else:
             task_id = change.task_id
+            prev = t_store.load_task(conn, task_id)
+            if (change.action == res.ACT_CONTINUE and prev
+                    and prev.get("summary_status") == t_store.TASK_AWAITING_INFO):
+                # 恢复“等待回答”中的任务：回到等待回答，而不是直接置 ready
+                # （否则缺信息任务会被送去编译，报“缺少编译前必需信息”）
+                eff_status = t_store.TASK_AWAITING_INFO
             version = t_store.patch_task(
                 conn, task_id, change.expected_version,
                 slots=change.slots or None,
                 capability=change.capability or None,
-                summary_status=status,
+                summary_status=eff_status,
                 ambiguity=change.ambiguity,
                 label=change.label or None,
                 priority=change.priority,
                 event_payload={"action": change.action,
                                "missing": change.missing})
+            if change.action == res.ACT_PAUSE:
+                # 暂停：任务级软暂停标记（调度器据此停止派发新节点）
+                conn.execute("UPDATE tasks SET pause_requested=1 WHERE id=?",
+                             (task_id,))
+            elif change.action in (res.ACT_CONTINUE, res.ACT_CANCEL):
+                # 恢复或取消：撤销暂停标记（恢复即从断点继续；取消避免残留）
+                if change.action == res.ACT_CONTINUE and prev and \
+                        prev.get("pause_requested"):
+                    resumed = True
+                conn.execute("UPDATE tasks SET pause_requested=0"
+                             " WHERE id=? AND pause_requested=1", (task_id,))
         q_store.expire_questions_for_task(
             conn, task_id, reason="任务草稿已更新，旧问题不再适用")
         question_ids = [
@@ -419,16 +528,40 @@ def _commit_change(store, change: res.DraftChange, *, user_id: str,
             for spec in change.questions
         ]
         return {"task_id": task_id, "version": version,
-                "question_ids": question_ids}
+                "question_ids": question_ids, "resumed": resumed,
+                "status": eff_status}
 
-    written = store.submit_write(_tx)
-    return {
+    # 乐观锁冲突自动重试一次：并发编译/其他命令刚推进任务版本时，
+    # 用户命令不应因此失败（重读最新版本后在其上执行）
+    from core.state_kernel.store import StaleVersionError
+    written = None
+    for _attempt in (1, 2):
+        try:
+            written = store.submit_write(_tx)
+            break
+        except StaleVersionError:
+            if _attempt == 2 or not change.task_id:
+                raise
+            fresh = store.read(lambda c: t_store.load_task(c, change.task_id))
+            if fresh is None:
+                raise
+            change.expected_version = int(fresh.get("version") or 1)
+    out = {
         "task_id": written["task_id"], "version": written["version"],
         "question_ids": written["question_ids"],
         "capability": change.capability, "label": change.label,
-        "slots": change.slots, "summary_status": status,
+        "slots": change.slots,
+        "summary_status": written.get("status") or status,
         "missing": list(change.missing), "action": change.action,
+        "resumed": bool(written.get("resumed")),
     }
+    if change.action == res.ACT_POSTPROCESS:
+        out.update({
+            "postprocess": True,
+            "summary_status": "ready",
+            "execution": dict(change.execution or {}),
+        })
+    return out
 
 
 def _commit_unbound_questions(store, change: res.DraftChange, *, user_id: str,

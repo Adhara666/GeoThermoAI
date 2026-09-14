@@ -17,7 +17,7 @@ from typing import List, Optional, Tuple
 
 # 当前数据库结构版本：每次结构变更（新增表/字段/约束）必须 +1，
 # 并在 MIGRATIONS 末尾追加对应的迁移条目。
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 # 建库时冻结的默认连接参数（§3.3）：
 #   - 默认回滚日志模式（不启用 WAL）
@@ -383,6 +383,15 @@ CREATE TABLE IF NOT EXISTS legacy_imports (
 """
 
 
+# ── 版本 7：暂停/恢复（对话与按钮双通道）──
+# 任务级软暂停：pause_requested=1 时调度器不派发新节点（已就绪的节点保持待命），
+# 正在执行的节点跑完即停在节点边界；恢复（清 0 + 唤醒调度）后从断点继续。
+# 暂停与取消严格分离：取消仍是终止；暂停不摧毁任何已完成的成果。
+_DDL_V7 = """
+ALTER TABLE tasks ADD COLUMN pause_requested INTEGER NOT NULL DEFAULT 0;
+"""
+
+
 def _apply_connection_pragmas(conn: sqlite3.Connection) -> None:
     """按 §3.3 设置连接参数。读/写连接共用（默认回滚日志模式，不用 WAL）。"""
     conn.execute("PRAGMA foreign_keys=ON")
@@ -400,6 +409,7 @@ def migrations() -> List[Tuple[int, str, str]]:
         (4, "界面：运行的项目视图绑定（产物符号链接落点与运行标签）", _DDL_V4),
         (5, "界面：任务执行日志持久化（跨刷新/重启不丢失）", _DDL_V5),
         (6, "记忆与部署：可靠写回状态及旧数据兼容映射", _DDL_V6),
+        (7, "暂停/恢复：任务级软暂停标记（对话与按钮双通道）", _DDL_V7),
     ]
 
 
