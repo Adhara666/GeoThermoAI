@@ -132,6 +132,9 @@ export const useChatStore = defineStore('chat', {
     // 选中任务中枢（面板联动）：conv → task_id；地图/精度/下载/日志
     // 按选中任务的产物解析，未选中时回退旧行为（兼容旧链路）
     activeTaskByConv: {},
+    // 地图选点（MapView 点选）：{lon, lat} —— 随消息带给理解层，
+    // 支持「这个点周围300米范围的地表温度是多少」类提问
+    selectedPoint: null,
   }),
 
   getters: {
@@ -419,6 +422,15 @@ export const useChatStore = defineStore('chat', {
     },
 
     /** 任务命令（§12.1）：取消 / 重试 / 优先级，带所见版本校验（409 语义） */
+    setSelectedPoint(p) {
+      // 地图选点写/清（null 清除）；只接受有效经纬度
+      if (p && typeof p.lon === 'number' && typeof p.lat === 'number') {
+        this.selectedPoint = { lon: p.lon, lat: p.lat }
+      } else {
+        this.selectedPoint = null
+      }
+    },
+
     async taskCommand(taskId, operation, payload = {}) {
       const toast = useToast()
       const seen = Number(this.kernelTasks[taskId]?.version || 0)
@@ -510,9 +522,23 @@ export const useChatStore = defineStore('chat', {
           exec_mode: this.execMode,
           chat_mode: this.chatMode, // Chat=只读对话 / Work=完整执行
           request_id: requestId,
+          selected_point: this.selectedPoint || undefined,
         })
         if (!r.ok) { t2.error(trServer(r.message) || t('chat.sendFailed')); this.streaming = false; return }
         if (r.messages) this.messages = normalizeMessages(r.messages)
+        // 点信息跟随本条消息展示在气泡上；发送成功后消费清空
+        // （发送失败时保留在输入框中，供用户重发）
+        if (this.selectedPoint) {
+          const pt = { lon: this.selectedPoint.lon, lat: this.selectedPoint.lat }
+          for (let i = this.messages.length - 1; i >= 0; i--) {
+            if (this.messages[i].role === 'user') {
+              this.messages[i].point = pt
+              break
+            }
+          }
+          this.messages = [...this.messages]
+          this.setSelectedPoint(null)
+        }
         await this._listen(useProjectStore().currentConv)
       } catch (e) {
         t2.error(t('chat.sendFailedMsg', { msg: e.message }))
@@ -537,6 +563,14 @@ export const useChatStore = defineStore('chat', {
           if (last) {
             last.thinking = data.thinking || last.thinking
             last.thinkingDone = false // 思考进行中：折叠块展开、正文尚未开始
+            this.messages = [...this.messages]
+          }
+        } else if (type === 'thinking_note') {
+          // 该轮“处理摘要”（真实理解与动作）：气泡思考块可展开内容的
+          // 优先展示源（无则回落到“等待与处理”占位说明）
+          const last = this.messages[this.messages.length - 1]
+          if (last && data && data.note) {
+            last.pendingNote = String(data.note)
             this.messages = [...this.messages]
           }
         } else if (type === 'token') {
@@ -576,6 +610,8 @@ export const useChatStore = defineStore('chat', {
           }
           if (last && data.thinking_seconds) last.thinking_seconds = data.thinking_seconds
           if (last && last.thinking) last.thinkingDone = true
+          // 处理摘要随 done 搵带（可靠通道）：无真思考流的轮次展开可见“理解：…”
+          if (last && data.note) last.pendingNote = String(data.note)
           this.messages = [...this.messages]
           this.streaming = false
           this.paused = false

@@ -1155,10 +1155,17 @@ class Scheduler:
             if str(answer.get("option_id")) not in valid:
                 raise ValueError("答案不在已保存候选中")
             if constraint.get("payload"):
-                from core.agent.orchestrator.approval import parse_resume
-                answer, error = parse_resume(constraint["payload"], answer)
-                if error:
-                    raise ValueError(error)
+                payload = constraint["payload"] or {}
+                if payload.get("kind") == "pair_select":
+                    # 配对选择载荷：option_id 即候选序号（acquisition.select 直接消费），
+                    # 不走通用审批的 parse_resume（它要求 options 列表，此前导致
+                    # “无效的选项”→“已失效”误报，用户实测卡片点不了）。
+                    pass
+                else:
+                    from core.agent.orchestrator.approval import parse_resume
+                    answer, error = parse_resume(payload, answer)
+                    if error:
+                        raise ValueError(error)
             params = decode(current["params"])
             params["execution_answer"] = answer
             questions.close_question(conn, question_id, saved["version"], status="answered", answer=answer)

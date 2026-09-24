@@ -45,6 +45,17 @@ async function submit() {
 
     <div class="chat-input-wrap">
       <div class="chat-input-box">
+        <!-- 地图选点：输入框内组件（可逐一删除），随本条消息发送 -->
+        <div v-if="chat.selectedPoint" class="point-chip" :title="t('chatInput.pointTitle')">
+          <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+            <path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z" />
+            <circle cx="12" cy="10" r="3" />
+          </svg>
+          <span class="point-chip__text">{{ t('chatInput.pointChip', { lon: chat.selectedPoint.lon.toFixed(5), lat: chat.selectedPoint.lat.toFixed(5) }) }}</span>
+          <button class="point-chip__x" type="button" :title="t('chatInput.pointClear')" @click="chat.setSelectedPoint(null)">
+            <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" aria-hidden="true"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+          </button>
+        </div>
         <textarea
           v-model="input"
           rows="1"

@@ -317,7 +317,56 @@ const tempMode = ref(false)   // 是否激活"显示温度"（激活后锁定地
 const tempLocked = ref(false) // 是否锁定当前像素（点击一次锁定，再点一次解锁）
 const cursorPos = ref(null)   // 鼠标当前所在位置 {lat, lon}
 const tempValues = ref({})    // layer_id -> 温度(K) 或 null（仅显示已勾选图层）
-const lockInfo = ref(null)    // 锁定时固定的 {lat, lon, values}
+const lockInfo = ref(null)    // 锁定时固定的 {lat, lon, values}（坐标为 WGS-84）
+
+// ── 坐标系统一：高德底图（gaode/gaode_sat）的点击坐标是 GCJ-02，
+// 必须反算为 WGS-84 后再用于取值与选点（否则位置偏差约 300~600 米）；
+// Esri 影像本身是 WGS-84。算法与后端 core/boundaries/coordconv.py 一致。
+const _GCJ_A = 6378245.0
+const _GCJ_EE = 0.00669342162296594323
+function _gcjInChina(lng, lat) {
+  return lng >= 72.004 && lng <= 137.8347 && lat >= 0.8293 && lat <= 55.8271
+}
+function _gcjTransformLat(x, y) {
+  let ret = -100.0 + 2.0 * x + 3.0 * y + 0.2 * y * y + 0.1 * x * y + 0.2 * Math.sqrt(Math.abs(x))
+  ret += (20.0 * Math.sin(6.0 * x * Math.PI) + 20.0 * Math.sin(2.0 * x * Math.PI)) * 2.0 / 3.0
+  ret += (20.0 * Math.sin(y * Math.PI) + 40.0 * Math.sin(y / 3.0 * Math.PI)) * 2.0 / 3.0
+  ret += (160.0 * Math.sin(y / 12.0 * Math.PI) + 320 * Math.sin(y * Math.PI / 30.0)) * 2.0 / 3.0
+  return ret
+}
+function _gcjTransformLon(x, y) {
+  let ret = 300.0 + x + 2.0 * y + 0.1 * x * x + 0.1 * x * y + 0.1 * Math.sqrt(Math.abs(x))
+  ret += (20.0 * Math.sin(6.0 * x * Math.PI) + 20.0 * Math.sin(2.0 * x * Math.PI)) * 2.0 / 3.0
+  ret += (20.0 * Math.sin(x * Math.PI) + 40.0 * Math.sin(x / 3.0 * Math.PI)) * 2.0 / 3.0
+  ret += (150.0 * Math.sin(x / 12.0 * Math.PI) + 300.0 * Math.sin(x / 30.0 * Math.PI)) * 2.0 / 3.0
+  return ret
+}
+function _wgs84ToGcj02(lng, lat) {
+  if (!_gcjInChina(lng, lat)) return [lng, lat]
+  let dlat = _gcjTransformLat(lng - 105.0, lat - 35.0)
+  let dlon = _gcjTransformLon(lng - 105.0, lat - 35.0)
+  const radLat = lat / 180.0 * Math.PI
+  let magic = Math.sin(radLat)
+  magic = 1 - _GCJ_EE * magic * magic
+  const sqrtMagic = Math.sqrt(magic)
+  dlat = (dlat * 180.0) / ((_GCJ_A * (1 - _GCJ_EE)) / (magic * sqrtMagic) * Math.PI)
+  dlon = (dlon * 180.0) / (_GCJ_A / sqrtMagic * Math.cos(radLat) * Math.PI)
+  return [lng + dlon, lat + dlat]
+}
+/** Leaflet 点击坐标 → WGS-84（高德系底图做 GCJ→WGS 迭代反算，Esri 原样） */
+function leafletToWgs(lat, lon) {
+  if (currentBase.value !== 'gaode' && currentBase.value !== 'gaode_sat') {
+    return { lat, lon }
+  }
+  let wlon = lon
+  let wlat = lat
+  for (let i = 0; i < 2; i++) {
+    const [glon, glat] = _wgs84ToGcj02(wlon, wlat)
+    wlon += lon - glon
+    wlat += lat - glat
+  }
+  return { lat: wlat, lon: wlon }
+}
 let _lastQuery = 0
 
 const lstLayers = computed(() => layers.value.filter((l) => l.available && l.is_lst))
@@ -371,6 +420,23 @@ function toggleTempMode() {
   }
 }
 
+/** 退出温度模式并清理锁定/浮窗（项目/对话被删除或切换时调用）：
+ *  修复删项目后锁定态残留 → 地图交互被冻结（拖不动）、
+ *  浮窗提示“请勾选 LST 图层”的问题。 */
+function resetTempState() {
+  tempMode.value = false
+  tempLocked.value = false
+  lockInfo.value = null
+  cursorPos.value = null
+  tempValues.value = {}
+  unlockMapInteractions()
+}
+
+// 对话切换/清空（含删除项目、删除对话）→ 复位温度模式，
+// 避免旧锁定浮窗与新对话图层错位或地图被“卡住”
+watch(() => project.currentConv, () => resetTempState())
+watch(() => project.currentProject, (v) => { if (!v) resetTempState() })
+
 async function queryTemps(lat, lon) {
   const targets = checkedLstLayers.value
   if (!targets.length) {
@@ -402,7 +468,8 @@ async function queryTemps(lat, lon) {
 function onMouseMove(e) {
   if (!tempMode.value || !e.latlng) return
   // 锁定期间也记录光标最新位置（解锁后若光标在别的像素就显示那个像素），只是不刷新温度
-  cursorPos.value = { lat: e.latlng.lat, lon: e.latlng.lng }
+  // 坐标统一为 WGS-84（高德底图反算），浮窗/取值/选点全链路一致
+  cursorPos.value = leafletToWgs(e.latlng.lat, e.latlng.lng)
   if (tempLocked.value) return
   const now = Date.now()
   if (now - _lastQuery < 60) return // 60ms 节流，避免移动时高频请求
@@ -419,11 +486,13 @@ async function onMapClick(e) {
     if (cursorPos.value) await queryTemps(cursorPos.value.lat, cursorPos.value.lon)
     return
   }
-  // 第一次点击：锁定当前像素的坐标与温度
-  cursorPos.value = { lat: e.latlng.lat, lon: e.latlng.lng }
+  // 第一次点击：锁定当前像素的坐标与温度（坐标统一反算为 WGS-84）
+  cursorPos.value = leafletToWgs(e.latlng.lat, e.latlng.lng)
   await queryTemps(cursorPos.value.lat, cursorPos.value.lon)
   tempLocked.value = true
   lockInfo.value = { lat: cursorPos.value.lat, lon: cursorPos.value.lon, values: { ...tempValues.value } }
+  // 同步记为“对话选点”：可在输入框直接提问（如「这个点周围300米范围的地表温度是多少」）
+  chat.setSelectedPoint({ lon: cursorPos.value.lon, lat: cursorPos.value.lat })
 }
 
 function fmtTemp(v) {

@@ -417,6 +417,27 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
 .folder-chip:hover { border-color: var(--primary); color: var(--primary); }
 .folder-chip__text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 360px; }
 
+/* 输入框内地图选点组件（可点叉删除）：随消息发送，发送后自动消费 */
+.point-chip {
+  display: inline-flex; align-items: center; gap: 5px; align-self: center;
+  padding: 3px 4px 3px 9px; border-radius: 8px; flex-shrink: 0;
+  background: var(--primary-soft); color: var(--primary);
+  font-size: 12px; line-height: 1; white-space: nowrap; max-width: 260px;
+}
+.point-chip__text { overflow: hidden; text-overflow: ellipsis; }
+.point-chip__x {
+  width: 16px; height: 16px; border: none; border-radius: 50%; padding: 0;
+  background: transparent; color: var(--primary); cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+}
+.point-chip__x:hover { background: rgba(0, 0, 0, 0.08); }
+
+/* 气泡内选点微章（用户消息携带的选点信息，浅色适配蓝色气泡） */
+.msg__point {
+  display: inline-flex; align-items: center; gap: 5px; margin-bottom: 6px;
+  font-size: 12px; line-height: 1; opacity: 0.92;
+}
+
 /* 配对选择卡片 */
 .pair-card {
   max-width: 860px; margin: 0 auto 12px; padding: 14px 16px; background: var(--bg-panel);

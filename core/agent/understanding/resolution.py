@@ -108,6 +108,8 @@ class ResolveContext:
     recent_results: Sequence[Dict[str, Any]] = ()
     default_product: str = "lst_10m"
     default_model: str = "rf"
+    # 地图选点上下文（{lon, lat, label?}）："这个点周围300m" 类提问的地点来源
+    selected_point: Optional[Dict[str, Any]] = None
 
 
 @dataclass
@@ -117,6 +119,8 @@ class ResolutionOutcome:
     reply_only: bool = False
     failure: str = ""
     notes: List[str] = field(default_factory=list)
+    # 地理提问（geo_query）：地点/街道/商圈/选点的温度询问
+    geo_queries: List[Dict[str, Any]] = field(default_factory=list)
 
     @property
     def blocking_questions(self) -> List[QuestionSpec]:
@@ -199,6 +203,18 @@ def resolve(batch: ops.CandidateBatch,
                            for c in outcome.changes):
                     outcome.changes.append(change)
             continue
+        if op.op == ops.OP_GEO_QUERY:
+            # 地点温度/位置识别提问：不改任务；带上地图选点（如用户用“这个点”指代）
+            point = dict(ctx.selected_point or {}) \
+                if getattr(ctx, "selected_point", None) else {}
+            outcome.geo_queries.append({
+                "place": (op.target_ref or "").strip(),
+                "buffer_m": int(getattr(op, "buffer_m", 0) or 0),
+                "intent": (getattr(op, "intent", "") or "temperature"),
+                "point": point,
+                "evidence": op.evidence,
+            })
+            continue
 
         change = _resolve_draft_op(op, ctx, fresh, negated)
         if change is None:
@@ -207,7 +223,8 @@ def resolve(batch: ops.CandidateBatch,
             fresh[op.label] = change
         outcome.changes.append(change)
 
-    if not outcome.changes and not outcome.answers and not outcome.reply_only:
+    if not outcome.changes and not outcome.answers \
+            and not outcome.reply_only and not outcome.geo_queries:
         outcome.failure = "没有得到可以执行的理解结果"
     return outcome
 
@@ -498,6 +515,52 @@ def _bind_recent_result(book: SlotBook, capability: str, ctx: ResolveContext,
     return book, note, rec
 
 
+def _library_region(name: str, lang: str = "zh"):
+    """边界库检索（自然语言研究区）：把常见城市/区县/街道名解析为边界文件。
+
+    仅当名称唯一命中时直接绑定；多个同名边界（不同城市）时返回追问。
+    返回 dict 或 None（None=库中没有，落入原有上传研究区流程）。
+    """
+    try:
+        from core.boundaries import get_library
+        lib = get_library()
+    except Exception:  # noqa: BLE001
+        return None
+    hits = lib.search(name, levels=("city", "district", "street"))
+    strong = [h for h in hits if h.get("score", 0) >= 70]
+    if not strong:
+        return None
+    top = strong[0]
+    same = [h for h in strong
+            if h.get("score") == top.get("score")
+            and h.get("key") != top.get("key")]
+    if same:
+        options = [{"id": str(i + 1),
+                    "label": "%s（%s）" % (h["name"], h.get("parent") or ""),
+                    "value": str(h.get("key"))}
+                   for i, h in enumerate(strong[:6])]
+        prompt = (f"「{name}」匹配到多个同名边界，你想用哪一个？"
+                  if lang == "zh" else
+                  f'Multiple boundaries match "{name}". Which one?')
+        return {"kind": "ambiguous", "prompt": prompt, "options": options}
+    path = lib.resolve_path(top)
+    if not path.is_file():
+        return None
+    display = str(top["name"])
+    if top.get("parent") and top["parent"] != top["name"]:
+        display = f"{top['name']}（{top['parent']}）"
+    try:
+        digest = binding.file_content_hash(path)
+    except OSError:
+        digest = ""
+    detail = {"path": str(path), "display": display,
+              "content_hash": digest}
+    note = (f"已从边界库检索到「{top['name']}」的行政边界" if lang == "zh"
+            else f'Boundary for "{top["name"]}" loaded from the boundary library')
+    return {"kind": "unique", "display": display, "detail": detail,
+            "note": note}
+
+
 def _resolve_region(book: SlotBook, ctx: ResolveContext, lang: str = "zh"):
     raw = book.value(ops.F_REGION)
     detail = book.get(ops.F_REGION).get("detail") or {}
@@ -541,6 +604,21 @@ def _resolve_region(book: SlotBook, ctx: ResolveContext, lang: str = "zh"):
                 field=ops.F_REGION, prompt=prompt, candidates=options), ""
 
     result = binding.bind_region(name, ctx.study_area_paths)
+    if result.kind in (binding.BIND_MISSING, binding.BIND_EMPTY) and name:
+        # 自然语言研究区：本地上传里找不到时，检索边界库（城市/区县/街道）。
+        # 兼容性：上传的研究区优先（上面的 bind_region 已处理）——同名时
+        # 用户自己的文件胜出；库里检索仅作“没有上传时”的补充。
+        lib_hit = _library_region(name, lang)
+        if lib_hit is not None:
+            if lib_hit["kind"] == "unique":
+                return (book.set(ops.F_REGION, lib_hit["display"],
+                                 book.source(ops.F_REGION) or SRC_USER,
+                                 evidence=book.get(ops.F_REGION).get("evidence", ""),
+                                 detail=lib_hit["detail"], override=True),
+                        None, lib_hit["note"])
+            return book.drop(ops.F_REGION), QuestionSpec(
+                field=ops.F_REGION, prompt=lib_hit["prompt"],
+                candidates=lib_hit["options"]), ""
     if result.kind == binding.BIND_UNIQUE:
         # 被否定过的地区不得因「只剩一个候选」而重新入选（9.2 第 4 条）
         if book.is_negated(ops.F_REGION, result.display):

@@ -15,6 +15,7 @@
 不碰真实边界文件、不查台账、不调用模型。
 """
 
+import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -31,10 +32,12 @@ OP_CANCEL = "cancel"          # 取消某个任务
 OP_PAUSE = "pause"            # 暂停某个任务（软暂停：停在节点边界，可恢复）
 OP_PRIORITY = "priority"      # 调整优先级
 OP_REPLY_ONLY = "reply_only"  # 只回答，不动任何任务
+OP_GEO_QUERY = "geo_query"    # 地点/街道/商圈/选点的地表温度提问（读取已有结果）
 
 ALL_OPS: Tuple[str, ...] = (
     OP_CREATE, OP_SET, OP_CLEAR, OP_CORRECT, OP_ANSWER,
     OP_CONTINUE, OP_RETRY, OP_CANCEL, OP_PAUSE, OP_PRIORITY, OP_REPLY_ONLY,
+    OP_GEO_QUERY,
 )
 
 # 会新建或修改任务草稿的操作（Chat 模式一律禁止，§4.5）
@@ -65,9 +68,11 @@ F_PRODUCT_MODE = "product_mode"  # 产品方式：配对 / 月度合成
 F_DATASETS = "datasets"          # 数据集合（landsat / sentinel2 / dem）
 F_PRODUCT = "product"            # 产品类型（当前只有 lst_10m）
 F_MODEL = "model"                # 模型（rf）
+F_GAPFILL = "gapfill"            # 输出要求：是否要无空洞结果（主流程完成后自动填洞）
 
 ALL_FIELDS: Tuple[str, ...] = (
     F_REGION, F_TIME, F_PRODUCT_MODE, F_DATASETS, F_PRODUCT, F_MODEL,
+    F_GAPFILL,
 )
 
 # 字段补丁动作（§4.1「字段补丁」行：每字段区分设置、清除、本轮未提及）
@@ -87,6 +92,68 @@ DATASETS = ("landsat", "sentinel2", "dem")
 # 单条消息内允许的候选操作上限：模型偶发的「笛卡尔积式」爆量输出直接判无效，
 # 不让它变成几十个任务（§4.1「共享修饰范围…不由程序随意做笛卡尔积」）
 MAX_OPERATIONS = 8
+
+# ── 覆盖审计（生成-校验回路，不做任何语义判断） ──────────────────
+# 程序只做结构比对：消息按通用标点切子句 vs 模型自报的 covers 片段。
+# 不含业务词表、不参与意图识别；命中遗漏只是把子句交回模型补充解析。
+_CLAUSE_SPLIT = re.compile(r"[，,。.；;！!？?、\n]+")
+_MIN_CLAUSE_LEN = 3  # 纯长度阈值：过滤“嗯/好的”类极短语气，无词表
+
+
+def _parse_covers(raw_val: Any) -> Tuple[str, ...]:
+    """covers 规范化：字符串或数组 → 去重、截断的片段元组。"""
+    if isinstance(raw_val, str):
+        items = [raw_val]
+    elif isinstance(raw_val, (list, tuple)):
+        items = [str(x) for x in raw_val]
+    else:
+        items = []
+    out: List[str] = []
+    for s in items:
+        t = str(s).strip()
+        if t and t not in out:
+            out.append(t)
+    return tuple(out[:6])
+
+
+def uncovered_clauses(message: str, operations) -> List[str]:
+    """覆盖审计：找出未被任何操作自报覆盖的子句。
+
+    覆盖来源＝covers 新字段 ∪ evidence（操作与补丁的既有字段）——
+    模型对 geo_query 类轻量输出常省略 covers，但 evidence 一直有值，
+    复用它可以避免审计在关键时刻“无抓手就放过”。
+
+    边界（有意为之）：
+      - 只做结构比对，不包含业务关键词，不推断意图——语义始终由模型负责；
+      - 覆盖声明全空时才跳过（避免误报）；命中则交回模型补充解析。
+    """
+    text = (message or "").strip()
+    if not text:
+        return []
+    covers: List[str] = []
+    for op in (operations or []):
+        for c in (getattr(op, "covers", ()) or ()):
+            t = str(c).strip()
+            if t:
+                covers.append(t)
+        ev = str(getattr(op, "evidence", "") or "").strip()
+        if ev:
+            covers.append(ev)
+        for p in (getattr(op, "patches", ()) or ()):
+            pev = str(getattr(p, "evidence", "") or "").strip()
+            if pev:
+                covers.append(pev)
+    if not covers:
+        return []  # 无法审计：模型未做任何覆盖声明，直接放过
+    miss: List[str] = []
+    for clause in _CLAUSE_SPLIT.split(text):
+        c = clause.strip()
+        if len(c) < _MIN_CLAUSE_LEN:
+            continue
+        if any(c in cov or cov in c for cov in covers):
+            continue
+        miss.append(c)
+    return miss
 
 
 @dataclass(frozen=True)
@@ -117,6 +184,9 @@ class CandidateOperation:
     missing: Tuple[str, ...] = ()   # 模型认为还缺的字段（只作提示，程序自己判）
     ambiguity: Tuple[str, ...] = ()
     evidence: str = ""
+    buffer_m: int = 0               # geo_query：缓冲半径（米），0=默认
+    intent: str = ""               # geo_query：temperature（默认）/ identify（位置识别）
+    covers: Tuple[str, ...] = ()   # 覆盖审计：本条操作自报覆盖的原句片段
 
     def patch_for(self, name: str) -> Optional[FieldPatch]:
         for patch in self.patches:
@@ -256,6 +326,19 @@ def _parse_operation(raw: Any, index: int,
     missing = tuple(f for f in (_text(x) for x in (raw.get("missing") or []))
                     if f in ALL_FIELDS)
     ambiguity = tuple(_text(x) for x in (raw.get("ambiguity") or []) if _text(x))
+    try:
+        buffer_m = int(float(_text(raw.get("buffer_m")) or 0))
+    except (TypeError, ValueError):
+        buffer_m = 0
+    if buffer_m < 0:
+        buffer_m = 0
+    intent = _text(raw.get("intent")).strip().lower()
+    if intent in ("identify", "locate", "position", "where"):
+        intent = "identify"
+    elif intent in ("temperature", "temp", "lst"):
+        intent = "temperature"
+    else:
+        intent = ""
     return CandidateOperation(
         op=op,
         label=_text(raw.get("label") or raw.get("target_label")),
@@ -268,6 +351,9 @@ def _parse_operation(raw: Any, index: int,
         missing=missing,
         ambiguity=ambiguity,
         evidence=_text(raw.get("evidence")),
+        buffer_m=buffer_m,
+        intent=intent,
+        covers=_parse_covers(raw.get("covers")),
     )
 
 

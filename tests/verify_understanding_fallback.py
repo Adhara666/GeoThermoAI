@@ -114,6 +114,57 @@ empty_change = res.DraftChange(action=res.ACT_CREATE, capability="full_lst",
 check("指纹全空不判重（信息缺失照常追问）",
       us._find_duplicate_open_task(empty_change, [task]) is None)
 
+# ── 5.5) 覆盖审计：纯结构比对（无业务词表，不推断意图） ──
+c_id = ops.CandidateOperation(op=ops.OP_GEO_QUERY, intent="identify",
+                              covers=("这是哪",))
+c_tp = ops.CandidateOperation(op=ops.OP_GEO_QUERY, intent="temperature",
+                              covers=("温度如何",))
+check("审计：子句全部被覆盖 → 无遗留",
+      ops.uncovered_clauses("这是哪，温度如何", [c_id, c_tp]) == [])
+check("审计：模型只给了位置操作 → 命中漏掉的温度子句",
+      ops.uncovered_clauses("这是哪，温度如何", [c_id]) == ["温度如何"])
+check("审计：模型未声明 covers → 直接放过（不误报）",
+      ops.uncovered_clauses("这是哪，温度如何",
+                            [ops.CandidateOperation(op=ops.OP_GEO_QUERY)]) == [])
+check("审计：修饰语并入 covers → 无遗留",
+      ops.uncovered_clauses(
+          "我想要武汉7月的数据，用配对模式",
+          [ops.CandidateOperation(op="create",
+                                  covers=("我想要武汉7月的数据", "用配对模式"))])
+      == [])
+check("审计：covers 规范化（字符串 → 元组）",
+      ops._parse_covers("武汉 7 月") == ("武汉 7 月",))
+
+# ── 5.6) 补充回路（假模型）：首答漏子句 → 审计触发 → 补充解析合并 ──
+_first = ('{"operations": [{"op": "geo_query", "intent": "identify",'
+          ' "covers": ["这是哪"], "evidence": "这是哪"}]}')
+_extra = ('{"operations": [{"op": "geo_query", "intent": "temperature",'
+          ' "covers": ["温度如何"], "evidence": "温度如何"}]}')
+logs2 = []
+fa2 = _FakeAssistant([_first, _extra])
+agent2 = und.CandidateUnderstander(fa2, on_log=lambda x: logs2.append(str(x)))
+batch2 = agent2.understand(
+    "这是哪，温度如何", anchor_date=datetime.date(2026, 9, 21),
+    tz_label="UTC+8", chat_mode="work", study_areas=["武汉市_市"],
+    open_tasks=[], open_questions=[])
+intents2 = [getattr(o, "intent", "") for o in batch2.operations]
+check("补充回路：首答漏温度 → 审计触发并合并出第二条",
+      batch2.valid and len(batch2.operations) == 2
+      and intents2 == ["identify", "temperature"], str(intents2))
+check("补充回路：批次 note 记录了补充", "覆盖审计补充" in (batch2.note or ""))
+check("补充回路：日志可见审计触发", any("覆盖审计" in x for x in logs2))
+
+_noop = ('{"operations": [{"op": "reply_only", "covers": ["温度如何"]}]}')
+fa3 = _FakeAssistant([_first, _noop])
+agent3 = und.CandidateUnderstander(fa3, on_log=lambda x: None)
+batch3 = agent3.understand(
+    "这是哪，温度如何", anchor_date=datetime.date(2026, 9, 21),
+    tz_label="UTC+8", chat_mode="work", study_areas=["武汉市_市"],
+    open_tasks=[], open_questions=[])
+check("补充回路：模型表态无补充（reply_only）→ 原批次不变",
+      batch3.valid and len(batch3.operations) == 1,
+      str([o.op for o in batch3.operations]))
+
 # ── 6) 真实模型探针（可选）：带历史问“那现在呢”，不得重放 create ──
 try:
     import json
@@ -133,8 +184,9 @@ try:
         hist_rows = list(c.execute(
             "SELECT role, content FROM messages WHERE conversation_id=?"
             " ORDER BY rowid", (pk,)))[-8:]
-        prior = [{"role": r[0], "content": wa.strip_thinking(r[1] or "")}
-                 for r in hist_rows if wa.strip_thinking(r[1] or "")]
+        # 与生产 runner 一致：剥离思考链 + 裁剪尾部未答 user 消息
+        raw_hist = [{"role": r[0], "content": r[1] or ""} for r in hist_rows]
+        prior = wa.sanitize_prior_messages(raw_hist)
         b = wa.AppBackend()
         b._uid = lambda: "Adhara"
         probe_agent = und.CandidateUnderstander(b._assistant_for())

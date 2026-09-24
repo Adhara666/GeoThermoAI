@@ -99,7 +99,7 @@ export const api = {
     const tz = -new Date().getTimezoneOffset() / 60
     const es = new EventSource(`/api/chat/stream?conv=${encodeURIComponent(convId)}&token=${encodeURIComponent(getToken())}&tz=${encodeURIComponent(tz)}`)
     // 服务端统一发送命名事件（token/thinking/pause 等），不依赖默认 message 帧
-    ;['token', 'thinking', 'append', 'pause', 'workflow', 'log', 'done', 'error'].forEach((t) => {
+    ;['token', 'thinking', 'thinking_note', 'append', 'pause', 'workflow', 'log', 'done', 'error'].forEach((t) => {
       es.addEventListener(t, (e) => {
         let data = {}
         try { data = JSON.parse(e.data) } catch (_) {}

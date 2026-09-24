@@ -25,6 +25,20 @@ function clipText(s, limit = 3000) {
 
 // 第六阶段：待答问题卡（按问题编号）——在消息流末尾以可点击选项呈现，
 // 点击即提交答案（与文字回复共用同一通道）；问题被回答/失效后自动消失。
+// 提交期间（geo 类问题卡会经过一次 LLM 润色）给按钮置 pending，
+// 防止重复点击并在卡片上显示“思考中”（与气泡同文案）。
+const answeringId = ref('')
+
+async function answerQuestion(qid, label) {
+  if (answeringId.value) return
+  answeringId.value = qid
+  try {
+    await chat.answerKernelQuestion(qid, label)
+  } finally {
+    answeringId.value = ''
+  }
+}
+
 const openQuestions = computed(() =>
   (chat.kernelQuestionsOrder || [])
     .map((id) => chat.kernelQuestions[id])
@@ -191,6 +205,46 @@ watch(
 )
 
 // 思考过程默认折叠：无论思考中还是思考结束都不自动展开，用户点击 summary 才查看
+
+// ── “思考中”等待组件：两态保留（处理中 → 完成后“用时X秒”不消失） ──
+// 进入等待态时打标（pendingShown/起始时间），离开等待态时记录结束时间；
+// 只要本会话内出现过等待态，完成后头部就保留在气泡中；若期间有真正的
+// 思考流到达，则由上面的思考块接管（条件 !m.thinking）。刷新后标记丢失、
+// 历史气泡不显示——它属于本轮实时状态，不属于持久内容。
+watch(() => [chat.messages, chat.streaming], ([msgs, streaming]) => {
+  const last = msgs[msgs.length - 1]
+  if (!last || last.role !== 'assistant') return
+  const empty = !String(last.content || '').trim()
+    && !String(last.thinking || '').trim()
+  if (streaming && empty) {
+    if (!last.pendingShown) {
+      last.pendingShown = true
+      last.pendingStartTs = Date.now()
+    }
+    return
+  }
+  if (last.pendingShown && last.pendingDoneTs == null) {
+    last.pendingDoneTs = Date.now()
+  }
+}, { deep: true })
+
+function pendingInfo(row) {
+  const m = row.m
+  if (!m || m.role !== 'assistant') return null
+  const empty = !String(m.content || '').trim()
+    && !String(m.thinking || '').trim()
+  if (chat.streaming && row.i === chat.messages.length - 1 && empty) {
+    return { live: true, seconds: 0 }
+  }
+  if (m.pendingShown) {
+    const end = m.pendingDoneTs || Date.now()
+    const sec = m.pendingStartTs
+      ? Math.max(1, Math.round((end - m.pendingStartTs) / 1000))
+      : 0
+    return { live: false, seconds: sec }
+  }
+  return null
+}
 </script>
 
 <template>
@@ -222,7 +276,31 @@ watch(
               </summary>
               <div class="thinking-box__body">{{ clipText(row.m.thinking) }}</div>
             </details>
-            <MarkdownRender :content="clipText(row.m.content)" />
+            <!-- LLM 处理期指示（理解层/问答编排/任务提交）：与思考块同构的可展开详情块
+                 （带展开箭头）；完成后转为“（用时X秒）”的完成态**保留在气泡中**。
+                 展开内容为该轮的如实说明；若期间有真正的思考流到达，由上面的
+                 思考块接管（条件 !m.thinking）。 -->
+            <details v-else-if="pendingInfo(row)"
+                     class="thinking-box thinking-box--pending" :open="false">
+              <summary>
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M9.5 2A2.5 2.5 0 0 1 12 4.5v15a2.5 2.5 0 0 1-4.96.44 2.5 2.5 0 0 1-2.96-3.08 3 3 0 0 1-.34-5.58 2.5 2.5 0 0 1 1.32-4.24 2.5 2.5 0 0 1 1.98-3A2.5 2.5 0 0 1 9.5 2Z"/><path d="M14.5 2A2.5 2.5 0 0 0 12 4.5v15a2.5 2.5 0 0 0 4.96.44 2.5 2.5 0 0 0 2.96-3.08 3 3 0 0 0 .34-5.58 2.5 2.5 0 0 0-1.32-4.24 2.5 2.5 0 0 0-1.98-3A2.5 2.5 0 0 0 14.5 2Z"/></svg>
+                <span>{{ t('chat.thinking') }}</span>
+                <span v-if="pendingInfo(row).live"
+                      class="thinking-box__live thinking-box__live--pulse">{{ t('chat.thinkingLive') }}</span>
+                <span v-else-if="pendingInfo(row).seconds"
+                      class="thinking-box__live">{{ t('chat.thinkingSeconds', { sec: pendingInfo(row).seconds }) }}</span>
+              </summary>
+              <div class="thinking-box__body">{{ row.m.pendingNote || t('chat.thinkingEmpty', { sec: pendingInfo(row).seconds || 0 }) }}</div>
+            </details>
+            <MarkdownRender v-if="!(row.m.role === 'user' && row.m.point)" :content="clipText(row.m.content)" />
+            <template v-else>
+              <!-- 携带选点的用户消息：先展示点信息微章，再展示正文 -->
+              <div class="msg__point">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true"><path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/><circle cx="12" cy="10" r="3"/></svg>
+                <span>{{ t('chatInput.pointChip', { lon: row.m.point.lon.toFixed(5), lat: row.m.point.lat.toFixed(5) }) }}</span>
+              </div>
+              <MarkdownRender :content="clipText(row.m.content)" />
+            </template>
             <span v-if="chat.streaming && row.i === chat.messages.length - 1 && row.m.role === 'assistant'" class="typing-cursor"></span>
           </div>
         </div>
@@ -236,12 +314,14 @@ watch(
                 <button
                   v-if="!c.info"
                   class="kernel-question__opt"
-                  @click="chat.answerKernelQuestion(q.id, c.label)"
+                  :disabled="!!answeringId"
+                  @click="answerQuestion(q.id, c.label)"
                 >{{ c.id }}. {{ c.label }}</button>
                 <button
                   v-else
                   class="kernel-question__pair"
-                  @click="chat.answerKernelQuestion(q.id, c.label)"
+                  :disabled="!!answeringId"
+                  @click="answerQuestion(q.id, c.label)"
                 >
                   <span class="kernel-question__pair-head">
                     <span class="kernel-question__no">{{ c.id }}</span>
@@ -265,6 +345,9 @@ watch(
                 </button>
               </template>
             </div>
+            <div v-if="answeringId === q.id" class="kernel-question__pending">
+              {{ t('chat.thinkingLive') }}
+            </div>
           </div>
         </div>
       </template>
@@ -278,6 +361,16 @@ watch(
   margin-left: 2px; vertical-align: -2px; animation: blink 0.8s step-end infinite;
 }
 @keyframes blink { 50% { opacity: 0; } }
+
+/* LLM 处理期的“思考中”块（与思考块同构的 details）与问题卡提交提示 */
+.thinking-box__live--pulse { animation: pendingPulse 1.2s ease-in-out infinite; }
+.kernel-question__pending {
+  margin-top: 8px; font-size: 12px; color: var(--text-secondary);
+  animation: pendingPulse 1.2s ease-in-out infinite;
+}
+@keyframes pendingPulse { 50% { opacity: 0.45; } }
+.kernel-question__opt:disabled,
+.kernel-question__pair:disabled { opacity: 0.55; cursor: default; }
 
 /* ── 第六阶段：待答问题卡（可点击选项） ── */
 /* 卡片列：左对齐（与上方气泡同起线，去侧边缩进）；卡片宽度由脚本按“上方最近气泡”等宽设置 */

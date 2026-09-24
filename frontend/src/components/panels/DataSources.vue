@@ -13,6 +13,8 @@ const clientId = ref('')
 const clientSecret = ref('')
 const s3Key = ref('')
 const s3Secret = ref('')
+// 高德 Web 服务 Key（地点检索，可选）：与其它秘密字段一致按掩码回显
+const amapKey = ref('')
 const saved = ref(false)
 const saving = ref(false)
 
@@ -30,6 +32,8 @@ watch(
     password.value = ds.password_len ? '•'.repeat(ds.password_len) : ''
     clientSecret.value = ds.client_secret_len ? '•'.repeat(ds.client_secret_len) : ''
     s3Secret.value = ds.s3_secret_len ? '•'.repeat(ds.s3_secret_len) : ''
+    const gc = s.geocode || {}
+    amapKey.value = gc.amap_key_len ? '•'.repeat(gc.amap_key_len) : ''
   },
   { immediate: true },
 )
@@ -45,6 +49,9 @@ async function save() {
         client_secret: stripMask(clientSecret.value),
         s3_key: s3Key.value.trim(),
         s3_secret: stripMask(s3Secret.value),
+      },
+      geocode: {
+        amap_key: stripMask(amapKey.value),
       },
     })
     saved.value = ok
@@ -108,14 +115,21 @@ async function save() {
       </div>
     </details>
 
+    <p class="form-hint" style="margin-top:0">
+      {{ t('ds.hintBottom') }}
+    </p>
+
+    <div class="form-group" style="margin-top:14px">
+      <label>{{ t('ds.amapKey') }}</label>
+      <input v-model="amapKey" class="form-input" :placeholder="t('ds.amapKeyPh')" />
+      <p class="form-hint" style="margin-top:6px">{{ t('ds.amapKeyHint') }}</p>
+    </div>
+
     <button class="btn btn--primary btn--block" :disabled="saving" @click="save">
       <svg v-if="!saving" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>
       {{ saving ? t('ds.saving') : t('ds.saveBtn') }}
     </button>
     <p v-if="saved" class="form-hint" style="margin-top:8px;color:var(--success)">{{ t('ds.saved') }}</p>
-    <p class="form-hint" style="margin-top:10px">
-      {{ t('ds.hintBottom') }}
-    </p>
   </div>
 </template>
 

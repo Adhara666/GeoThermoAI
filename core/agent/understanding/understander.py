@@ -49,6 +49,7 @@ class CandidateUnderstander(RoleAgent):
         history: Optional[List[dict]] = None,
         recent_summary: str = "",
         recent_completed: Optional[Sequence[str]] = None,
+        selected_point: str = "",
     ) -> ops.CandidateBatch:
         """返回候选批次。模型不可用时返回 `source=unavailable` 的空批次。"""
         system = prompts.understand_prompt(
@@ -60,6 +61,7 @@ class CandidateUnderstander(RoleAgent):
             open_questions=open_questions,
             recent_summary=recent_summary,
             recent_completed=list(recent_completed or []),
+            selected_point=selected_point,
         )
         raw = self.call_text(system, message, temperature=0.0,
                              max_tokens=_MAX_TOKENS, history=history,
@@ -72,7 +74,8 @@ class CandidateUnderstander(RoleAgent):
 
         batch = self._to_batch(raw)
         if batch.valid:
-            return ops.apply_shared_modifiers(batch)
+            batch = ops.apply_shared_modifiers(batch)
+            return self._supplement_uncovered(message, batch, system, history)
 
         # 一次格式修复（§4.1「最多一次格式修复」）：把不合格的原始输出
         # 回传给模型做结构化修复（空手重问等于原地再错一次）
@@ -87,7 +90,9 @@ class CandidateUnderstander(RoleAgent):
             return batch
         repaired_batch = self._to_batch(repaired)
         if repaired_batch.valid:
-            return ops.apply_shared_modifiers(repaired_batch)
+            repaired_batch = ops.apply_shared_modifiers(repaired_batch)
+            return self._supplement_uncovered(message, repaired_batch,
+                                              system, history)
         # 两次都无效：留痕（日志面板可见 + 由上层归档），保留第二次的
         # 原始输出与错误，交由上层决定（现为“降级为问答”而非报错）
         snippet = (repaired_batch.raw_output or batch.raw_output or "").strip()
@@ -104,6 +109,56 @@ class CandidateUnderstander(RoleAgent):
             batch.errors.append("模型输出无法解析为 JSON")
             return batch
         return ops.parse_batch(parsed, raw_output=raw)
+
+    def _supplement_uncovered(self, message, batch, system, history):
+        """覆盖审计回路：有子句未被任何操作自报覆盖时，交回模型补充解析一次。
+
+        设计边界（不做关键词规则）：程序只做结构比对（子句 vs covers），
+        不包含业务词表、不推断意图；漏掉的子句由模型重新理解并合并。
+        最多触发一次；审计异常/模型不可用/无补充时保持原批次，
+        不改变主流程结果。
+        """
+        try:
+            missing = ops.uncovered_clauses(message, batch.operations)
+        except Exception:  # noqa: BLE001 — 审计失败不影响主流程
+            return batch
+        if not missing:
+            return batch
+        self.log("覆盖审计：%d 个子句未被操作覆盖，触发补充解析：%s"
+                 % (len(missing), "；".join(missing)[:100]))
+        try:
+            raw = self.call_text(
+                system + prompts.supplement_hint(),
+                prompts.supplement_request(message, batch.operations, missing),
+                temperature=0.0, max_tokens=_MAX_TOKENS, history=history,
+                thinking=_THINKING_OFF, json_mode=True)
+        except Exception:  # noqa: BLE001
+            return batch
+        if is_api_failure(raw):
+            return batch
+        extra = self._to_batch(raw)
+        if not extra.valid or not extra.operations:
+            return batch
+        existing = list(batch.operations)
+        added = []
+        for op in extra.operations:
+            if op.op == ops.OP_REPLY_ONLY:
+                continue  # 模型明确表示“无补充操作”
+            dup = any(op.op == o.op
+                      and (op.target_ref or "") == (o.target_ref or "")
+                      and (getattr(op, "intent", "") or "")
+                      == (getattr(o, "intent", "") or "")
+                      for o in existing)
+            if not dup:
+                added.append(op)
+        if not added:
+            return batch
+        batch.operations = tuple(existing + added)
+        batch.note = ((batch.note + " " if batch.note else "")
+                      + "覆盖审计补充 %d 条操作" % len(added))
+        self.log("覆盖审计补充 %d 条操作（%s）"
+                 % (len(added), "、".join(op.op for op in added)))
+        return batch
 
 
 def enforce_chat_mode(batch: ops.CandidateBatch) -> ops.CandidateBatch:

@@ -142,6 +142,236 @@ def strip_thinking(text: str) -> str:
     return re.sub(r"<details[^>]*>.*?</details>", "", text or "", flags=re.DOTALL).strip()
 
 
+def sanitize_prior_messages(history: list):
+    """组装理解层历史：剥离思考链、丢空消息，并裁剪尾部“未回答的用户消息”。
+
+    上一轮尚未生成回复时（占位 assistant 为空被过滤），历史会以连串 user
+    结尾；模型会把倒数第二条误当成“最新消息”而作出错误动作（实测：问
+    “纽约百老汇”被理解成上一条“洪山区”）。只保留到最后一个 assistant 回复
+    为止，保证当前消息是历史中唯一的“待办”。
+    """
+    prior = []
+    for m in (history or [])[:-2]:
+        raw = m.get("content", "")
+        if isinstance(raw, list):
+            raw = "\n".join(str(x) for x in raw)
+        c = strip_thinking(raw)
+        if c:
+            prior.append({"role": m.get("role", "user"), "content": c})
+    while prior and prior[-1].get("role") == "user":
+        prior.pop()
+    return prior
+
+
+def _geo_allowed_numbers(facts: dict) -> list:
+    """根据地点温度事实清单收集合法数字集合（温度/半径/日期/名称中的数字）。"""
+    vals: list = []
+    for key in ("mean_c", "min_c", "max_c", "mean_k", "radius_m"):
+        v = facts.get(key)
+        if v:
+            vals.append(abs(float(v)))
+    for field in ("date", "label", "source", "desc"):
+        for m in re.findall(r"\d+(?:\.\d+)?", str(facts.get(field) or "")):
+            vals.append(float(m))
+    return vals
+
+
+def _geo_reply_numbers_ok(text: str, allowed: list) -> bool:
+    """防幻觉校验：模型文本中每个数字必须与事实值一致（容差 0.15）。
+
+    容忍“49.9 → 50”这类舍入表达，拒绝任何真实改动或新增数字。
+    """
+    for tok in re.findall(r"\d+(?:\.\d+)?", text or ""):
+        v = float(tok)
+        if not any(abs(v - a) <= 0.15 for a in allowed):
+            return False
+    return True
+
+
+def _build_geo_polish_prompt(facts: dict, lang: str) -> str:
+    """按回答类型构造“模型说话”提示词（数字/地名只能照抄，不得计算）。"""
+    kind = str(facts.get("kind") or "temperature")
+    if kind == "identify":
+        return _build_identify_prompt(facts, lang)
+    if kind == "guard":
+        return _build_guard_prompt(facts, lang)
+    return _build_temperature_prompt(facts, lang)
+
+
+def _build_temperature_prompt(facts: dict, lang: str) -> str:
+    """温度数值回答提示词。"""
+    label = str(facts.get("label") or "")
+    radius = int(facts.get("radius_m") or 0)
+    date = str(facts.get("date") or "")
+    source = str(facts.get("source") or "")
+    lines = []
+    if lang == "zh":
+        lines.append("你是 GeoThermoAI 的助手，请把一次地表温度查询结果自然地"
+                     "告诉用户：用 1~2 句口语化的中文直接作答，不要寒暄、"
+                     "不要列表、不要复述问题。")
+        lines.append("硬性要求：")
+        lines.append("1. 只能使用下面事实中的数字，必须完全一致，禁止新增或改动；")
+        req2 = "2. 提到地点时使用「%s」；" % label
+        if date:
+            req2 += "提到时间时使用「%s」；" % date
+        lines.append(req2)
+        lines.append("3. 不要出现“像元、占比、任务名、文件名”等技术词；")
+        lines.append("4. 若统计范围里注明“按默认值统计”，回答必须提到这是默认值；"
+                     "未注明时不要出现“默认”字样；")
+        lines.append("5. 必须说明统计范围（如“周围 500 米”或“整个区域”）。")
+        lines.append("")
+        lines.append("事实：")
+        if date:
+            period = date
+            if source:
+                period += "（基于当天 %s 影像计算）" % source
+            lines.append("- 数据时段：%s" % period)
+        if facts.get("geometry") == "point":
+            rng = "该位置周围 %d 米" % radius
+            if facts.get("default_radius"):
+                rng += "（用户未指定半径，按默认值统计——这一点必须在回答里说到）"
+            lines.append("- 统计范围：%s" % rng)
+        else:
+            lines.append("- 统计范围：该区域范围之内")
+        lines.append("- 平均地表温度：%.1f ℃（约 %.1f K）"
+                     % (facts["mean_c"], facts["mean_k"]))
+        lines.append("- 最低：%.1f ℃；最高：%.1f ℃"
+                     % (facts["min_c"], facts["max_c"]))
+        if facts.get("gap_filled"):
+            lines.append("- 数据版本：空洞已填补（可表述为“已做空洞填补”）")
+        if facts.get("note"):
+            lines.append("- 需一并说明的情况：%s" % facts["note"])
+        return "\n".join(lines)
+    lines.append("You are the GeoThermoAI assistant. Report one land surface "
+                 "temperature query result in 1-2 natural English sentences. "
+                 "Answer directly; no greetings, no lists, no restating the question.")
+    lines.append("Hard rules:")
+    lines.append("1. Use ONLY numbers from the facts below, exactly as given; "
+                 "never add or alter numbers.")
+    req2 = "2. Refer to the place as \"%s\"." % label
+    if date:
+        req2 += " Refer to the time as \"%s\"." % date
+    lines.append(req2)
+    lines.append("3. Avoid jargon such as pixels, valid-pixel share, task or file names.")
+    lines.append("4. If the scope line notes a default radius, mention it; "
+                 "otherwise never use the word \"default\".")
+    lines.append("5. Always state the scope (e.g. \"within 500 m\" or "
+                 "\"across the whole area\").")
+    lines.append("")
+    lines.append("Facts:")
+    if date:
+        period = date
+        if source:
+            period += " (computed from the %s image of that day)" % source
+        lines.append("- Period: %s" % period)
+    if facts.get("geometry") == "point":
+        rng = "within %d m of the point" % radius
+        if facts.get("default_radius"):
+            rng += " (default radius; user did not specify)"
+        lines.append("- Scope: %s" % rng)
+    else:
+        lines.append("- Scope: the whole area")
+    lines.append("- Mean LST: %.1f C (about %.1f K)"
+                 % (facts["mean_c"], facts["mean_k"]))
+    lines.append("- Min: %.1f C; Max: %.1f C" % (facts["min_c"], facts["max_c"]))
+    if facts.get("gap_filled"):
+        lines.append("- Version: gap-filled")
+    if facts.get("note"):
+        lines.append("- Must mention: %s" % facts["note"])
+    return "\n".join(lines)
+
+
+def _build_identify_prompt(facts: dict, lang: str) -> str:
+    """位置识别回答提示词（模型只能引用描述，不得改动地名/数字）。"""
+    desc = str(facts.get("desc") or "")
+    label = str(facts.get("label") or "")
+    lines = []
+    if lang == "zh":
+        lines.append("你是 GeoThermoAI 的助手，请把一次位置识别的结果自然地"
+                     "告诉用户：用 1~2 句口语化的中文直接作答，不要寒暄、"
+                     "不要列表、不要复述问题。")
+        lines.append("硬性要求：")
+        lines.append("1. 位置描述必须与事实一致，不得改动或添加任何地名、数字；")
+        lines.append("2. 描述中的道路 / 区域 / 地标使用事实里的原词；")
+        if label:
+            lines.append("3. 提到用户询问的地名时使用「%s」；" % label)
+        lines.append("4. 不要出现“像元、任务名、文件名”等技术词。")
+        lines.append("")
+        lines.append("事实：")
+        if desc:
+            lines.append("- 位置：%s" % desc)
+        lines.append("- 场景：%s" % ("用户在地图上点选了这个位置"
+                                     if not label else "用户询问该地点的位置"))
+        return "\n".join(lines)
+    lines.append("You are the GeoThermoAI assistant. Report one location-"
+                 "identification result in 1-2 natural English sentences. "
+                 "Answer directly; no greetings, no lists.")
+    lines.append("Hard rules:")
+    lines.append("1. The location description must match the facts exactly; "
+                 "never alter or add place names or numbers.")
+    lines.append("2. Use the original words from the facts.")
+    if label:
+        lines.append("3. Refer to the asked place as \"%s\"." % label)
+    lines.append("")
+    lines.append("Facts:")
+    if desc:
+        lines.append("- Location: %s" % desc)
+    lines.append("- Scenario: %s" % ("the user picked this point on the map"
+                                      if not label else
+                                      "the user asked where this place is"))
+    return "\n".join(lines)
+
+
+_GUARD_SITUATIONS = {
+    "out_of_coverage": "该位置不在已有地表温度结果的覆盖范围内",
+    "no_data": "该范围落在结果内，但没有有效的地表温度像元（可能为水体或无效区）",
+    "not_found": "没有找到该地点对应的位置",
+    "no_result": "当前没有任何已完成的地表温度结果",
+}
+
+
+def _build_guard_prompt(facts: dict, lang: str) -> str:
+    """无法给出数值的回答提示词（严禁编造数字，必须点明地点）。"""
+    label = str(facts.get("label") or "")
+    date = str(facts.get("date") or "")
+    guard = str(facts.get("guard") or "")
+    situation = _GUARD_SITUATIONS.get(guard, "无法给出该位置的温度数值")
+    lines = []
+    if lang == "zh":
+        lines.append("你是 GeoThermoAI 的助手，请把一次地表温度查询“无法给出数值”"
+                     "的情况如实告诉用户：用 1~2 句口语化的中文，不要寒暄、"
+                     "不要列表、不要复述问题。")
+        lines.append("硬性要求：")
+        lines.append("1. 严禁给出任何温度数值，严禁编造数字（事实中列明的时间除外）；")
+        if label:
+            lines.append("2. 必须提到「%s」；" % label)
+        lines.append("3. 说明原因，并给出下一步建议（针对该地区先生成地表温度"
+                     "任务后再查询，或换更完整的名称、在地图上点选位置）。")
+        lines.append("")
+        lines.append("事实：")
+        lines.append("- 情况：%s" % situation)
+        if date:
+            lines.append("- 当前已有结果的数据时段：%s" % date)
+        return "\n".join(lines)
+    lines.append("You are the GeoThermoAI assistant. Explain that the LST "
+                 "query cannot be answered with a number: 1-2 natural "
+                 "English sentences; no greetings, no lists.")
+    lines.append("Hard rules:")
+    lines.append("1. Never output any temperature value or invented number "
+                 "(only the time given in the facts is allowed).")
+    if label:
+        lines.append("2. Mention \"%s\"." % label)
+    lines.append("3. Give the reason and a next step (run an LST task for "
+                 "that area first, or use a fuller name / pick a point on "
+                 "the map).")
+    lines.append("")
+    lines.append("Facts:")
+    lines.append("- Situation: %s" % situation)
+    if date:
+        lines.append("- Period of the existing result: %s" % date)
+    return "\n".join(lines)
+
+
 def release_rss_memory() -> None:
     """任务线程结束（成功/暂停/失败/纯对话）后，把进程空闲堆归还操作系统。
 
@@ -339,6 +569,8 @@ class AppBackend:
         self._stream_thinking_seconds: Dict[str, float] = {}
         # 每个对话已累积的实时日志（日志面板权威全量）：刷新/断线重连后恢复日志连续性
         self._stream_logs: Dict[str, list] = {}
+        # 每轮“处理摘要”（理解层模型理解句等）：随 done 事件搵带交付（可靠通道）
+        self._stream_notes: Dict[str, str] = {}
         # 对话消息版本号：完成报告等由服务端主动追加气泡时递增，
         # conversation_events 监测变化并把新气泡推给已打开的页面
         self._conv_msg_ver: Dict[str, int] = {}
@@ -627,6 +859,20 @@ class AppBackend:
         active = {r[0] for r in store.read(lambda c: c.execute(
             "SELECT n.run_id FROM attempts a JOIN nodes n ON n.id=a.node_id"
             " WHERE a.process_exited=0").fetchall())}
+        # 正式产物保护：产物真身就在运行目录的 committed 里——若目录仍含
+        # 台账登记且实际存在的 keep_forever 产物，绝不回收（否则“无空洞
+        # 填洞”等后继步骤会因输入消失失败；用户实测：主图被启动清理
+        # （6h 阈值）误删，填洞报“输入 LST 影像不存在”）。
+        keep_rows = store.read(lambda c: c.execute(
+            "SELECT r.id, a.path, a.retention_class FROM artifacts a"
+            " JOIN attempts x ON x.id = a.attempt_id"
+            " JOIN nodes n ON n.id = x.node_id"
+            " JOIN runs r ON r.id = n.run_id").fetchall())
+        keep_runs = set()
+        for rid, path, rc in keep_rows:
+            if str(rc or "") == "keep_forever" and path \
+                    and os.path.isfile(str(path)):
+                keep_runs.add(str(rid))
         stale_terminal = {"failed", "cancelled", "draft"}
         now = time.time()
         freed = 0
@@ -651,6 +897,8 @@ class AppBackend:
                                  or current != d.name)
                 if not deletable:
                     continue
+                if d.name in keep_runs:
+                    continue  # 仍含现存正式产物（keep_forever）的运行目录：不回收
                 try:
                     if now - d.stat().st_mtime < float(min_age_hours) * 3600:
                         continue
@@ -671,14 +919,20 @@ class AppBackend:
             print(f"[cleanup] 回收历史运行目录 {removed} 个，释放 {freed / (1024 ** 3):.2f} GB")
         return {"removed": removed, "freed_bytes": freed}
 
-    def _completion_report_data(self, run_id: str) -> dict:
-        """读该运行的精度产物（测试预测 JSON 与闭合 JSON）与正式产物数。"""
+    def _completion_report_data(self, task_id: str) -> dict:
+        """读该任务（跨全部运行，含填洞续跑）的精度产物与正式产物数。
+
+        跨运行汇总的原因：无空洞任务的主图/精度在主运行、无空洞版本
+        在填洞续跑里；完成报告需一次汇总全部（用户实测：报告只报
+        1 项、漏了无空洞版本）。
+        """
         store = self._get_state_store()
         arts = store.read(lambda c: c.execute(
             "SELECT a.path, a.retention_class FROM artifacts a"
             " JOIN attempts at ON at.id = a.attempt_id"
             " JOIN nodes n ON n.id = at.node_id"
-            " WHERE n.run_id = ? ORDER BY a.created_at", (run_id,)).fetchall())
+            " JOIN runs r ON r.id = n.run_id"
+            " WHERE r.task_id = ? ORDER BY a.created_at", (task_id,)).fetchall())
         metrics = closure = None
         final_count = 0
         for path, retention in arts:
@@ -774,10 +1028,15 @@ class AppBackend:
         except Exception:
             return ""
 
-    def _compose_completion_report(self, uid: str, label: str, run_id: str) -> str:
+    def _compose_completion_report(self, uid: str, label: str,
+                                   task_id: str, run_id: str = "") -> str:
         """组装完成报告正文：任务名 + 影像配对 + 测试区精度 + 与 30m 对照 +
-        正式产物数 + 结果解读段；不使用 emoji 图标。"""
-        data = self._completion_report_data(run_id)
+        正式产物数 + 结果解读段；不使用 emoji 图标。
+
+        task_id 用于跨运行汇总产物与配对（无空洞任务含填洞续跑）；
+        run_id 仅用于研究区显示等运行级字段。
+        """
+        data = self._completion_report_data(task_id)
         if not (data.get("metrics") or data.get("closure") or data.get("final_count")):
             return ""
         lang = self._user_lang(uid)
@@ -788,7 +1047,7 @@ class AppBackend:
             lines.append(f"- 使用研究区：{region}" if lang == "zh"
                          else f"- Study area: {region}")
         # 使用的影像配对（哪天、哪颗 Landsat、Sentinel-2、云量与时差）
-        pair = self._selected_pair_for_task(run_id, lang)
+        pair = self._selected_pair_for_task(run_id, lang, task_id=task_id)
         if pair:
             lines.append(f"- 使用影像：{pair}" if lang == "zh"
                          else f"- Imagery used: {pair}")
@@ -831,26 +1090,54 @@ class AppBackend:
         from core.scheduling.scheduler import strip_emoji
         return strip_emoji(content)
 
+    def _compose_round_note(self, outcome) -> str:
+        """该轮“处理摘要”（真实理解与动作，非模型推理文本）。
+
+        由理解层的模型理解句与系统备注（如降级说明）构成，随
+        thinking_note 事件推给前端，展示在气泡思考块的可展开内容里
+        （用户实测需求：展开要有信息量，而不是仅“等待与处理”占位说明）。
+        """
+        try:
+            notes = [str(n).strip() for n in
+                     (getattr(outcome, "notes", None) or [])
+                     if str(n or "").strip()]
+            if not notes:
+                return ""
+            zh = self._user_lang(self._uid()) == "zh"
+            return (("理解：" if zh else "Understanding: ")
+                    + ("；" if zh else "; ").join(notes[:4]))
+        except Exception:  # noqa: BLE001
+            return ""
+
     def _report_completed_tasks(self):
         """扫描已完成任务：对话里还没有完成报告气泡就补写一条（含精度）。
 
         幂等：气泡带 kind=task_complete + task_id + run_id 标记，重复扫描
-        跳过；重启后从对话文件检查，不重复报告；历史上已完成的任务
-        在功能上线后首次扫描时也会补上报告。
+        跳过；重启后从对话文件检查，不重复报告。
+
+        无空洞任务（创建时要求 gapfill）：主流程完成后自动续跑填洞，
+        **报告延后到填补完成后**一次发出（跨该任务全部运行汇总），
+        不再出现“自动开始结果后处理”的中间气泡（用户实测反馈：
+        无空洞不应被“另算”，应一条链跑到尾、只给一份完成报告）。
         """
         store = self._get_state_store()
         rows_ = store.read(lambda c: c.execute(
             "SELECT t.id, t.user_id, t.conversation_id, t.label,"
-            " t.current_run_id, cv.legacy_conv_id FROM tasks t"
+            " t.current_run_id, cv.legacy_conv_id, t.slots FROM tasks t"
             " JOIN conversations cv ON cv.id = t.conversation_id"
             " WHERE t.summary_status = 'completed'"
             " AND t.current_run_id IS NOT NULL"
             " ORDER BY t.updated_at DESC LIMIT 20").fetchall())
-        for tid, uid, conv_pk, label, run_id, legacy in rows_:
+        for tid, uid, conv_pk, label, run_id, legacy, t_slots in rows_:
             if not uid or not legacy or not run_id:
                 continue
             token = _uid_ctx.set(uid)
             try:
+                # 结果后处理编排（无空洞要求）：未触发→触发续跑并等完成；
+                # 进行中→本轮不发报告；已完成/失败→继续走报告
+                post = self._ensure_postprocess(tid, conv_pk, label, t_slots)
+                if post == "running":
+                    continue  # 填补进行中：报告延后到完成后一次发出
                 convs = self.load_conversations()
                 holder = None
                 for pname, items in convs.items():
@@ -860,13 +1147,25 @@ class AppBackend:
                 if holder is None:
                     continue
                 msgs = list(holder[1].get("messages") or [])
-                if any(isinstance(m, dict) and m.get("kind") == "task_complete"
-                       and m.get("task_id") == tid and m.get("run_id") == run_id
-                       for m in msgs):
+                reported = any(
+                    isinstance(m, dict) and m.get("kind") == "task_complete"
+                    and m.get("task_id") == tid and m.get("run_id") == run_id
+                    for m in msgs)
+                if reported:
                     continue
-                content = self._compose_completion_report(uid, label or tid, run_id)
+                content = self._compose_completion_report(uid, label or tid, tid, run_id)
                 if not content:
                     continue
+                if post == "failed":
+                    # 填补未成功：如实说明，报告仍照发（主流程结果不受影响）
+                    _zh = self._user_lang(uid) == "zh"
+                    content += ("\n\n注：空洞填补（结果后处理）未能成功完成，"
+                                "以上为主流程结果的完成报告；可在任务面板"
+                                "查看后处理失败原因。" if _zh else
+                                "\n\nNote: gap filling (post-processing) did not "
+                                "complete successfully; this report covers the "
+                                "main pipeline results. See the task panel "
+                                "for details.")
                 msgs.append({"role": "assistant", "content": content,
                              "kind": "task_complete", "task_id": tid,
                              "run_id": run_id})
@@ -876,6 +1175,105 @@ class AppBackend:
                 print(f"[completion] 完成报告写入失败：{e}")
             finally:
                 _uid_ctx.reset(token)
+
+    def _ensure_postprocess(self, tid: str, conv_pk: str,
+                            label: str, slots_raw) -> str:
+        """无空洞要求的结果后处理编排（幂等）。返回：
+        not_required（无需）/ running（填补进行中）/ done（已完成）/
+        failed（触发失败或填补失败）。
+
+        未触发时在此发起同任务下的填洞续跑（与手动“继续给我无空洞的
+        结果”同一编译路径）；报告侧据返回值决定是否延后（running）
+        或补发失败说明（failed）。
+        """
+        try:
+            slots = json.loads(slots_raw or "{}")
+        except (ValueError, TypeError):
+            return "not_required"
+        fields = slots.get("fields") or {}
+        g = fields.get("gapfill")
+        val = g.get("value") if isinstance(g, dict) else g
+        if val is None or str(val).strip().lower() not in ("true", "1", "yes"):
+            return "not_required"
+        store = self._get_state_store()
+        runs = store.read(lambda c: c.execute(
+            "SELECT id, status, frozen_inputs FROM runs WHERE task_id = ?"
+            " ORDER BY rowid DESC", (tid,)).fetchall())
+        for _rid, status, fi_raw in runs:
+            try:
+                fi = json.loads(fi_raw or "{}")
+            except (ValueError, TypeError):
+                continue
+            if fi.get("capability") == "gapfill":
+                st = str(status or "")
+                if st == "completed":
+                    return "done"
+                if st in ("failed", "cancelled"):
+                    return "failed"
+                return "running"  # queued/running/awaiting_info 等均视为进行中
+        # 尚未触发：发起填洞续跑（同任务、postprocess 编译）
+        # 主产品溯源（与手动“继续给我无空洞的结果”同一绑定来源：该任务
+        # 最新一次 export 的可用 GeoTIFF）——多个候选中逐一到盘校验存在性
+        # （产物可能被历史清理回收）；此前遗漏绑定导致填洞报“缺少明确
+        # 绑定的主产品”，仅取最新一条又会在被清后报“输入不存在”
+        main_rows = store.read(lambda c: c.execute(
+            "SELECT a.path FROM artifacts a"
+            " JOIN attempts x ON x.id = a.attempt_id"
+            " JOIN nodes n ON n.id = x.node_id"
+            " JOIN runs r ON r.id = n.run_id"
+            " WHERE r.task_id = ? AND n.node_type = 'export'"
+            " AND a.type = 'geotiff' AND a.availability = 'available'"
+            " ORDER BY a.rowid DESC LIMIT 8", (tid,)).fetchall())
+        main_tif = ""
+        for (_p,) in main_rows:
+            if _p and os.path.isfile(str(_p)):
+                main_tif = str(_p)
+                break
+        if not main_tif:
+            print("[completion] 找不到可用主产品（export 产物已不存在），"
+                  "无法发起填洞续跑：%s" % str(tid)[:10])
+            return "failed"
+        conv_row = store.read(lambda c: c.execute(
+            "SELECT legacy_conv_id, project_id FROM conversations WHERE id=?",
+            (conv_pk,)).fetchone())
+        if not conv_row:
+            return "failed"  # 无法定位项目目录：不再等待，报告照发
+        try:
+            project_dir = str(self._conv_project_dir(conv_row[1], conv_row[0]))
+        except Exception:  # noqa: BLE001 — legacy 为空的对话等：不阻塞报告
+            project_dir = ""
+        if not project_dir:
+            print("[completion] 对话目录不可解析，无法发起填洞续跑：%s"
+                  % str(tid)[:10])
+            return "failed"
+        settings = self._load_settings()
+        # main_tif 经 settings["_execution"] 冻结进快照 execution
+        # （adapters gapfill 节点读 execution.main_tif）
+        local = dict(settings)
+        local["_execution"] = {**dict(settings.get("_execution") or {}),
+                               "main_tif": main_tif}
+        from core.planning.compiler import compile_task_tx
+
+        def _tx(conn):
+            task = t_store.load_task(conn, tid)
+            return compile_task_tx(
+                conn, task_id=tid,
+                expected_task_version=int((task or {}).get("version") or 1),
+                settings=local, project_dir=project_dir,
+                run_label=(label or "").strip(), postprocess=True)
+
+        try:
+            made = store.submit_write(_tx)
+        except Exception as e:  # noqa: BLE001 — 触发失败：报告照发并说明
+            print(f"[completion] 填洞续跑触发失败：{e}")
+            return "failed"
+        try:
+            if self._scheduler:
+                self._scheduler.notify()
+        except Exception:  # noqa: BLE001
+            pass
+        print(f"[completion] 已按「无空洞」要求自动创建填洞续跑：{made}")
+        return "running"
 
     # 注意：_compose_completion_report 全库唯一；若出现重复定义，后定义会
     # 覆盖先定义（验证脚本含唯一性断言）。
@@ -1149,7 +1547,7 @@ class AppBackend:
 
     def _resolve_context(self, pid: str, cid: str, *, message: str,
                          chat_mode: str, tz_offset: float,
-                         conv_pk: str = ""):
+                         conv_pk: str = "", selected_point: Optional[dict] = None):
         """组装理解上下文（真实边界文件 + 台账任务/问题快照）。"""
         store = self._get_state_store()
         conv_pk = conv_pk or self._conversation_pk(pid, cid)
@@ -1169,17 +1567,19 @@ class AppBackend:
             study_area_paths=paths,
             active_study_area_paths=active_paths,
             ledger=ledger,
+            selected_point=selected_point or None,
         )
 
     def _understand(self, pid: str, cid: str, message: str, *,
                     chat_mode: str, tz_offset: float, command_id: str,
                     message_id: str, conv_pk: str, prior_messages=None,
-                    on_log=None):
+                    on_log=None, selected_point: Optional[dict] = None):
         """跑一次理解层；返回 UnderstandingResult。异常向上抛给调用方处理。"""
         store = self._get_state_store()
         conv_pk, ctx = self._resolve_context(
             pid, cid, message=message, chat_mode=chat_mode,
-            tz_offset=tz_offset, conv_pk=conv_pk)
+            tz_offset=tz_offset, conv_pk=conv_pk,
+            selected_point=selected_point)
         agent = understanding.CandidateUnderstander(
             self._assistant_for(), on_log=on_log)
         with self._scheduler.model_request():
@@ -1191,6 +1591,147 @@ class AppBackend:
             )
         self._auto_activate_bound_regions(result)
         return result
+
+    def _polish_geo_reply(self, out: Dict[str, Any], lang: str) -> str:
+        """把结构化回答结果交给模型组织成自然语言（“程序定事实、模型说话”）。
+
+        覆盖三类：温度数值（temperature）、位置识别（identify）、
+        无法给出数值的守卫情况（guard）。事实在 out["facts"] 中一次性定妥；
+        模型文本经防幻觉校验（数字与事实一致、关键地名必须保留、守卫不得
+        编造数字），校验不过、模型不可用或超时时回退模板 out["reply"]。
+        """
+        fallback = str(out.get("reply") or "")
+        facts = out.get("facts") or {}
+        kind = str(facts.get("kind") or "")
+        if not facts or kind not in ("temperature", "identify", "guard"):
+            return fallback
+        try:
+            allowed = _geo_allowed_numbers(facts)
+            prompt = _build_geo_polish_prompt(facts, lang)
+            parts: List[str] = []
+            with self._scheduler.model_request():
+                self._assistant_for().ask_stream(
+                    prompt, lambda t: parts.append(t))
+            text = (parts[-1] if parts else "").strip()
+            if not text or len(text) > 400:
+                return fallback
+            if text.startswith("未配置模型ID") or \
+                    text.startswith("未检测到LLM模型配置"):
+                return fallback
+            if not _geo_reply_numbers_ok(text, allowed):
+                return fallback
+            if kind == "temperature":
+                # 点查询必须提到统计半径（用户指定或默认），否则丢信息太严重
+                if facts.get("geometry") == "point" and facts.get("radius_m"):
+                    if str(int(facts["radius_m"])) not in text:
+                        return fallback
+                # “默认”字样：仅当事实确实注明默认半径时才允许出现
+                if ("默认" in text or "default" in text.lower()) \
+                        and not facts.get("default_radius"):
+                    return fallback
+            elif kind == "identify":
+                # 位置描述主片段必须保留（防止模型改动地点结论）
+                desc = str(facts.get("desc") or "")
+                main = desc.split("、")[0].split("（")[0].split("(")[0].strip()
+                if main and main not in text:
+                    return fallback
+            else:  # guard：必须点明地点，且不得出现无据的“默认”字样
+                label = str(facts.get("label") or "")
+                main = label.split("（")[0].split("(")[0].strip()
+                if main and main not in text:
+                    return fallback
+                if "默认" in text or "default" in text.lower():
+                    return fallback
+            return text
+        except Exception:  # noqa: BLE001 — 润色失败不影响回答
+            return fallback
+
+    def _answer_geo_queries(self, queries, *, uid: str, cid: str, conv_pk: str,
+                            command_id: str = "") -> Optional[str]:
+        """执行地点温度提问（geo_query）：统计已有结果并生成回复文本。
+
+        - 默认针对本对话最近完成的结果；无则用全局最近完成；
+        - 目标重名时生成“地点选择”问题卡（不挂任务，回答通道处理）；
+        - 位置在结果范围外/无有效像元时只说明、不给数字（覆盖守卫）。
+        返回可直接展开发送的文本；无法处理时返回 None。
+        """
+        try:
+            from core import geoqa
+        except Exception:  # noqa: BLE001
+            return None
+        settings = self._load_settings() or {}
+        amap_key = str((settings.get("geocode") or {}).get("amap_key") or "")
+        lang = self._user_lang(uid)
+        # 对话级最近完成结果（避免跨对话错查）
+        task_id = ""
+        try:
+            store = self._get_state_store()
+            ledger = understanding.load_ledger_context(
+                store, user_id=uid, conversation_id=conv_pk)
+            rec = (ledger.get("recent_results") or [])
+            if rec and rec[0].get("task_id"):
+                task_id = str(rec[0]["task_id"])
+        except Exception:  # noqa: BLE001
+            task_id = ""
+        replies: List[str] = []
+        for gq in list(queries)[:3]:
+            point = gq.get("point") or {}
+            # 位置识别（“这是哪里/这个点在什么地方”）：反向地理编码，
+            # 不涉温度统计与覆盖守卫
+            if str(gq.get("intent") or "") == "identify":
+                try:
+                    iout = geoqa.identify_place(
+                        target_text=str(gq.get("place") or ""),
+                        lon=point.get("lon"), lat=point.get("lat"),
+                        amap_key=amap_key, lang=lang)
+                    txt = self._polish_geo_reply(iout, lang)
+                except Exception as e:  # noqa: BLE001
+                    txt = ("⚠️ 位置识别出错：%s" % e) if lang == "zh" \
+                        else ("⚠️ Place lookup failed: %s" % e)
+                if txt:
+                    replies.append(txt)
+                continue
+            try:
+                out = geoqa.answer_geo_query(
+                    target_text=str(gq.get("place") or ""),
+                    lon=point.get("lon"), lat=point.get("lat"),
+                    radius_m=int(gq.get("buffer_m") or 0),
+                    task_id=task_id, amap_key=amap_key, lang=lang,
+                    pair_dates_resolver=self._task_pair_dates)
+            except Exception as e:  # noqa: BLE001
+                replies.append(("⚠️ 地点温度查询出错：%s" % e) if lang == "zh"
+                               else ("⚠️ Geo query failed: %s" % e))
+                continue
+            status = out.get("status")
+            if status == "ambiguous":
+                label = str(out.get("label") or gq.get("place") or "")
+                candidates = out.get("candidates") or []
+                prompt = (("「%s」匹配到多个地点，你想查哪一个？" % label)
+                          if lang == "zh" else
+                          ('Multiple places match "%s". Which one?' % label))
+                try:
+                    from core.state_kernel import questions as q_store
+                    self._get_state_store().submit_write(
+                        lambda c: q_store.create_question(
+                            c, user_id=uid, conversation_id=conv_pk,
+                            qtype="geo_target", prompt=prompt,
+                            candidates=candidates,
+                            answer_constraint={
+                                "geo": True,
+                                "buffer_m": int(gq.get("buffer_m") or 0),
+                            },
+                            targets=[], origin_command_id=command_id))
+                except Exception:  # noqa: BLE001
+                    pass
+                options = "\n".join("%s. %s" % (c.get("id"), c.get("name"))
+                                    for c in candidates[:6])
+                replies.append(prompt + ("\n\n" + options if options else ""))
+                continue
+            txt = self._polish_geo_reply(out, lang)
+            if txt:
+                replies.append(txt)
+        text = "\n\n".join(replies).strip()
+        return text or None
 
     def _archive_understanding_failure(self, uid: str, cid: str, conv_pk: str,
                                        message: str, outcome) -> None:
@@ -1238,40 +1779,60 @@ class AppBackend:
         except Exception as e:  # noqa: BLE001
             logging.warning(f"[study-area] 自动启用失败: {e}")
 
-    def _selected_pair_for_task(self, run_id: str, lang: str = "zh") -> str:
+    def _pair_from_attempt_row(self, row) -> dict:
+        """从 select_scene 尝试记录解析配对信息（result_path / staging_dir 双兜底）。"""
+        if not row:
+            return {}
+        sel_path = ""
+        for pth in filter(None, [row[0],
+                                 str(Path(row[1]) / "completion.json")
+                                 if row[1] else None]):
+            try:
+                envelope = json.loads(Path(pth).read_text(encoding="utf-8"))
+                sel_path = str(((envelope.get("result") or {})
+                                .get("context") or {})
+                               .get("selection_path") or "")
+                if sel_path:
+                    break
+            except (OSError, ValueError):
+                continue
+        if not sel_path or not Path(sel_path).is_file():
+            return {}
+        try:
+            selection = json.loads(Path(sel_path).read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+        return ((selection.get("selection") or {}).get("pair") or {})
+
+    def _selected_pair_for_task(self, run_id: str, lang: str = "zh",
+                                task_id: str = "") -> str:
         """已选定配对的摘要（select_scene 的 selection.json）；无则空串。
 
-        问答/完成报告需要知道“当前用的是哪一天的哪颗 Landsat（型号）和
-        Sentinel-2”。lang=en 时输出英文格式。"""
-        if not run_id:
+        task_id 非空时按任务跨全部运行查找（填洞续跑自身没有
+        select_scene 节点）；否则按 run 查（兼容原调用）。
+        """
+        if not (run_id or task_id):
             return ""
         try:
-            row = self._get_state_store().read(lambda c: c.execute(
-                "SELECT result_path, staging_dir FROM attempts a"
-                " JOIN nodes n ON n.id = a.node_id"
-                " WHERE n.run_id = ? AND n.node_key = 'select_scene'"
-                " AND a.status = 'succeeded'"
-                " ORDER BY a.attempt_no DESC LIMIT 1",
-                (run_id,)).fetchone())
-            if not row:
-                return ""
-            sel_path = ""
-            for pth in filter(None, [row[0],
-                                     str(Path(row[1]) / "completion.json")
-                                     if row[1] else None]):
-                try:
-                    envelope = json.loads(Path(pth).read_text(encoding="utf-8"))
-                    sel_path = str(((envelope.get("result") or {})
-                                    .get("context") or {})
-                                   .get("selection_path") or "")
-                    if sel_path:
-                        break
-                except (OSError, ValueError):
-                    continue
-            if not sel_path or not Path(sel_path).is_file():
-                return ""
-            selection = json.loads(Path(sel_path).read_text(encoding="utf-8"))
-            pair = (selection.get("selection") or {}).get("pair") or {}
+            store_ = self._get_state_store()
+            if task_id:
+                row = store_.read(lambda c: c.execute(
+                    "SELECT a.result_path, a.staging_dir FROM attempts a"
+                    " JOIN nodes n ON n.id = a.node_id"
+                    " JOIN runs r ON r.id = n.run_id"
+                    " WHERE r.task_id = ? AND n.node_key = 'select_scene'"
+                    " AND a.status = 'succeeded'"
+                    " ORDER BY a.attempt_no DESC LIMIT 1",
+                    (task_id,)).fetchone())
+            else:
+                row = store_.read(lambda c: c.execute(
+                    "SELECT result_path, staging_dir FROM attempts a"
+                    " JOIN nodes n ON n.id = a.node_id"
+                    " WHERE n.run_id = ? AND n.node_key = 'select_scene'"
+                    " AND a.status = 'succeeded'"
+                    " ORDER BY a.attempt_no DESC LIMIT 1",
+                    (run_id,)).fetchone())
+            pair = self._pair_from_attempt_row(row)
             if not pair.get("landsat_date"):
                 return ""
             # 型号：存储为 L8/L9 等简写 → 展示为“Landsat 9”
@@ -1292,6 +1853,55 @@ class AppBackend:
                     f"成像时差 {diff} 天")
         except Exception:
             return ""
+
+    def _task_pair_dates(self, task_id: str) -> Dict[str, str]:
+        """任务配对的观测日期（跨该任务所有运行回溯最近的 select_scene 成功记录）。
+
+        用于地点温度回答：把“数据时段”精确到 Sentinel-2 观测日（降尺度
+        特征源；产品实际代表该日期的地表温度）。优先读台账 nodes.result
+        （持久化，不受 execution 目录中间清理影响），再回退文件解析。
+        返回 {"landsat_date": "YYYY-MM-DD", "sentinel2_date": "YYYY-MM-DD"}，
+        无记录时返回 {}（问答退回月份表述）。
+        """
+        if not task_id:
+            return {}
+        try:
+            # 1) 优先：台账结果（节点 result 里含完整的 selection.pair）
+            row = self._get_state_store().read(lambda c: c.execute(
+                "SELECT n.result FROM nodes n"
+                " JOIN runs r ON r.id = n.run_id"
+                " WHERE r.task_id = ? AND n.node_key = 'select_scene'"
+                " AND n.status = 'succeeded'"
+                " AND n.result IS NOT NULL AND n.result != ''"
+                " ORDER BY n.rowid DESC LIMIT 1",
+                (task_id,)).fetchone())
+            if row and row[0]:
+                try:
+                    res = (json.loads(row[0]) if isinstance(row[0], str)
+                           else row[0])
+                except (ValueError, TypeError):
+                    res = {}
+                pair = ((res or {}).get("selection") or {}).get("pair") or {}
+                if pair.get("landsat_date") or pair.get("sentinel2_date"):
+                    return {"landsat_date": str(pair.get("landsat_date") or ""),
+                            "sentinel2_date": str(pair.get("sentinel2_date")
+                                                 or "")}
+            # 2) 回退：select_scene 的 completion/selection 文件
+            row = self._get_state_store().read(lambda c: c.execute(
+                "SELECT a.result_path, a.staging_dir FROM attempts a"
+                " JOIN nodes n ON n.id = a.node_id"
+                " JOIN runs r ON r.id = n.run_id"
+                " WHERE r.task_id = ? AND n.node_key = 'select_scene'"
+                " AND a.status = 'succeeded'"
+                " ORDER BY a.rowid DESC LIMIT 1",
+                (task_id,)).fetchone())
+            pair = self._pair_from_attempt_row(row)
+            if not pair:
+                return {}
+            return {"landsat_date": str(pair.get("landsat_date") or ""),
+                    "sentinel2_date": str(pair.get("sentinel2_date") or "")}
+        except Exception:  # noqa: BLE001 — 日期元数据缺失不影响问答
+            return {}
 
     def kernel_qa_context(self, pid: str, cid: str) -> dict:
         """对话问答上下文（多角色应知道流程进展）：任务进度/当前节点/
@@ -2066,6 +2676,32 @@ class AppBackend:
             pid, cid, message=text, chat_mode="work", tz_offset=tz_offset)
         if not conv_pk:
             return {"ok": False, "message": "这条对话还没有台账记录"}
+        # 地理选点问题（geo_target）：直接执行统计并落两条气泡
+        geo_row = store.read(lambda c: c.execute(
+            "SELECT answer_constraint, candidates, version FROM questions"
+            " WHERE id = ? AND conversation_id = ?",
+            (question_id, conv_pk)).fetchone())
+        _geo_ac: Dict[str, Any] = {}
+        if geo_row:
+            try:
+                _geo_ac = json.loads(geo_row[0] or "{}")
+            except (ValueError, TypeError):
+                _geo_ac = {}
+        if _geo_ac.get("geo"):
+            geo_reply = self._resolve_geo_answer(
+                geo_row[1], _geo_ac, str(text), uid=self._uid(),
+                conv_pk=conv_pk)
+            try:
+                from core.state_kernel import questions as qs
+                store.submit_write(lambda c: qs.close_question(
+                    c, question_id, int(geo_row[2]), status=qs.Q_ANSWERED,
+                    answer={"text": str(text), "field": "geo_target"}))
+            except Exception:  # noqa: BLE001 — 关闭失败不阻断回答
+                pass
+            appended = self._append_answer_bubbles(pid, cid, str(text),
+                                                   geo_reply or "")
+            return {"ok": True, "appended": appended,
+                    **self.session_snapshot(pid, cid)}
         if self._scheduler:
             try:
                 execution_answer = self._scheduler.answer(
@@ -2097,6 +2733,69 @@ class AppBackend:
         reply = self._ack_reply_text()
         appended = self._append_answer_bubbles(pid, cid, text, reply)
         return {"ok": True, "task": applied, "appended": appended, **snapshot}
+
+    def _resolve_geo_answer(self, candidates_raw: str, ac: Dict[str, Any],
+                            text: str, *, uid: str, conv_pk: str) -> str:
+        """用户在地点选择卡上选定后，执行统计并返回回答文本。"""
+        lang = self._user_lang(uid)
+        try:
+            cands = json.loads(candidates_raw or "[]")
+        except (ValueError, TypeError):
+            cands = []
+        chosen = None
+        t = (text or "").strip()
+        for c in cands:
+            name = str(c.get("name") or "")
+            if not t:
+                continue
+            if t == str(c.get("id")) or t in name or (name and name in t):
+                chosen = c
+                break
+        if chosen is None:
+            return ("没能对上你选的候选，请回复候选前的编号（如 1）重新选择。"
+                    if lang == "zh" else
+                    "I could not match your choice; reply with the option "
+                    "number (e.g. 1).")
+        value = str(chosen.get("value") or "")
+        radius = int(ac.get("buffer_m") or 0)
+        settings = self._load_settings() or {}
+        key = str((settings.get("geocode") or {}).get("amap_key") or "")
+        task_id = ""
+        try:
+            store = self._get_state_store()
+            ledger = understanding.load_ledger_context(
+                store, user_id=uid, conversation_id=conv_pk)
+            rec = (ledger.get("recent_results") or [])
+            if rec and rec[0].get("task_id"):
+                task_id = str(rec[0]["task_id"])
+        except Exception:  # noqa: BLE001
+            task_id = ""
+        try:
+            import re as _re
+            from core import geoqa
+            if _re.match(r"^-?\d+(\.\d+)?\s*,\s*-?\d+(\.\d+)?$", value):
+                lon, lat = (float(x) for x in value.split(",")[:2])
+                # 短名（如有）作为回答里的地点标签，避免整条地址链
+                out = geoqa.answer_geo_query(
+                    target_text=str(chosen.get("short") or ""),
+                    lon=lon, lat=lat, radius_m=radius,
+                    task_id=task_id, amap_key=key, lang=lang,
+                    pair_dates_resolver=self._task_pair_dates)
+            elif value:
+                # 边界库条目 key（“多个同名边界”场景）
+                out = geoqa.answer_geo_query(boundary_key=value,
+                                             amap_key=key,
+                                             task_id=task_id, lang=lang,
+                                             pair_dates_resolver=self._task_pair_dates)
+            else:
+                out = geoqa.answer_geo_query(target_text=str(chosen.get("name") or ""),
+                                             amap_key=key,
+                                             task_id=task_id, lang=lang,
+                                             pair_dates_resolver=self._task_pair_dates)
+            return self._polish_geo_reply(out, lang)
+        except Exception as e:  # noqa: BLE001
+            return ("⚠️ 地点温度查询出错：%s" % e) if lang == "zh" \
+                else ("⚠️ Geo query failed: %s" % e)
 
     def _ack_reply_text(self) -> str:
         """问题回答后的确认文案（随用户界面语言）。"""
@@ -3028,11 +3727,30 @@ class AppBackend:
                 "client_secret_len": len(ds.get("client_secret") or ""),
                 "s3_secret_len": len(ds.get("s3_secret") or ""),
             },
+            # 地点检索配置（高德 Key；与其它秘密字段一致只回掩码+长度）
+            "geocode": {
+                "amap_key": "",
+                "has_amap_key": bool((s.get("geocode") or {}).get("amap_key")),
+                "amap_key_masked": self._mask_secret(
+                    (s.get("geocode") or {}).get("amap_key", "")),
+                "amap_key_len": len((s.get("geocode") or {}).get("amap_key") or ""),
+            },
         }
 
     def save_settings(self, payload: dict) -> dict:
         s = self._load_settings()
         api = s.setdefault("api", {})
+
+        # 高德 Web 服务 Key（地点检索；掩码占位不写回，空=保持原值）
+        if isinstance(payload.get("geocode"), dict):
+            gc_cfg = s.setdefault("geocode", {})
+            raw_amap = payload["geocode"].get("amap_key")
+            if raw_amap is None:
+                gc_cfg.pop("amap_key", None)
+            else:
+                v = str(raw_amap).strip()
+                if v and not v.startswith("•"):
+                    gc_cfg["amap_key"] = v
 
         api_format = "anthropic" if payload.get("api_format") == "anthropic" else "openai"
         base_url = (payload.get("base_url") or "").strip().rstrip("/")
@@ -3538,7 +4256,16 @@ class AppBackend:
 
     def list_layers(self, cid: Optional[str]) -> List[dict]:
         project_dir = self._get_project_dir(cid)
-        return LayerVisualizer.list_available_layers(project_dir)
+        layers = LayerVisualizer.list_available_layers(project_dir)
+        # 后台预热各图层全局统计：地图面板打开时即提前算好，
+        # 首瓦片不再等首次全图统计（首载性能）
+        try:
+            LayerVisualizer.prewarm_stats(
+                [str(l.get("id")) for l in (layers or [])
+                 if l.get("available")], project_dir)
+        except Exception:  # noqa: BLE001 — 预热失败不影响图层列表
+            pass
+        return layers
 
     def render_layer_png(self, layer_id: str, cid: Optional[str]):
         """渲染单图层 PNG 字节 + WGS84 边界；不可用返回 None"""
@@ -3973,7 +4700,7 @@ class AppBackend:
 
     # ── 聊天流式（线程 + 队列，复刻旧版语义） ─────────────────
 
-    def chat_start(self, pid: str, cid: str, user_msg: str, exec_mode: str = "", chat_mode: str = "", request_id: str = "") -> dict:
+    def chat_start(self, pid: str, cid: str, user_msg: str, exec_mode: str = "", chat_mode: str = "", request_id: str = "", selected_point: Optional[dict] = None) -> dict:
         user_msg = (user_msg or "").strip()
         if not user_msg:
             return {"ok": False, "message": "消息不能为空"}
@@ -4098,6 +4825,9 @@ class AppBackend:
         # 创建流式队列 + 后台线程
         q: "queue.Queue" = queue.Queue()
         self._stream_queues[cid] = q
+        # 本轮“处理摘要”（按对话暂存，随各分支推送的同时，done 事件也会
+        # 搵带一次——done 是双通道可靠到达的收尾事件，避免中间事件偶发丢失）
+        self._stream_notes[cid] = ""
         # 同一对话多轮执行的日志不断追加（不重置），避免后一轮覆盖前一轮日志
         self._stream_logs.setdefault(cid, [])
         # 新一轮开始：重置思考链 / 思考用时 / 正文累积。_stream_thinking 只在删除
@@ -4110,14 +4840,7 @@ class AppBackend:
         pause_event = threading.Event()
         self._pause_events[cid] = pause_event
 
-        prior_messages = []
-        for m in history[:-2]:
-            raw = m.get("content", "")
-            if isinstance(raw, list):
-                raw = "\n".join(str(x) for x in raw)
-            c = strip_thinking(raw)
-            if c:
-                prior_messages.append({"role": m.get("role", "user"), "content": c})
+        prior_messages = sanitize_prior_messages(history)
 
         uid = self._uid()
 
@@ -4219,7 +4942,7 @@ class AppBackend:
                         pid, cid, user_msg, chat_mode="work", tz_offset=_DEFAULT_TZ_OFFSET,
                         command_id=command_id or "", message_id=message_id,
                         conv_pk=conv_pk, prior_messages=prior_messages,
-                        on_log=_emit_log)
+                        on_log=_emit_log, selected_point=selected_point)
                     self._scheduler.notify()
                     if getattr(outcome, "degraded", False):
                         # 解析失败样本归档（JSONL）：供复盘与回归金样采集
@@ -4256,9 +4979,28 @@ class AppBackend:
                             _head = (f"已提交 {len(submitted)} 个任务，按各自节点与资源额度执行。"
                                      if _zh else
                                      f"{len(submitted)} task(s) submitted; each runs under its own node and resource quotas.")
+                        _note = self._compose_round_note(outcome)
+                        if _note:
+                            self._stream_notes[cid] = _note
+                            q.put(("thinking_note", _note))
                         _put_token(_head + ("\n" + outcome.message if outcome.message else ""))
                     else:
                         reply = outcome.message or ""
+                        # 地理提问（geo_query）：读取已有结果做统计问答（不改任务）
+                        _geo = getattr(outcome, "geo_queries", None) or []
+                        if _geo and not getattr(outcome, "degraded", False):
+                            _geo_reply = self._answer_geo_queries(
+                                _geo, uid=uid, cid=cid, conv_pk=conv_pk,
+                                command_id=command_id or "")
+                            if _geo_reply:
+                                _note = self._compose_round_note(outcome)
+                                if _note:
+                                    self._stream_notes[cid] = _note
+                                    q.put(("thinking_note", _note))
+                                _put_token(_geo_reply)
+                                q.put(("tasks", self.session_snapshot(pid, cid)))
+                                q.put(("done", None))
+                                return
                         # 「只回答」或理解层降级（解析失败但模型可用）时，
                         # 由真模型带台账上下文生成自然语言回答（§4.5）；
                         # 降级路径零执行副作用，不再抛“请分开说”式套话
@@ -4277,6 +5019,10 @@ class AppBackend:
                                      if self._user_lang(uid) == "zh" else
                                      "I couldn't interpret that message "
                                      "(model response error); please try again.")
+                        _note = self._compose_round_note(outcome)
+                        if _note:
+                            self._stream_notes[cid] = _note
+                            q.put(("thinking_note", _note))
                         _put_token(reply or "已记录你的说明。")
                     q.put(("tasks", self.session_snapshot(pid, cid)))
                     q.put(("done", None))
@@ -4387,13 +5133,15 @@ class AppBackend:
             if saved:
                 yield ("event: done\ndata: " + json.dumps(
                     {"content": saved, "thinking": thinking,
-                     "thinking_seconds": thinking_seconds},
+                     "thinking_seconds": thinking_seconds,
+                     "note": self._stream_notes.get(cid, "")},
                     ensure_ascii=False) + "\n\n")
             else:
                 yield ("event: done\ndata: " + json.dumps(
                     {"content": "> 本次执行在过程中断（服务重启或连接中断），"
                                 "已生成的部分结果可在工作面板查看；如需完整结果请重新发起执行。",
-                     "thinking": ""}, ensure_ascii=False) + "\n\n")
+                     "thinking": "", "note": self._stream_notes.get(cid, "")},
+                    ensure_ascii=False) + "\n\n")
             return
         # 重连接管（刷新/切回）：若任务正暂停等待审批或选影像，把待处理载荷
         # 重放进队列，让新连接重新收到 pause 事件，前端恢复暂停弹窗（不丢暂停态）
@@ -4463,7 +5211,12 @@ class AppBackend:
                     break
                 last_emit = time.time()
 
-                if event_type == "thinking":
+                if event_type == "thinking_note":
+                    # 该轮“处理摘要”（真实理解与动作，非模型推理文本）：
+                    # 前端优先作为思考块可展开内容展示
+                    yield from _emit("thinking_note",
+                                     {"note": str(data or "")})
+                elif event_type == "thinking":
                     thinking = data
                     # 思考链同样防复读/超长（用户实测：思考链刷屏）
                     if not thinking_truncated:
@@ -4570,7 +5323,8 @@ class AppBackend:
                 elif event_type == "error":
                     from core.scheduling.scheduler import strip_emoji
                     accumulated += f"\n\n执行出错：{strip_emoji(str(data))}"
-                    yield from _emit("done", {"content": format_bubble("", accumulated, streaming=False)})
+                    yield from _emit("done", {"content": format_bubble("", accumulated, streaming=False),
+                                              "note": self._stream_notes.get(cid, "")})
                     return
 
             elapsed = time.time() - start_time
@@ -4580,7 +5334,9 @@ class AppBackend:
             # chat_stream 恢复路径也已用 _stream_content 补齐，二者口径一致。
             authoritative = self._stream_content.get(cid, "") or accumulated
             final = format_bubble("", authoritative, streaming=False, elapsed=elapsed)
-            yield from _emit("done", {"content": final, "thinking": thinking, "thinking_seconds": thinking_seconds})
+            yield from _emit("done", {"content": final, "thinking": thinking,
+                                    "thinking_seconds": thinking_seconds,
+                                    "note": self._stream_notes.get(cid, "")})
             if pid:
                 convs = self.load_conversations()
                 if cid in convs.get(pid, {}):
@@ -5107,6 +5863,7 @@ def chat_start(payload: dict):
         exec_mode=payload.get("exec_mode", ""),
         chat_mode=payload.get("chat_mode", ""),
         request_id=payload.get("request_id", ""),
+        selected_point=payload.get("selected_point") or None,
     )
 
 

@@ -24,6 +24,7 @@ _OPS_TABLE = """\
 | cancel | 用户要求取消某个已有任务（终止，不是暂停） |
 | pause | 用户要求暂停某个正在进行中的任务（停在节点边界，可再恢复） |
 | priority | 用户要求调整某个任务的先后顺序 |
+| geo_query | 询问某地/某点的地表温度，或询问「这里/这个点/所选位置」是什么地方（读取已有结果，不建任务） |
 | reply_only | 用户只是在问问题/闲聊，不需要动任何任务 |"""
 
 _CAP_TABLE = """\
@@ -45,7 +46,8 @@ _FIELD_TABLE = """\
 | product_mode | 只能是 pair（配对模式）或 monthly（月度合成） |
 | datasets | 数组，取值只能是 landsat / sentinel2 / dem |
 | product | 只能是 lst_10m |
-| model | 只能是 rf |"""
+| model | 只能是 rf |
+| gapfill | 用户要求「无空洞 / 不要空洞 / 填补空洞」时写布尔值 true；没提就不要写这个字段 |"""
 
 _OUTPUT_SPEC = """\
 {
@@ -54,6 +56,7 @@ _OUTPUT_SPEC = """\
       "op": "create",
       "label": "A",
       "target_ref": "武汉",
+      "covers": ["武汉 7 月"],
       "capability": "full_lst",
       "patches": {
         "region": {"action": "set", "value": "武汉", "evidence": "武汉 7 月"},
@@ -85,7 +88,8 @@ def understand_prompt(*, anchor_date: str, tz_label: str, chat_mode: str,
                       open_tasks: Sequence[str],
                       open_questions: Sequence[str],
                       recent_summary: str = "",
-                      recent_completed: Sequence[str] = ()) -> str:
+                      recent_completed: Sequence[str] = (),
+                      selected_point: str = "") -> str:
     """候选理解器的系统提示词。"""
     mode_line = (
         "当前是 Chat 只读模式：你**只能**输出 reply_only，"
@@ -158,6 +162,7 @@ def understand_prompt(*, anchor_date: str, tz_label: str, chat_mode: str,
 - 最近完成的结果（「继续/接着/无空洞/补洞/再导出一份」这类延续请求以此为默认目标；
   可以在 patches 里引用它的 region/time，并注明「来自最近完成的任务」）：
 {_bullet(recent_completed, "本对话还没有刚完成的结果")}
+- 地图选点：{selected_point or "（当前没有地图选点）"}
 {("- 最近对话摘要：" + recent_summary) if recent_summary else ""}
 
 ## 输出格式（严格遵守）
@@ -170,7 +175,21 @@ def understand_prompt(*, anchor_date: str, tz_label: str, chat_mode: str,
 - 一句话里说了两个地区/两个月份，就输出两条 create，label 分别用 A、B。
 - 只有真的属于多个目标的共同修饰（「都是 2025 年」）才写 shared_modifiers。
 - 用户在回答问题时用 answer，并带上 question_id（上面列出的待答问题编号）。
+- 用户要求「无空洞」「不要空洞」「填补空洞」时，在 create 的 patches 里加
+  "gapfill": {{"action": "set", "value": true, "evidence": 原话片段}}——主流程完成后会
+  自动做空洞填补；没提就不要写这个字段。
 - 每条补丁尽量带 evidence，抄原句里对应的那一小段。
+- 询问某地当前的地表温度（如「洪山区多少度」「武汉大学附近热不热」「纽约百老汇的温度」）
+  用 geo_query：地名原话写在 target_ref；说了「周围 300 米」就把半径写进 buffer_m（整数米，没提就省略）；
+  用户用「这个点/这里/刚才选的点」指代地图选点时，target_ref 留空（程序会用上面的地图选点）；
+  同样要写 covers 和 evidence（抄本句原话片段，覆盖审计用）。
+- 询问位置归属（如「这是哪里」「具体在什么地方」「这个点是什么位置」）也用 geo_query，
+  但要写 "intent": "identify"（问温度时不写或写 "temperature"）；问位置时 target_ref 可留空（用地图选点）。
+- 一句话同时问位置和温度（如「这是哪，温度如何」「这是什么地方、热不热」）时输出两条 geo_query：
+  一条 "intent": "identify" 问位置，一条 "intent": "temperature" 问温度，不要只输出其中一条。
+- 每一条操作都必须写 covers：抄下它覆盖的原句片段（数组，可多个；修饰语并入
+  相关操作，例如「用配对模式」并入对应 create 的 covers）。程序会按标点切子句
+  做覆盖审计，漏写的子句会被自动补充解析。
 """
 
 
@@ -179,6 +198,28 @@ def repair_hint() -> str:
     return ("\n\n## 强制要求\n上一次输出无法解析。只输出一个 JSON 对象，"
             "不要任何解释文字、标题或代码块标记；operations 必须是数组；"
             "op / capability / 字段名只能取上面枚举表里的值。")
+
+
+def supplement_hint() -> str:
+    """补充解析提示（覆盖审计触发，最多一次）。"""
+    return ("\n\n## 补充要求\n上一条消息中有子句未被任何操作覆盖。"
+            "请只为遗漏的子句补充操作，输出同一 JSON 形状；"
+            "若遗漏子句只是问候/修饰语而无需操作，输出："
+            '{"operations": [{"op": "reply_only", "covers": ["<该子句原文>"]}]}。'
+            "不要重复已解析过的操作。")
+
+
+def supplement_request(user_message: str, operations, missing) -> str:
+    """把原消息 + 已解析操作摘要 + 未覆盖子句回传给模型做补充解析。"""
+    rows = []
+    for op in operations or []:
+        cov = "、".join(str(c) for c in (getattr(op, "covers", ()) or ()))
+        rows.append("- %s（覆盖：%s）" % (op.op, cov or "未标注"))
+    miss = "\n".join("- %s" % m for m in (missing or []))
+    return ("原始用户消息：\n%s\n\n已解析的操作：\n%s\n\n"
+            "以下子句未被任何操作覆盖：\n%s\n\n"
+            "请只为上述遗漏子句补充操作（不要重复已有操作）。"
+            % (user_message, "\n".join(rows) or "（无）", miss))
 
 
 def repair_request(user_message: str, raw_output: str) -> str:

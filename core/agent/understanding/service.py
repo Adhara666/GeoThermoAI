@@ -56,6 +56,8 @@ class UnderstandingResult:
     raw_model_output: str = ""
     # 解析失败降级：模型可用但两次都吐不出合法操作 JSON，已按“只回答”处理
     degraded: bool = False
+    # 地理提问（geo_query）：[{place, buffer_m, point, evidence}]
+    geo_queries: List[Dict[str, Any]] = field(default_factory=list)
 
     @property
     def should_execute(self) -> bool:
@@ -107,22 +109,29 @@ def _recent_completed_results(conn, *, user_id: str, conversation_id: str,
         display = str(value or detail.get("display")
                       or Path(str(detail.get("path") or "")).stem or "")
         time_v = (fields.get(ops.F_TIME) or {}).get("value") or {}
-        # 结果后处理（填洞）需要的主产品：该任务最新一次导出的可用 GeoTIFF
-        art = conn.execute(
+        # 结果后处理（填洞）需要的主产品：该任务最新一次导出且**仍在盘上**
+        # 的 GeoTIFF——多候选中逐一校验存在性（产物可能被历史清理回收；
+        # 用户实测：仅取最新一条时被清产物会导致填洞报“输入不存在”）。
+        arts = conn.execute(
             "SELECT a.path FROM artifacts a"
             " JOIN attempts x ON x.id = a.attempt_id"
             " JOIN nodes n ON n.id = x.node_id"
             " JOIN runs r ON r.id = n.run_id"
             " WHERE r.task_id = ? AND n.node_type = 'export'"
             " AND a.type = 'geotiff' AND a.availability = 'available'"
-            " ORDER BY a.rowid DESC LIMIT 1", (task_id,)).fetchone()
+            " ORDER BY a.rowid DESC LIMIT 8", (task_id,)).fetchall()
+        main_tif = ""
+        for (p_,) in arts:
+            if p_ and Path(str(p_)).is_file():
+                main_tif = str(p_)
+                break
         out.append({
             "task_id": str(task_id or ""),
             "label": str(label or ""),
             "region_display": display,
             "region_detail": detail,
             "time_value": dict(time_v) if isinstance(time_v, dict) else {},
-            "main_tif": str(art[0]) if art and art[0] else "",
+            "main_tif": main_tif,
             "updated_at": str(updated or ""),
         })
     return out
@@ -139,13 +148,29 @@ def _recent_line(rec: Dict[str, Any]) -> str:
                                  span) if x)
 
 
+def _selected_point_line(point: Optional[Dict[str, Any]]) -> str:
+    """地图选点的提示词表达（无选点返回空串）。"""
+    if not point:
+        return ""
+    try:
+        lon = float(point.get("lon"))
+        lat = float(point.get("lat"))
+    except (TypeError, ValueError, AttributeError):
+        return ""
+    label = str(point.get("label") or "")
+    return ("经度 %.6f，纬度 %.6f（WGS84）%s"
+            % (lon, lat, "，%s" % label if label else ""))
+
+
 def build_resolve_context(*, message: str, received_at: datetime.datetime,
                           tz_offset: float, chat_mode: str,
                           study_area_paths: Sequence[Path],
                           active_study_area_paths: Sequence[Path] = (),
                           ledger: Dict[str, List[Dict[str, Any]]],
                           default_product: str = "lst_10m",
-                          default_model: str = "rf") -> res.ResolveContext:
+                          default_model: str = "rf",
+                          selected_point: Optional[Dict[str, Any]] = None
+                          ) -> res.ResolveContext:
     return res.ResolveContext(
         message=message,
         anchor_date=timeparse.anchor_from(received_at, tz_offset),
@@ -158,6 +183,7 @@ def build_resolve_context(*, message: str, received_at: datetime.datetime,
         recent_results=list(ledger.get("recent_results") or []),
         default_product=default_product,
         default_model=default_model,
+        selected_point=dict(selected_point) if selected_point else None,
     )
 
 
@@ -188,6 +214,7 @@ def handle_message(
         open_questions=[_question_line(q) for q in ctx.open_questions],
         recent_completed=[_recent_line(r) for r in ctx.recent_results],
         history=history,
+        selected_point=_selected_point_line(ctx.selected_point),
     )
     if ctx.chat_mode == "chat":
         batch = enforce_chat_mode(batch)
@@ -199,6 +226,10 @@ def handle_message(
         raw_model_output=batch.raw_output,
         notes=list(outcome.notes),
     )
+    # 模型的一句话理解（批次 note）并入备注：runner 会把它作为“处理摘要”
+    # 展示在气泡思考块的可展开内容里（真实理解与动作，非模型推理文本）
+    if batch.note:
+        result.notes.insert(0, batch.note)
 
     if outcome.failure:
         if batch.source == SOURCE_UNAVAILABLE:
@@ -213,6 +244,9 @@ def handle_message(
         result.degraded = True
         result.notes.append("解析失败已降级为问答")
         return result
+
+    # 地理提问透传（与任务无关；runner 优先检查 geo_queries 执行统计问答）
+    result.geo_queries = list(outcome.geo_queries)
 
     # 1) 先消费答案（§3.4 消费答案事务）
     for action in outcome.answers:

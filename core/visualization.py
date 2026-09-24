@@ -13,6 +13,7 @@ v3.2 变更：
 import contextlib
 import glob
 import hashlib
+import json
 import math
 import os
 import re
@@ -81,24 +82,96 @@ def _open_cached(path: str):
 # 副本只在请求缩放低于其自身原生级别时使用（否则回原图）——修复：
 # 此前固定 z≤15 都读 4096 像素副本，10m 影像被等效降到 ~30m（用户实测模糊）。
 _OVERVIEW_LOCK = threading.Lock()
-_OVERVIEW_READY = {}  # (file_path, mtime) → (副本路径, 副本原生级别) or ""
+_OVERVIEW_READY = {}   # (file_path, mtime) → ""（无副本/失败）| ("building", ov_z) | (副本路径, ov_z)
+_OVERVIEW_STARTED = set()  # 已启动后台构建的 key（防重复启动）
 _OVERVIEW_MAX_DIM = 8192
 _OVERVIEW_MAX_PIXELS = 12_000_000  # 超过才值得建副本
+
+# ── 全局统计缓存：每文件锁（防首屏并发重复全图解码）+ 磁盘缓存 ──
+_STATS_LOCKS = {}
+_STATS_LOCKS_GUARD = threading.Lock()
+
+# ── 统计后台预热（打开地图面板时提前算好，首瓦片免等首次全图统计） ──
+_PREWARM_LOCK = threading.Lock()
+_PREWARM_STARTED = set()
+
+
+def _stats_lock(key):
+    """按统计缓存 key 取互斥锁（首屏多瓦片并发时避免重复全图解码）。"""
+    with _STATS_LOCKS_GUARD:
+        lk = _STATS_LOCKS.get(key)
+        if lk is None:
+            lk = _STATS_LOCKS[key] = threading.Lock()
+        return lk
+
+
+def _stats_disk_path(key) -> str:
+    """统计结果的磁盘缓存路径（进程重启后仍命中）。"""
+    try:
+        digest = hashlib.md5(repr(key).encode()).hexdigest()[:16]
+    except Exception:  # noqa: BLE001
+        return ""
+    return os.path.join(tempfile.gettempdir(), "gtai_overview",
+                        f"st_{digest}.json")
+
+
+def _build_overview_async(file_path: str, key, ov_z: int) -> None:
+    """后台构建概览副本：完成后记录路径并预热副本统计（不阻塞任何请求）。"""
+    out = ""
+    try:
+        with rasterio.open(file_path) as src:
+            scale = _OVERVIEW_MAX_DIM / max(src.width, src.height)
+            ow = max(1, int(src.width * scale))
+            oh = max(1, int(src.height * scale))
+            count = int(src.count)
+            data = src.read(out_shape=(count, oh, ow),
+                            resampling=_Resampling.bilinear)
+            prof = src.profile.copy()
+            prof.update(width=ow, height=oh, count=count,
+                        transform=src.transform * src.transform.scale(
+                            src.width / ow, src.height / oh))
+        out_dir = os.path.join(tempfile.gettempdir(), "gtai_overview")
+        os.makedirs(out_dir, exist_ok=True)
+        digest = hashlib.md5(f"{file_path}:{key[1]}".encode()).hexdigest()[:16]
+        out_path = os.path.join(out_dir, f"ov_{digest}.tif")
+        with rasterio.open(out_path, "w", **prof) as dst:
+            dst.write(data)
+        del data
+        with rasterio.open(out_path) as osrc:
+            ov_z = LayerVisualizer._native_zoom(osrc)
+        out = out_path
+        # 构建是整幅影像的大块分配（数百 MB~GB 级）：完成后立即把空闲堆归还系统
+        try:
+            from core.memtrim import release_rss_memory
+            release_rss_memory()
+        except Exception:  # noqa: BLE001 — 归还失败不影响构建
+            pass
+        # 预热副本统计：后续低缩放瓦片直接命中，免二次全图解码
+        try:
+            for b in range(1, count + 1):
+                LayerVisualizer._cached_stats(out, "pct", b)
+                LayerVisualizer._cached_stats(out, "range", b)
+        except Exception:  # noqa: BLE001
+            pass
+    except Exception:  # noqa: BLE001 — 构建失败保持“无副本”
+        out = ""
+    _OVERVIEW_READY[key] = (out, ov_z) if out else ""
 
 
 def _overview_or_self(file_path: str, mtime: float, z: int):
     """返回渲染应读取的 (文件路径, 该文件的原生缩放级别)。
 
     大地图为加速构建低分辨率概览副本，但仅当请求的 z 低于副本原生级别
-    时才读副本，且副本**按需构建**（高缩放请求直接读原图，不触发构建）——
-    此前固定 z≤15 都读 4096 像素副本，10m 影像被等效降到 ~30m（用户实测）。
+    时才读副本，且副本**异步构建**（首个低缩放请求只触发后台构建、自己
+    直接读原图渲染不等待；构建期间所有请求都读原图，副本就绪后自动接管）。
+    高缩放请求直接读原图，不触发构建。
     """
     if not HAS_RASTERIO:
         return file_path, None
     key = (file_path, mtime)
     cached = _OVERVIEW_READY.get(key)
     if cached is None:
-        # 只做廉价探测（打开读尺寸）：大图记录预计副本级别，等低缩放请求再构建
+        # 廉价探测（打开读尺寸）：大图记录预计副本级别，待下面触发后台构建
         cached = ""
         try:
             with rasterio.open(file_path) as src:
@@ -108,57 +181,39 @@ def _overview_or_self(file_path: str, mtime: float, z: int):
                     scale = _OVERVIEW_MAX_DIM / max(src.width, src.height)
                     ov_z = int(round(LayerVisualizer._native_zoom(src)
                                      + math.log2(scale)))
-                    cached = ("", ov_z)
+                    # 磁盘上已有同名副本（上次构建已写盘）→ 直接复用，免重建
+                    digest = hashlib.md5(
+                        f"{file_path}:{mtime}".encode()).hexdigest()[:16]
+                    out_path = os.path.join(tempfile.gettempdir(),
+                                            "gtai_overview",
+                                            f"ov_{digest}.tif")
+                    if os.path.isfile(out_path):
+                        try:
+                            with rasterio.open(out_path) as osrc:
+                                cached = (out_path,
+                                          LayerVisualizer._native_zoom(osrc))
+                        except Exception:
+                            cached = ("building", ov_z)
+                    else:
+                        cached = ("building", ov_z)
         except Exception:
             cached = ""
         _OVERVIEW_READY[key] = cached
     if not cached:
         return file_path, None
-    out, ov_z = cached
+    state, ov_z = cached
     if z >= ov_z:
-        return file_path, None   # 达到/超出副本原生级别：读原图，不建副本
-    if not out:
-        # 低缩放：惰性构建概览副本（一次，构建期间后续请求已可回原图）
+        return file_path, None   # 达到/超出副本原生级别：读原图，不触发构建
+    if state == "building":
+        # 首个低缩放请求：只启动一次后台构建，本次及构建期间直接读原图
         with _OVERVIEW_LOCK:
-            cur = _OVERVIEW_READY.get(key)
-            out, ov_z = cur if isinstance(cur, tuple) else ("", ov_z)
-            if not out:
-                try:
-                    with rasterio.open(file_path) as src:
-                        scale = _OVERVIEW_MAX_DIM / max(src.width, src.height)
-                        ow = max(1, int(src.width * scale))
-                        oh = max(1, int(src.height * scale))
-                        data = src.read(
-                            out_shape=(src.count, oh, ow),
-                            resampling=_Resampling.bilinear)
-                        prof = src.profile.copy()
-                        prof.update(width=ow, height=oh, count=src.count,
-                                    transform=src.transform * src.transform.scale(
-                                        src.width / ow, src.height / oh))
-                    out_dir = os.path.join(tempfile.gettempdir(), "gtai_overview")
-                    os.makedirs(out_dir, exist_ok=True)
-                    digest = hashlib.md5(
-                        f"{file_path}:{mtime}".encode()).hexdigest()[:16]
-                    out_path = os.path.join(out_dir, f"ov_{digest}.tif")
-                    with rasterio.open(out_path, "w", **prof) as dst:
-                        dst.write(data)
-                    del data
-                    with rasterio.open(out_path) as osrc:
-                        ov_z = LayerVisualizer._native_zoom(osrc)
-                    out = out_path
-                    # 概览构建是整幅影像的大块分配（数百 MB~GB 级）：完成后
-                    # 立即把空闲堆归还系统，避免高水位 RSS 长期留存
-                    try:
-                        from core.memtrim import release_rss_memory
-                        release_rss_memory()
-                    except Exception:  # noqa: BLE001 — 归还失败不影响构建
-                        pass
-                except Exception:
-                    out = ""
-                _OVERVIEW_READY[key] = (out, ov_z)
-    if not out or z >= ov_z:
+            if key not in _OVERVIEW_STARTED:
+                _OVERVIEW_STARTED.add(key)
+                threading.Thread(target=_build_overview_async,
+                                 args=(file_path, key, ov_z),
+                                 daemon=True).start()
         return file_path, None
-    return out, ov_z
+    return state, ov_z
 
 
 # 默认地图中心（武汉），未指定项目目录或无法读取时使用
@@ -455,26 +510,53 @@ class LayerVisualizer:
 
     @staticmethod
     def _cached_stats(file_path: str, kind: str, band: int = 1) -> Tuple[float, float]:
-        """读取并缓存全局统计：kind='range' → (min,max)；kind='pct' → (2%,98%)"""
+        """读取并缓存全局统计：kind='range' → (min,max)；kind='pct' → (2%,98%)。
+
+        ⚡ 三级缓存（首载性能）：内存 dict → 磁盘 JSON（进程重启后仍命中）
+        → 现场计算；现场计算走每文件锁双重检查（首屏多瓦片并发时避免
+        重复全图解码），采样 512px（降采样读全图，分位差异视觉无感）。
+        """
         key = (os.path.realpath(file_path), os.path.getsize(file_path),
                os.path.getmtime(file_path), kind, band)
         cached = LayerVisualizer._STATS_CACHE.get(key)
         if cached is not None:
             return cached
-        with contextlib.nullcontext(_open_cached(file_path)) as src:
-            arr = LayerVisualizer._read_sample(src, band)
-        valid = arr[~np.isnan(arr)]
-        if valid.size == 0:
-            result = (0.0, 1.0)
-        elif kind == "range":
-            result = (float(valid.min()), float(valid.max()))
-        elif kind == "rgb":
-            # 真彩色拉伸：兼顾暗部可见与不过曝（1/88 偏亮、2/98 偏暗，取折中）
-            result = (float(np.percentile(valid, 2)), float(np.percentile(valid, 94)))
-        else:
-            result = (float(np.percentile(valid, 2)), float(np.percentile(valid, 98)))
-        LayerVisualizer._STATS_CACHE[key] = result
-        return result
+        with _stats_lock(key):
+            cached = LayerVisualizer._STATS_CACHE.get(key)  # 双重检查
+            if cached is not None:
+                return cached
+            disk = _stats_disk_path(key)
+            if disk:
+                try:
+                    if os.path.isfile(disk):
+                        with open(disk, encoding="utf-8") as fh:
+                            v = json.load(fh)
+                        result = (float(v[0]), float(v[1]))
+                        LayerVisualizer._STATS_CACHE[key] = result
+                        return result
+                except Exception:  # noqa: BLE001 — 磁盘缓存损坏按未命中处理
+                    pass
+            with contextlib.nullcontext(_open_cached(file_path)) as src:
+                arr = LayerVisualizer._read_sample(src, band, max_size=512)
+            valid = arr[~np.isnan(arr)]
+            if valid.size == 0:
+                result = (0.0, 1.0)
+            elif kind == "range":
+                result = (float(valid.min()), float(valid.max()))
+            elif kind == "rgb":
+                # 真彩色拉伸：兼顾暗部可见与不过曝（1/88 偏亮、2/98 偏暗，取折中）
+                result = (float(np.percentile(valid, 2)), float(np.percentile(valid, 94)))
+            else:
+                result = (float(np.percentile(valid, 2)), float(np.percentile(valid, 98)))
+            LayerVisualizer._STATS_CACHE[key] = result
+            if disk:
+                try:
+                    os.makedirs(os.path.dirname(disk), exist_ok=True)
+                    with open(disk, "w", encoding="utf-8") as fh:
+                        json.dump([result[0], result[1]], fh)
+                except Exception:  # noqa: BLE001
+                    pass
+            return result
 
     @staticmethod
     def _colorize_with_range(arr: np.ndarray, vmin: float, vmax: float,
@@ -533,6 +615,53 @@ class LayerVisualizer:
             return bounds, nz
         except Exception:
             return None
+
+    @staticmethod
+    def prewarm_stats(layer_ids, project_dir: str) -> None:
+        """后台预热图层全局统计（地图面板打开时调用）：首瓦片免等首次全图统计。
+
+        每个文件只预热一次（含 mtime 哨兵）；后台线程串行执行；失败静默。
+        覆盖渲染实际用到的 kind：单波段 → range，RGB → rgb。
+        """
+        if not HAS_RASTERIO or not project_dir or not os.path.isdir(project_dir):
+            return
+        jobs = []
+        for lid in layer_ids or []:
+            try:
+                layer_def = next((d for d in LayerVisualizer.LAYER_DEFS
+                                  if d["id"] == lid), None)
+                if layer_def is None:
+                    continue
+                fp = LayerVisualizer._resolve_layer_path(project_dir, layer_def)
+                if fp and os.path.isfile(fp):
+                    jobs.append((fp, layer_def))
+            except Exception:  # noqa: BLE001
+                continue
+        if not jobs:
+            return
+
+        def _run():
+            for fp, layer_def in jobs:
+                try:
+                    with _PREWARM_LOCK:
+                        key = (os.path.realpath(fp), os.path.getmtime(fp))
+                        if key in _PREWARM_STARTED:
+                            continue
+                        _PREWARM_STARTED.add(key)
+                    with contextlib.nullcontext(_open_cached(fp)) as src:
+                        count = int(src.count)
+                    if "bands" in layer_def:
+                        for b in layer_def["bands"]:
+                            if 1 <= int(b) <= count:
+                                LayerVisualizer._cached_stats(fp, "rgb", int(b))
+                    else:
+                        b = int(layer_def.get("band", 1))
+                        if 1 <= b <= count:
+                            LayerVisualizer._cached_stats(fp, "range", b)
+                except Exception:  # noqa: BLE001
+                    continue
+
+        threading.Thread(target=_run, daemon=True).start()
 
     @staticmethod
     def render_layer_tile(layer_id: str, project_dir: str, z: int, x: int, y: int,
