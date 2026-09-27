@@ -100,6 +100,17 @@ export const useProjectStore = defineStore('project', {
       toast.success(trServer(r.message))
     },
 
+    async renameConversation(cid, pid, newTitle) {
+      const toast = useToast()
+      if (!newTitle?.trim()) { toast.error(t('project.enterNewName')); return }
+      const r = await api.post(
+        `/api/conversations/${encodeURIComponent(cid)}/rename`,
+        { project: pid || this.currentProject, title: newTitle.trim() })
+      if (!r.ok) { toast.error(trServer(r.message)); return }
+      await this.bootstrap()
+      toast.success(trServer(r.message))
+    },
+
     async deleteProject(pid) {
       const toast = useToast()
       const r = await api.del(`/api/projects/${encodeURIComponent(pid)}`)

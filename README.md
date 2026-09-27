@@ -34,6 +34,7 @@ Describe your goal in natural language (e.g. *"Downscale land surface temperatur
 | **Role relay visualization** | Avatar chain in the chat bubble shows Planner → Data → Train → Evaluation progress and the current node in real time |
 | **Progress & time estimation** | Live progress and "~N min remaining" make waiting predictable |
 | **Failure self-healing** | Failures are diagnosed automatically and handled within a whitelist (e.g. relax the cloud threshold and retry), logged as "[self-heal]", with experience crystallized across tasks |
+| **Multi-task management** | Submit several tasks at once (queued by the deployment resource budget — "queued" is a normal controlled state); clicking any task card switches the Map / Accuracy / Download / Log panels to that task's results in sync |
 
 ## 🚀 Quick Start
 

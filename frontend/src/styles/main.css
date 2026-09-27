@@ -216,6 +216,10 @@ input[type="password"]::-webkit-credentials-auto-fill-button {
 .conv-item:hover { background: #eef0f5; }
 .conv-item--active { background: var(--primary-soft); color: var(--primary); font-weight: 500; }
 .conv-item__title { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.conv-item__rename {
+  flex: 1; min-width: 0; height: 22px; padding: 0 6px; font-size: 12.5px;
+  border-radius: 4px; border-color: var(--primary);
+}
 .conv-item__del { visibility: hidden; border: none; background: none; color: var(--text-muted); padding: 2px; border-radius: 4px; }
 .conv-item:hover .conv-item__del { visibility: visible; }
 .conv-item__del:hover { color: var(--danger); background: #fdecec; }

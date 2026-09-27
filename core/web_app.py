@@ -3515,6 +3515,33 @@ class AppBackend:
         return {"ok": True, "message": f"项目已重命名为「{new_name}」",
                 "projects": [p["name"] for p in projects]}
 
+    def rename_conversation(self, cid: str, project: str, new_title: str) -> dict:
+        """重命名对话：同步对话 JSON 标题（title 只存于对话文件，即唯一权威源）。
+
+        各引用面的同步关系（实测核对）：
+        - 对话文件 title：本操作更新（侧栏/顶部标题跟随刷新）；
+        - 台账 conversations 表无 title 列、内存态不缓存标题，无需额外同步；
+        - 任务 label 是任务自身的科学身份（由创建时的需求生成），不随对话名变化；
+        - 记忆条目引用的是对话 id（非名字），改名不会破坏记忆关联。
+        """
+        new_title = (new_title or "").strip()
+        if not new_title:
+            return {"ok": False, "message": "请输入新的对话名称"}
+        convs = self.load_conversations()
+        holder = None
+        for pname, items in convs.items():
+            if cid in items and not str(cid).startswith("__"):
+                holder = pname
+                break
+        if holder is None or (project and holder != project):
+            return {"ok": False, "message": "对话不存在"}
+        old_title = str(convs[holder][cid].get("title") or "")
+        if old_title == new_title:
+            return {"ok": True, "message": "名称未变化", "title": new_title}
+        self._update_conversation_file(cid, holder, title=new_title)
+        return {"ok": True, "message": f"对话已重命名为「{new_title}」",
+                "title": new_title}
+
     def delete_project(self, pid: str) -> dict:
         convs = self.load_conversations()
         if pid not in convs:
@@ -5852,6 +5879,13 @@ def delete_project(pid: str):
 @app.post("/api/conversations")
 def create_conversation(payload: dict):
     return backend.create_conversation(payload.get("project", ""), payload.get("title", ""))
+
+
+@app.post("/api/conversations/{cid}/rename")
+def rename_conversation_endpoint(cid: str, payload: dict):
+    body = payload or {}
+    return backend.rename_conversation(
+        cid, str(body.get("project") or ""), str(body.get("title") or ""))
 
 
 @app.delete("/api/conversations/{cid}")

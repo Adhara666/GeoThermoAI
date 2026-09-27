@@ -102,6 +102,32 @@ async function onRenameConfirm() {
   await project.renameProject(pid, renameValue.value.trim())
 }
 
+// ── 对话重命名：点击名称 → 行内编辑 ────────────────────────
+const renamingCid = ref('')
+const renameConvValue = ref('')
+const renameConvInput = ref(null)
+
+function startRenameConv(p, c) {
+  renamingCid.value = c.id
+  renameConvValue.value = c.title
+  nextTick(() => {
+    if (renameConvInput.value) {
+      renameConvInput.value.focus()
+      renameConvInput.value.select()
+    }
+  })
+}
+
+async function onRenameConvConfirm() {
+  const cid = renamingCid.value
+  if (!cid) return
+  renamingCid.value = ''
+  const owner = project.tree.find((p) => (p.conversations || []).some((c) => c.id === cid))
+  const old = (owner?.conversations || []).find((c) => c.id === cid)?.title || ''
+  if (!renameConvValue.value.trim() || renameConvValue.value.trim() === old) return
+  await project.renameConversation(cid, owner?.project || '', renameConvValue.value.trim())
+}
+
 async function onSelectConv(p, c) {
   // 切换项目时 selectProject 会自动加载第一个对话；
   // 已在同项目时直接 selectConv（内部会加载该对话消息/进度/恢复流）
@@ -183,7 +209,22 @@ const hasAny = computed(() => project.tree.length > 0)
               :class="{ 'conv-item--active': c.id === project.currentConv && p.project === project.currentProject }"
               @click="onSelectConv(p, c)"
             >
-              <span class="conv-item__title" :title="c.title">{{ c.title }}</span>
+              <span
+                v-if="renamingCid !== c.id"
+                class="conv-item__title"
+                :title="t('sidebar.renameTitle') + c.title"
+                @click.stop="startRenameConv(p, c)"
+              >{{ c.title }}</span>
+              <input
+                v-else
+                ref="renameConvInput"
+                v-model="renameConvValue"
+                class="form-input conv-item__rename"
+                @keyup.enter="onRenameConvConfirm"
+                @keyup.esc="renamingCid = ''"
+                @blur="onRenameConvConfirm"
+                @click.stop
+              />
               <button class="conv-item__del" :title="t('sidebar.delConvTitle')" @click.stop="openDeleteConv(p, c)">✕</button>
             </div>
             <div v-if="!p.conversations.length" class="project-card__empty">

@@ -212,6 +212,14 @@ docker run -d --name geothermoai -p 7860:7860 \
 
 　　After the task starts, the workbench shows the status of data acquisition, preprocessing, terrain thermal response, model training, thermal constraint correction, product export, and accuracy assessment by stage. The chat bubble shows the agent-role relay, the current executing node, overall progress, and the estimated remaining time in sync. If data are missing or a quality check fails, the pipeline stops at the corresponding stage and explains why — it never continues with placeholder imagery. For failures that can be handled automatically (e.g. no image candidate, network glitches), the system retries per §3.9 and logs a "[self-heal]" line; when automatic handling is not possible, the task card keeps the failed state with suggested actions.
 
+#### 4.4.3 Running multiple tasks at the same time
+
+　　GeoThermoAI supports submitting and tracking several tasks at once: every task has its own progress card in the chat bubble (with its own agent-role relay, progress, and estimated remaining time), and tasks never interfere with each other — each can be paused, resumed, cancelled, or retried independently.
+
+　　Results of multiple tasks are separated by the "task selection" mechanism: click any task card in the "Tasks & Progress" panel (or use the "result selector" dropdown at the top of each panel) to make that task the selected one — the Map, Accuracy, Download, and Log panels switch to that task's results in sync (the selection is remembered per conversation, so conversations never mix). Without a manual selection, the system defaults to the most recent available result; when no artifact exists yet, panels show a hint instead of an empty map.
+
+　　A GeoThermoAI deployment shares one resource budget (CPU, memory, disk, and download connections). When multiple tasks run at once, compute and download nodes are queued under that budget: with the default settings, for example, only one download package is prepared at a time, and the download nodes of other tasks show "queued" and resume automatically once resources are released. Queuing is normal, controlled scheduling — not a hang: each task card shows the current waiting reason (e.g. "queued: prefetch slot limit reached"), and waiting tasks can be paused or cancelled at any time. To raise parallelism, adjust deployment variables such as `GTAI_COMPUTE_JOBS` and `GTAI_DOWNLOAD_JOBS` (see the Deployment document).
+
 ### 4.5 Viewing maps and accuracy
 
 #### 4.5.1 Querying pixel temperatures
