@@ -50,11 +50,18 @@ def _clean_item(item):
 def search(spec, report):
     snapshot, stage = spec["snapshot"], Path(spec["staging_dir"])
     config = values(snapshot)
+    # 自愈放宽云量：节点参数 retry_overrides 覆盖快照值（只改检索阈值，
+    # 不改区域/时间等科学设定）——由调度器自愈流程写入
+    try:
+        overrides = json.loads(spec["node"]["params"]).get("retry_overrides") or {}
+    except Exception:  # noqa: BLE001
+        overrides = {}
+    cloud = overrides.get("cloud_threshold") or config.get("cloud_threshold", 30)
     skill = _skill(snapshot)
     region = region_path(snapshot)
     tr = config.get("time", {})
     result = skill.execute({"region": region, "start_date": tr.get("start"), "end_date": tr.get("end"),
-                            "composite": config.get("product_mode"), "cloud_threshold": config.get("cloud_threshold", 30),
+                            "composite": config.get("product_mode"), "cloud_threshold": cloud,
                             "output_dir": str(stage / "search")}, report, report)
     if not result.success:
         from .transfer import TransferError

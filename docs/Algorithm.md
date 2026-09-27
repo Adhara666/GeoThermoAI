@@ -135,3 +135,13 @@ $$
 　　where $n$ is the number of samples, $i$ is the sample index, $y_i$ is the observed temperature, $\widehat{y}_i$ is the predicted temperature, and $\overline{y}$ is the mean of all observed temperatures. $R^2$ closer to 1 indicates better overall fit; smaller $RMSE$ and $MAE$ indicate lower error; $MB$ close to 0 indicates small overall systematic bias.
 
 　　When gaps are few, the system fills them by distance weighting. When gaps are many, the system estimates in a multi-scale space and restores to the original resolution. Filled values are for continuous display only and do not participate in thermal constraint closure or accuracy claims.
+
+## 5.8 Runtime robustness and failure self-healing
+
+　　Reliability during long pipelines is provided by the task-control layer; the mechanisms are decoupled from the algorithms and change no deterministic computation.
+
+　　The first mechanism is the tuning memory pre-check. After tuning reaches the qualified accuracy (test $R^2 \ge 0.75$) it may still try better parameters, but before each round the memory demand is estimated with the same formula as the scheduler (the larger of the formula estimate and the historical real peak, times a safety factor). If it exceeds the deployment budget, tuning stops automatically and the pipeline continues with the smallest-RMSE round among completed ones; on normal completion the same smallest-RMSE rule is used, keeping one consistent selection criterion.
+
+　　The second is failure diagnosis with whitelisted actions. Node failures are classified by error type (no scene candidate, empty pair candidates, network transfer, resource overrun, data quality, etc.). Handling priority: successful experience of the same class (cards are conditioned on study area, error class, and node type; experience is never applied automatically across study areas) → built-in rules (e.g. automatic retry for network errors, relaxing the cloud threshold by a safe step when no scene candidate exists) → structured LLM diagnosis by the responsible role for long-tail errors that rules cannot cover. Executable actions are restricted to a whitelist — plain retry / relax the retrieval cloud threshold and retry / escalate to the user — and only touch method-level parameters, never study area, time range, or product definition; per-node healing attempts are capped to avoid retry loops.
+
+　　The third is experience crystallization. After each healing action, its outcome (node succeeded, or the same class failed again) is written back to the project-level experience store: successes raise the confidence count, and the same error class is next handled directly from experience — "first time by diagnosis, afterwards by experience" — raising automation without sacrificing determinism.

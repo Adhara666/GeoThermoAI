@@ -58,6 +58,14 @@ def _event(conn, row, event, payload):
                  object_id=row["id"], payload=payload)
 
 
+def _task_event(conn, run, event, payload):
+    """任务汇总状态变化事件（run 行作为载体；前端据此刷新任务卡/气泡进度条）。"""
+    append_event(conn, type=event, user_id=run["user_id"],
+                 conversation_id=run["conversation_id"],
+                 task_id=run["task_id"], run_id=run["id"],
+                 object_type="task", object_id=run["task_id"], payload=payload)
+
+
 def _log_insert(conn, *, user_id, conversation_id, task_id, run_id, text):
     """持久写一条执行日志（task_logs）：跨刷新/重启/中断不丢失。
 
@@ -127,6 +135,13 @@ class Scheduler:
         self._view_lock = threading.RLock()
         self.last_error = None
         self._model_queue = threading.BoundedSemaphore(max(2, self.budget.model_jobs * 4))
+        # 失败自愈（“任务管家”）：独立线程消费失败节点——诊断（经验→规则→
+        # 对口角色 LLM）→ 白名单动作执行（retry / 放宽云量重试 / 转人工）
+        self._heal_queue = queue.Queue()
+        self._heal_count = {}      # node_id -> 已自愈次数（有界）
+        self._heal_seen = set()    # 已投递过的节点（防重复投递）
+        self._heal_pending = {}    # node_id -> 自愈结果待观察信息
+        self.heal_thread = None
         # 界面语言读取器（zh/en）：由 web 层注入，决定生命周期日志的文案语言
         self._lang_lookup = None
 
@@ -183,6 +198,9 @@ class Scheduler:
         log.info("调度器生效预算 %s", asdict(self.budget))
         self.thread = threading.Thread(target=self._loop, name="node-scheduler", daemon=True)
         self.thread.start()
+        self.heal_thread = threading.Thread(target=self._heal_loop,
+                                            name="node-selfheal", daemon=True)
+        self.heal_thread.start()
 
     def notify(self):
         self.wake.set()
@@ -244,6 +262,7 @@ class Scheduler:
                     self._refresh()
                     if not self.stopping.is_set():
                         self._dispatch_ready()
+                    self._submit_failures_for_heal()
                 self.last_error = None
             except Exception as e:
                 self.last_error = str(e)
@@ -301,7 +320,8 @@ class Scheduler:
                     # 用户暂停优先于常规推导；但不掩盖“刚好全部完成”
                     status = ("completed" if all(s == "succeeded" for s in states)
                               else "paused")
-                elif "running" in states:
+                elif "running" in states or "committing" in states:
+                    # 提交中同样视为执行中（否则会被错推为 queued“排队中”）
                     status = "running"
                 elif "waiting_input" in states:
                     status = "awaiting_info"
@@ -316,6 +336,9 @@ class Scheduler:
                 conn.execute("UPDATE runs SET status=?,updated_at=? WHERE id=? AND status<>?", (status, utcnow_iso(), run["id"], status))
                 if run["current_run_id"] == run["id"] and run["summary_status"] != status:
                     conn.execute("UPDATE tasks SET summary_status=?,version=version+1,updated_at=? WHERE id=?", (status, utcnow_iso(), run["task_id"]))
+                    # 任务汇总状态变化写事件：前端据此刷新任务卡/气泡进度条
+                    # （否则恰好错过快照拉取时会停在旧状态，如“排队中”）
+                    _task_event(conn, run, "task.state", {"status": status})
                     # 任务总体完成/失败：持久一条汇总日志（用户实测：失败与完成
                     # 必须在日志里可见，且不因刷新/重启消失）
                     if status in ("completed", "failed"):
@@ -402,6 +425,268 @@ class Scheduler:
             pass
         return {}, ""
 
+    # ── 失败自愈（“任务管家”）：诊断器 → 白名单动作 → 经验结晶 ──────
+
+    def _submit_failures_for_heal(self):
+        """把“近 60 分钟内失败的当前运行节点”投递给自愈线程（去重、有界）。"""
+        from . import recovery as _r
+        try:
+            ids = self.store.read(lambda c: c.execute(
+                "SELECT n.id FROM nodes n JOIN runs r ON r.id = n.run_id"
+                " JOIN attempts a ON a.node_id = n.id AND a.status = 'failed'"
+                " WHERE n.status = 'failed'"
+                " AND a.finished_at >= datetime('now', '-60 minutes')"
+                " GROUP BY n.id ORDER BY MAX(a.rowid) DESC LIMIT 5").fetchall())
+        except Exception:  # noqa: BLE001 — 自愈巡检失败不影响调度
+            return
+        for (nid,) in ids:
+            if self._heal_count.get(nid, 0) >= _r.MAX_HEAL_PER_NODE:
+                continue
+            if nid in self._heal_seen:
+                continue
+            found = self.store.read(lambda c: self._node_rows(c, "n.id = ?", (nid,)))
+            if not found or not self._valid(found[0]):
+                continue
+            self._heal_seen.add(nid)
+            self._heal_queue.put(found[0])
+
+    def _heal_loop(self):
+        """自愈消费线程：新失败 → 诊断/执行；定期结算经验（成功/失败回填）。"""
+        last_resolve = 0.0
+        while not self.stopping.is_set():
+            try:
+                row = self._heal_queue.get(timeout=1.0)
+            except queue.Empty:
+                row = None
+            if row is not None:
+                try:
+                    self._heal_node(row)
+                except Exception:  # noqa: BLE001
+                    log.exception("自愈处理失败（忽略，不影响调度）")
+            now = time.monotonic()
+            if now - last_resolve >= 20:
+                last_resolve = now
+                try:
+                    self._resolve_heals()
+                except Exception:  # noqa: BLE001
+                    log.exception("自愈结算失败（忽略）")
+
+    def _resolve_heals(self):
+        """结算：重跑的节点成功了 → 经验置信 +1；又失败了 → 记一次失败。"""
+        from . import recovery as _r
+        for node_id in list(self._heal_pending.keys()):
+            info = self._heal_pending.get(node_id) or {}
+            row = self.store.read(lambda c: c.execute(
+                "SELECT status FROM nodes WHERE id = ?", (node_id,)).fetchone())
+            if not row:
+                self._heal_pending.pop(node_id, None)
+                continue
+            status = str(row[0] or "")
+            store_x = _r.ExperienceStore(str(info.get("path") or ""))
+            if status == "succeeded":
+                store_x.resolve(node_id, "success")
+                self._heal_pending.pop(node_id, None)
+                self._heal_note(info, "自愈成功：节点已恢复执行并完成")
+            elif status == "failed":
+                cur = self.store.read(lambda c: c.execute(
+                    "SELECT MAX(attempt_no) FROM attempts WHERE node_id = ?",
+                    (node_id,)).fetchone())
+                cur_no = int((cur[0] if cur else 0) or 0)
+                if cur_no > int(info.get("attempt_no") or 0):
+                    store_x.resolve(node_id, "failed")
+                    self._heal_pending.pop(node_id, None)
+                    self._heal_note(info, "自愈未奏效：同类问题再次出现，已转人工建议")
+
+    def _heal_note(self, info, text):
+        """自愈播报（日志行 + 调度唤醒）。"""
+        try:
+            self._log_raw(info.get("row") or {}, "[自愈] " + text)
+        except Exception:  # noqa: BLE001
+            pass
+        self.notify()
+
+    def _heal_node(self, row):
+        """自愈一个失败节点（有界）：诊断（经验→规则→角色LLM）→ 白名单动作。"""
+        from . import recovery as _r
+        node_id, nt = row["id"], row["node_type"]
+        if self._heal_count.get(node_id, 0) >= _r.MAX_HEAL_PER_NODE:
+            return
+        try:
+            err = self.store.read(lambda c: c.execute(
+                "SELECT error, error_kind FROM attempts WHERE node_id = ?"
+                " ORDER BY rowid DESC LIMIT 1", (node_id,)).fetchone())
+            error_text = str((err[0] if err else "") or "")
+            error_kind = str((err[1] if err else "") or "")
+            snap = decode(row["frozen_inputs"]).get("snapshot") or {}
+            region = self._snapshot_region(snap)
+            month = self._snapshot_month(snap)
+            store_x = _r.ExperienceStore(str(self._recovery_path(row)))
+            diag = _r.diagnose(region=region, node_type=nt,
+                               error_kind=error_kind, error_text=error_text,
+                               experiences=store_x, month=month)
+            # 未命中 → 叫醒对口角色（第一次靠脑子）
+            if diag.get("need_llm"):
+                assistant = self._user_assistant(row["user_id"])
+                llm = None
+                if assistant is not None:
+                    try:
+                        with self.model_request():
+                            llm = _r.llm_diagnose(
+                                assistant, role=diag.get("role") or "data",
+                                node_type=nt, error_class=diag["error_class"],
+                                error_text=error_text, region=region)
+                    except Exception:  # noqa: BLE001
+                        llm = None
+                if llm:
+                    diag.update(action=llm["action"], source="llm",
+                                reason=llm.get("reason") or diag.get("reason", ""))
+            action = str(diag.get("action") or "escalate")
+            cls_label = _r.class_label(diag["error_class"])
+            # 自愈前尝试号（供结算判断“是否又失败”）
+            att = self.store.read(lambda c: c.execute(
+                "SELECT COALESCE(MAX(attempt_no), 0) FROM attempts WHERE node_id = ?",
+                (node_id,)).fetchone())
+            attempt_no = int((att[0] if att else 0) or 0)
+            # ── 执行（白名单）────────────────────────────────────
+            if action == "retry":
+                self.retry(node_id, row["user_id"])
+                act_text = "已自动重试"
+            elif action == "retry_cloud_plus":
+                new_cloud = self._apply_cloud_override(row, snap)
+                self.retry(node_id, row["user_id"])
+                act_text = f"已放宽云量阈值到 {new_cloud} 并重试"
+            else:
+                # escalate：不自动动；诊断写入日志（失败卡已展示建议）
+                self._log_raw(row, f"[自愈] 诊断：{cls_label}；"
+                                   f"{diag.get('reason') or ''}（需你决定下一步）")
+                self.notify()
+                return
+            # ── 记账 + 经验 + 播报 ───────────────────────────────
+            self._heal_count[node_id] = self._heal_count.get(node_id, 0) + 1
+            store_x.add_pending(region=region, error_class=diag["error_class"],
+                                node_type=nt, action=action, params={},
+                                node_id=node_id, month=month)
+            self._heal_pending[node_id] = {
+                "path": str(self._recovery_path(row)), "row": row,
+                "attempt_no": attempt_no,
+            }
+            src = {"rule": "规则", "experience": "经验", "llm": "角色诊断"}.get(
+                str(diag.get("source") or ""), "规则")
+            self._log_raw(row, f"[自愈] {cls_label}：{diag.get('reason') or ''}"
+                               f"（依据：{src}）→ {act_text}")
+            self.notify()
+        except Exception:  # noqa: BLE001
+            log.exception("自愈节点处理异常（忽略）")
+
+    # ── 自愈辅助 ──────────────────────────────────────────────
+
+    def _snapshot_region(self, snap):
+        try:
+            from core.agent.understanding.slotbook import SlotBook
+            return str(SlotBook(snap.get("slot_values") or {}).value("region") or "")
+        except Exception:  # noqa: BLE001
+            return ""
+
+    def _snapshot_month(self, snap):
+        try:
+            t = ((snap.get("params") or {}).get("time") or {}).get("value") or {}
+            return str(t.get("start") or "")[:7]
+        except Exception:  # noqa: BLE001
+            return ""
+
+    def _snapshot_cloud(self, snap):
+        try:
+            return ((snap.get("params") or {}).get("cloud_threshold") or {}).get("value")
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _recovery_path(self, row):
+        """项目级经验库路径：users/{uid}/memory/projects/{pid}/recovery.json。"""
+        pid = self.store.read(lambda c: c.execute(
+            "SELECT project_id FROM conversations WHERE id = ?",
+            (row["conversation_id"],)).fetchone())
+        pid = str((pid[0] if pid else "") or "default")
+        path = (self.users_root / str(row["user_id"] or "default")
+                / "memory" / "projects" / pid)
+        path.mkdir(parents=True, exist_ok=True)
+        return path / "recovery.json"
+
+    def _apply_cloud_override(self, row, snap) -> int:
+        """把“放宽后的云量阈值”写进节点参数（retry_overrides），供检索节点读取。"""
+        from . import recovery as _r
+        new_cloud = _r.cloud_override(self._snapshot_cloud(snap))
+        row_id = row["id"]
+
+        def tx(conn):
+            cur = conn.execute("SELECT params FROM nodes WHERE id = ?",
+                               (row_id,)).fetchone()
+            params = {}
+            try:
+                params = json.loads((cur[0] if cur else "") or "{}")
+            except (ValueError, TypeError):
+                params = {}
+            overrides = dict(params.get("retry_overrides") or {})
+            overrides["cloud_threshold"] = new_cloud
+            params["retry_overrides"] = overrides
+            conn.execute("UPDATE nodes SET params = ? WHERE id = ?",
+                         (json.dumps(params, ensure_ascii=False), row_id))
+            return True
+
+        self.store.submit_write(tx)
+        return new_cloud
+
+    def _user_assistant(self, user_id):
+        """按用户设置构造一次性 assistant（自愈诊断用；失败返回 None）。"""
+        from core.ai_assistant import GeoThermoAI_Assistant
+        try:
+            cfg = json.loads((self.users_root / str(user_id or "default")
+                              / "settings.json").read_text(encoding="utf-8"))
+            api = cfg.get("api") or {}
+            if not api.get("model_id"):
+                return None
+            return GeoThermoAI_Assistant(**{
+                k: api[k] for k in ("model_type", "api_key", "api_base_url",
+                                    "model_id", "api_format") if k in api})
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _degrade_rf_round(self, row, reason) -> bool:
+        """追加调优轮 rf_round 被静态预算拒绝时的优雅降级（失败自愈）。
+
+        同一运行已有成功的 rf_round（首轮/前几轮）时，把本节点按“跳过”
+        处理：沿用上一轮的 result（下游 context 与“上一轮成功”完全一致），
+        让 train_decision / promote_best 继续——避免整个任务因调优贪心
+        多试的一轮（内存超预算）而失败。
+        """
+        if row["node_type"] != "rf_round":
+            return False
+        try:
+            def tx(conn):
+                prev = conn.execute(
+                    "SELECT result FROM nodes WHERE run_id=? AND node_type='rf_round'"
+                    " AND status='succeeded' ORDER BY rowid DESC LIMIT 1",
+                    (row["run_id"],)).fetchone()
+                if not prev:
+                    return False
+                conn.execute(
+                    "UPDATE nodes SET status='succeeded', wait_reason=NULL,"
+                    " result=COALESCE(result, ?) WHERE id=?",
+                    (prev[0], row["id"]))
+                _event(conn, row, "node.skipped",
+                       {"reason": reason or "",
+                        "note": "下一轮模型规模超出部署内存上限，沿用上一轮结果"})
+                _log_insert(conn, user_id=row["user_id"],
+                            conversation_id=row["conversation_id"],
+                            task_id=row["task_id"], run_id=row["run_id"],
+                            text="[rf_round] 下一轮模型规模超出部署内存上限，"
+                                 "已跳过该轮并沿用上一轮训练结果继续")
+                return True
+
+            return bool(self.store.submit_write(tx))
+        except Exception as e:
+            log.warning("调优轮降级失败（按普通失败处理）: %s", e)
+            return False
+
     def _dispatch_ready(self):
         candidates = self.store.read(lambda c: self._node_rows(c, "n.status IN ('ready','waiting_resource')"))
         eligible = []
@@ -429,9 +714,10 @@ class Scheduler:
                 eligible.append((row, claim, context))
             else:
                 # 静态上限不满足（预估需求本身超过部署预算）：等待无意义，
-                # 直接判失败并给出处置建议；其余情况排队等待
+                # 先尝试“追加调优轮”优雅降级（沿用上一轮）；否则判失败。
                 if self.ledger.static_block(claim):
-                    self._fail_static(row, reason)
+                    if not self._degrade_rf_round(row, reason):
+                        self._fail_static(row, reason)
                 else:
                     self._wait_resource(row, reason)
         # 逐个派发并立即更新账本，每个计算机会只统计当时确实能执行的同优先级任务。
@@ -447,7 +733,8 @@ class Scheduler:
             ok, reason = self.ledger.can_fit(claim)
             if not ok:
                 if self.ledger.static_block(claim):
-                    self._fail_static(row, reason)
+                    if not self._degrade_rf_round(row, reason):
+                        self._fail_static(row, reason)
                 else:
                     self._wait_resource(row, reason)
                 continue
@@ -538,11 +825,24 @@ class Scheduler:
         self.ledger.claims[aid] = claim  # 已用最新读数通过准入并原子持久预留
         parent, child = self.ctx.Pipe(duplex=True)
         cancel = self.ctx.Event()
+        # 调优内存预检（失败自愈）：train_decision 需要“预算 + 同任务 rf_round
+        # 历史真实峰值”，用于在“再试一轮”前预估下一轮内存（与派发判定同口径）
+        rf_peak = 0.0
+        if row["node_type"] == "train_decision":
+            try:
+                rf_peak = float(self.store.read(lambda c: c.execute(
+                    "SELECT COALESCE(MAX(a.peak_memory_bytes), 0) FROM attempts a"
+                    " JOIN nodes n ON n.id = a.node_id WHERE n.node_type = 'rf_round'"
+                    " AND n.run_id IN (SELECT id FROM runs WHERE task_id = ?)",
+                    (row["task_id"],)).fetchone()[0]) or 0)
+            except Exception:
+                rf_peak = 0.0
         spec = {"attempt_id": aid, "authorization": authorization, "batch": self.batch,
                 "task_version": row["task_version"], "node": row, "staging_dir": str(stage),
                 "snapshot": decode(row["frozen_inputs"])["snapshot"], "context": context,
                 "claim": asdict(claim), "disk_margin": self.budget.disk_margin,
                 "cache_root": str(self.root / "cache"), "cache_limit": self.budget.disk_cache,
+                "budget": asdict(self.budget), "rf_peak": rf_peak,
                 # 运行时交互模式（不随编译冻结）：“完全执行”下暂停点自动代选
                 "runtime_exec_mode": self._runtime_exec_mode(row)}
         if self.handler:
@@ -1104,6 +1404,11 @@ class Scheduler:
                                  self._context(node), self.budget, peak)
                 ok, reason = self.ledger.can_fit(claim)
                 if not ok and self.ledger.static_block(claim):
+                    # 追加调优轮 rf_round：不重试而是优雅跳过（沿用上一轮
+                    # 结果），让任务继续——与派发侧降级同一条路（失败自愈）。
+                    if self._degrade_rf_round(node, reason):
+                        self.notify()
+                        return "degraded"
                     raise ValueError(reason)
             except ValueError:
                 raise

@@ -31,6 +31,9 @@ Describe your goal in natural language (e.g. *"Downscale land surface temperatur
 | **Interactive map thermometry** | Pixel-level Kelvin query on 30 m / 10 m layers, cursor locking, opacity control |
 | **Project-level memory** | Structured + RAG dual-track memory; tasks continue across conversations, past experience is reused |
 | **Result Q&A** | Ask questions about existing results: place identification (*"Where is this?"*), region / picked-point temperature statistics |
+| **Role relay visualization** | Avatar chain in the chat bubble shows Planner → Data → Train → Evaluation progress and the current node in real time |
+| **Progress & time estimation** | Live progress and "~N min remaining" make waiting predictable |
+| **Failure self-healing** | Failures are diagnosed automatically and handled within a whitelist (e.g. relax the cloud threshold and retry), logged as "[self-heal]", with experience crystallized across tasks |
 
 ## 🚀 Quick Start
 
@@ -87,6 +90,7 @@ Data acquisition → Preprocessing → Terrain thermal response (TTRI) → Rando
 - **Data sources**: Microsoft Planetary Computer (Landsat 8/9 L2) and Copernicus Data Space (Sentinel-2 L2A, GLO-30 DEM), with automatic search, download, caching, and fallback;
 - **Temperature source**: Landsat 30 m LST provides the coarse-scale thermal reference; Sentinel-2 provides 10 m spatial detail; Random Forest plus thermal-constraint residual correction yields the 10 m estimate (preserving the 30 m parent-cell mean constraint);
 - **Result Q&A**: numerical statistics are computed in code; the LLM only phrases them — **numbers by program, words by model**.
+- **Runtime safeguards**: tuning memory pre-check with robust finishing, and failure self-healing (diagnosis → whitelisted action → experience crystallization) are implemented by the task-control layer without changing the deterministic algorithms.
 
 Technical details: [Algorithm Principles](docs/Algorithm.md); for setup and usage, see the [User Guide](docs/User-Guide.md).
 

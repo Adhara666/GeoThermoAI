@@ -165,7 +165,39 @@ def _train_decision(spec, context, report):
     context.update(rounds=train.rounds, train_state=persisted)
     if result.action == StepDecision.RETRY:
         params_new = {k: v for k, v in result.new_params.items() if k in ("n_estimators", "max_depth", "min_samples_split", "min_samples_leaf", "max_features", "random_state")}
-        decision = {"action": "adjust", "new_params": params_new, "reason": result.reason}
+        # ── 资源护栏预检（失败自愈）：下一轮 rf_round 的内存预估若超过应用
+        #    预算（与派发判定同口径：公式与历史真实峰值取大、乘安全系数），
+        #    自动停止调优、采用当前最佳模型——否则新轮会被调度器整轮拒绝，
+        #    导致整个任务失败（用户实测：600→900 棵时 20.1G > 18.8G 预算）。
+        blocked_by_budget = False
+        if spec.get("budget"):
+            try:
+                from types import SimpleNamespace as _SNS
+
+                from .resources import estimate as _estimate
+                budget = _SNS(**spec["budget"])
+                rf_cur = ((spec["snapshot"].get("params") or {}).get("rf_params") or {}).get("value") or {}
+                rf_next = {**rf_cur, **{k: v for k, v in params_new.items() if v is not None}}
+                probe = _estimate(
+                    "rf_round",
+                    {"params": {"rf_params": {"value": rf_next}}},
+                    {"scale": context.get("scale") or {}},
+                    budget, history_peak=float(spec.get("rf_peak") or 0))
+                if probe.memory > budget.memory:
+                    blocked_by_budget = True
+            except Exception:  # noqa: BLE001 — 预检失败不阻塞调优
+                blocked_by_budget = False
+        if blocked_by_budget:
+            report("下一轮模型规模超出部署内存上限，已自动停止调优，"
+                   "采用当前最佳模型继续\n")
+            best = getattr(train, "selected", None) or train_rules.best_round(train.rounds)
+            if not best:
+                raise ValueError("没有可以采用的有效模型轮次")
+            context["best_round"] = best
+            decision = {"action": "accept",
+                        "reason": "达到部署内存上限，自动采用当前最佳模型"}
+        else:
+            decision = {"action": "adjust", "new_params": params_new, "reason": result.reason}
     else:
         best = getattr(train, "selected", None) or train_rules.best_round(train.rounds)
         if not best:

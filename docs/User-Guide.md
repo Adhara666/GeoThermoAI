@@ -34,6 +34,8 @@
   </tbody>
 </table>
 
+　　During execution, GeoThermoAI presents the role relay directly: the "Agent Roles" area of the task card shows a chain of avatars for Planner → Data → Train → Evaluation with their states (done / working / waiting), a human-readable line underneath ("Working now: Data · Data & QC — current step 'Scene candidates'"), along with overall progress (e.g. 9/15), the estimated remaining time, and the latest completed node — so you can see which role is active and how far the task has gone without opening the log.
+
 ### 3.3 Chat and Work dual mode
 
 　　Inspired by the "Chat / Work" dual mode of the ChatGPT desktop app and the "Ask / Agent" dual mode of the Qoder desktop editor, this design draws a clear execution boundary for different conversational tasks, keeping them targeted and controllable.
@@ -99,6 +101,18 @@
 <div align="center"><b>Figure 2. 10 m land surface temperature around Wuhan Railway Station (cursor lock off)</b></div>
 
 　　The final accuracy panel simultaneously shows the image dates, valid-pixel count, test-area accuracy, 30 m reference range, and 10 m result range, helping you judge the usability of the temperatures.
+
+### 3.9 Runtime safeguards: estimation, self-healing, and robust finishing
+
+　　GeoThermoAI provides four reliability safeguards during execution.
+
+　　(1) Time estimation. The task card shows "~N min remaining", computed from historical node durations and the remaining node set, and updated as the run progresses, so waiting is predictable.
+
+　　(2) Historical parameter recommendation. When a high-quality past task exists for the same study area within the project, the system retrieves the best historical parameters (ranked by test-area R²) and applies them automatically while you are still on the default training parameters, noting the basis in the chat bubble (e.g. "Using the best parameters from 2 similar past task(s) (n_estimators=400, best R² 0.81)"). Your own parameter settings always take precedence and are never overwritten.
+
+　　(3) Failure self-healing. When a node fails, the system diagnoses automatically: it first matches a handling strategy by error class (e.g. relaxing the cloud threshold and retrying when no image candidate exists; retrying transient network failures), calls the responsible role's LLM for structured diagnosis when rules cannot cover the case, and always acts within a whitelist (retry / relax the retrieval threshold / escalate to you) without touching scientific settings such as study area or time. Every self-healing action is logged in the live log with a "[self-heal]" tag stating its basis (rule / experience / role diagnosis); when healing does not help or a decision is required, the task card keeps the failed state with an actionable suggestion (e.g. "retry with another image pair or a relaxed cloud threshold"). When the same error recurs, the system first reuses previously verified successful experience (conditioned on study area and error class; experience is never applied automatically across study areas).
+
+　　(4) Robust tuning finish. After reaching the qualified accuracy (test R² ≥ 0.75), tuning may still try better parameters, but every round first runs a memory pre-check: if the next round's model size would exceed the deployment memory budget, the system stops tuning automatically and continues the pipeline with the smallest-RMSE model among completed rounds, so a task never dies from over-ambitious tuning; on normal completion the same smallest-RMSE round is used as the final result, keeping one consistent selection criterion.
 
 ## 2. Getting Started and Online Experience
 
@@ -196,7 +210,7 @@ docker run -d --name geothermoai -p 7860:7860 \
 
 #### 4.4.2 Watching the run status
 
-　　After the task starts, the workbench shows the status of data acquisition, preprocessing, terrain thermal response, model training, thermal constraint correction, product export, and accuracy assessment by stage. If data are missing or a quality check fails, the pipeline stops at the corresponding stage and explains why — it never continues with placeholder imagery.
+　　After the task starts, the workbench shows the status of data acquisition, preprocessing, terrain thermal response, model training, thermal constraint correction, product export, and accuracy assessment by stage. The chat bubble shows the agent-role relay, the current executing node, overall progress, and the estimated remaining time in sync. If data are missing or a quality check fails, the pipeline stops at the corresponding stage and explains why — it never continues with placeholder imagery. For failures that can be handled automatically (e.g. no image candidate, network glitches), the system retries per §3.9 and logs a "[self-heal]" line; when automatic handling is not possible, the task card keeps the failed state with suggested actions.
 
 ### 4.5 Viewing maps and accuracy
 

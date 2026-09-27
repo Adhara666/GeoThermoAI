@@ -1087,8 +1087,53 @@ class AppBackend:
         if note:
             # 直接接在数据行后成段（不出现“AI 解读”前缀）
             content += "\n\n" + note
+        fu = self._completion_followups(uid, task_id, data)
+        if fu:
+            content += "\n\n" + fu
         from core.scheduling.scheduler import strip_emoji
         return strip_emoji(content)
+
+    def _completion_followups(self, uid: str, task_id: str, data: dict) -> str:
+        """完成报告的「后续可做」段（②反思回环 + ⑤主动建议，规则生成）。
+
+        - 与记忆对比：同项目同区域历史最优 R² 显著高于本次时提示调参对照；
+        - 主动建议：时间对比分析（可执行、无技术词）。
+        无内容时返回空串（不输出空段）。
+        """
+        zh = self._user_lang(uid) == "zh"
+        lines = []
+        # 1) 反思回环：同区域历史最优对比（仅当明显更优时提示）
+        try:
+            row = self._get_state_store().read(lambda c: c.execute(
+                "SELECT slots, conversation_id FROM tasks WHERE id=?",
+                (task_id,)).fetchone())
+            m = (data.get("metrics") or {}).get("metrics") or {}
+            cur_r2 = m.get("R2")
+            if row and isinstance(cur_r2, (int, float)):
+                from core.agent.understanding.slotbook import SlotBook
+                region = str(SlotBook(json.loads(row[0] or "{}")).value("region") or "")
+                conv_row = self._get_state_store().read(lambda c: c.execute(
+                    "SELECT project_id FROM conversations WHERE id=?",
+                    (row[1],)).fetchone())
+                pid = conv_row[0] if conv_row else ""
+                rec = self._recommend_rf_params(str(pid), region, uid) if pid else None
+                if rec and rec["r2"] > cur_r2 + 0.01:
+                    lines.append(
+                        f"同区域历史最优 R² 为 {rec['r2']:.2f}（本次 {cur_r2:.2f}），"
+                        f"可调整训练参数后重跑对照" if zh else
+                        f"Best historical R² for this region is {rec['r2']:.2f} "
+                        f"(this run {cur_r2:.2f}); retune and re-run for comparison")
+        except Exception:  # noqa: BLE001 — 对比失败不阻塞报告
+            pass
+        # 2) 主动建议（总是可执行的时对比）
+        lines.append("可继续做相邻月份或同月不同年份的对比分析（在对话里直接说明时间段即可）"
+                     if zh else
+                     "You can compare adjacent months or the same month across years "
+                     "(just state the period in the chat)")
+        if not lines:
+            return ""
+        return ("> 后续可做：" + "；".join(lines) if zh else
+                "> Next steps: " + "; ".join(lines))
 
     def _compose_round_note(self, outcome) -> str:
         """该轮“处理摘要”（真实理解与动作，非模型推理文本）。
@@ -1358,6 +1403,111 @@ class AppBackend:
         except Exception:
             return ""
 
+    # ── 参数推荐（记忆顾问化）：同区域历史最优 RF 参数 ──────────
+    _DEFAULT_MODEL_VALUES = {"n_estimators": 200, "max_depth": 25,
+                             "min_samples_split": 16, "min_samples_leaf": 8}
+
+    def _is_default_model(self, model: dict) -> bool:
+        """用户是否仍在使用出厂默认训练参数（是 → 可采用历史推荐）。"""
+        m = model or {}
+        return all(m.get(k) == v for k, v in self._DEFAULT_MODEL_VALUES.items())
+
+    def _recommend_rf_params(self, project_id: str, region: str,
+                             uid: str = "") -> Optional[dict]:
+        """从记忆（workflows.json）检索同区域历史最优训练参数（只读，不初始化记忆管理器）。
+
+        数据源：users/{uid}/memory/projects/{pid}/workflows.json（v1/v2 兼容）；
+        uid 由调用方显式传入（后台线程的请求上下文不可靠，不能依赖 _uid()）。
+        返回 {"params": {...}, "r2": 最优R², "n": 参考记录数, "note": 追溯句}。
+        """
+        uid = uid or self._uid()
+        if not project_id or not region:
+            return None
+        path = (self.deployment.users_root / uid / "memory"
+                / "projects" / str(project_id) / "workflows.json")
+        try:
+            records = json.loads(path.read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001 — 无记忆/文件坏：无推荐
+            return None
+        if not isinstance(records, list):
+            return None
+        cands = []
+        for r in records:
+            if not isinstance(r, dict):
+                continue
+            r_region = str(r.get("region") or "")
+            if not r_region or (region not in r_region and r_region not in region):
+                continue
+            try:
+                r2 = float((r.get("metrics") or {}).get("test_r2"))
+            except (TypeError, ValueError):
+                continue
+            params = r.get("final_params") or {}
+            picked = {k: params.get(k) for k in self._DEFAULT_MODEL_VALUES
+                      if params.get(k) is not None}
+            if not picked.get("n_estimators"):
+                continue
+            cands.append((r2, picked))
+        if not cands:
+            return None
+        cands.sort(key=lambda x: -x[0])
+        best_r2, best_params = cands[0]
+        n = len(cands)
+        zh = self._user_lang(uid) == "zh"
+        note = (f"已参考 {n} 个相似历史任务的最优参数"
+                f"（决策树数量 {best_params.get('n_estimators')}，历史最优 R² {best_r2:.2f}）"
+                if zh else
+                f"Using the best parameters from {n} similar past task(s) "
+                f"(n_estimators={best_params.get('n_estimators')}, best R² {best_r2:.2f})")
+        return {"params": best_params, "r2": best_r2, "n": n, "note": note}
+
+    # ── 失败自愈建议（根因 → 策略；首版为规则表） ──────────────────
+    _RECOVERY_HINTS = {
+        "search_scene": ("可放宽云量上限或扩大时间范围后重试",
+                         "Retry after relaxing the cloud threshold or widening the time range"),
+        "select_scene": ("可重新选择影像组合或放宽云量后重试",
+                         "Retry with another image pair or a relaxed cloud threshold"),
+        "acquire_asset": ("多为网络波动：点“重试”从断点继续即可",
+                          "Usually a network issue: click “Retry” to resume from the breakpoint"),
+        "prepare_local": ("建议重试；若反复失败请检查原始数据完整性",
+                          "Retry; if it keeps failing, check the raw data integrity"),
+        "data_check": ("建议重试；若反复失败请检查原始数据完整性",
+                       "Retry; if it keeps failing, check the raw data integrity"),
+        "preprocess_split": ("建议重试；若反复失败可检查下载数据是否完整",
+                             "Retry; if it keeps failing, verify the downloaded data"),
+        "prep_check": ("建议重试；若反复失败可检查下载数据是否完整",
+                       "Retry; if it keeps failing, verify the downloaded data"),
+        "ttri": ("建议重试；若反复失败可缩小研究区范围",
+                 "Retry; if it keeps failing, try a smaller study area"),
+        "ttri_check": ("建议重试；若反复失败可缩小研究区范围",
+                       "Retry; if it keeps failing, try a smaller study area"),
+        "rf_round": ("建议重试；若反复失败可减少决策树数量或缩小研究区",
+                     "Retry; if it keeps failing, reduce the tree count or the area"),
+        "train_decision": ("建议重试；若反复失败可减少决策树数量",
+                           "Retry; if it keeps failing, reduce the tree count"),
+        "promote_best": ("建议重试", "Retry"),
+        "tcr": ("建议重试；若反复失败请查看日志定位具体错误",
+                "Retry; if it keeps failing, check the log for details"),
+        "export": ("建议重试；请确认磁盘空间充足",
+                   "Retry; make sure there is enough disk space"),
+        "closure_eval": ("建议重试；若反复失败请查看日志定位具体错误",
+                         "Retry; if it keeps failing, check the log for details"),
+        "gapfill": ("建议重试；若反复失败请确认主产品仍然可用",
+                    "Retry; if it keeps failing, verify the main product still exists"),
+    }
+
+    def _recovery_suggestion(self, nodes: list, zh: bool) -> str:
+        """失败节点的根因→策略建议（规则表；未命中给通用建议）。"""
+        failed = [n for n in nodes if n.get("status") == "failed"]
+        if not failed:
+            failed = [n for n in nodes if n.get("status") == "blocked"]
+        key = str((failed[-1] if failed else {}).get("type") or "")
+        pair = self._RECOVERY_HINTS.get(key)
+        if pair is None:
+            return ("可在任务面板点“重试”从断点继续" if zh else
+                    "Click “Retry” in the task panel to resume from the breakpoint")
+        return pair[0] if zh else pair[1]
+
     def _enqueue_ready(self, task_rows, exec_mode=None):
         from core.planning.compiler import compile_task_tx
         from core.planning.replan import start_superseding_run_tx
@@ -1387,6 +1537,22 @@ class AppBackend:
                     project_dir = str(self._conv_project_dir(conv_row[1], conv_row[0]))
                     run_label = (task.get("label") or "").strip() or "运行"
                 current = rows(conn, "SELECT * FROM runs WHERE id=?", (task.get("current_run_id"),))
+                # 参数推荐（记忆顾问化）：用户仍用出厂默认训练参数时，
+                # 采用同区域历史最优参数（仅入本轮编译快照，不改用户设置）
+                _pnote = ""
+                _local = settings
+                if conv_row:
+                    try:
+                        from core.agent.understanding.slotbook import SlotBook
+                        _region = str(SlotBook(task.get("slots") or {}).value("region") or "")
+                        _rec = self._recommend_rf_params(str(conv_row[1]), _region, uid)
+                        if _rec and self._is_default_model(settings.get("model") or {}):
+                            _local = {**settings,
+                                      "model": {**dict(settings.get("model") or {}),
+                                                **_rec["params"]}}
+                            _pnote = _rec["note"]
+                    except Exception:  # noqa: BLE001 — 推荐失败不影响编译
+                        _pnote, _local = "", settings
                 if candidate.get("postprocess"):
                     # 结果后处理续跑：同一任务下只含 gapfill 节点的运行；
                     # 已有未完成的同类续跑直接复用，避免重复编译
@@ -1423,14 +1589,18 @@ class AppBackend:
                         continue
                     made = start_superseding_run_tx(
                         conn, task_id=tid, expected_task_version=task["version"],
-                        settings=settings,
+                        settings=_local,
                         replan_max=int(snap.get("params", {}).get("replan_max", {}).get("value", 3)),
                         reason="用户修改科学身份字段",
                         project_dir=project_dir, run_label=run_label)
+                    if _pnote:
+                        made["param_note"] = _pnote
                     compiled.append(made)
                     continue
-                made = compile_task_tx(conn, task_id=tid, expected_task_version=task["version"], settings=settings,
+                made = compile_task_tx(conn, task_id=tid, expected_task_version=task["version"], settings=_local,
                                        project_dir=project_dir, run_label=run_label)
+                if _pnote:
+                    made["param_note"] = _pnote
                 if current:
                     conn.execute("UPDATE runs SET superseded_by=?,cancel_requested=1 WHERE id=?", (made["run_id"], current[0]["id"]))
                 compiled.append(made)
@@ -1969,17 +2139,81 @@ class AppBackend:
         if not conv_pk:
             return {"tasks": [], "questions": [], "conversation_id": ""}
 
+        # 角色可见化：节点 → 角色/中文标签映射（catalog 单一来源）
+        from core.planning.catalog import role_of as _node_role, label_of as _node_label
+
+        def _task_view(conn, t):
+            """任务视图：基础字段 + 实时进度/当前角色（气泡进度条数据源）。"""
+            nodes = [dict(zip(("id", "type", "status", "wait_reason"), r))
+                     for r in conn.execute(
+                         "SELECT n.id,n.node_type,n.status,n.wait_reason FROM nodes n"
+                         " JOIN runs r ON r.id=n.run_id WHERE r.task_id=?"
+                         " ORDER BY n.rowid", (t["id"],))]
+            done = [n for n in nodes if n["status"] == "succeeded"]
+
+            def _pick(sts):
+                return next((n for n in nodes if n["status"] in sts), None)
+
+            active = (_pick(("running", "committing"))
+                      or _pick(("waiting_input",))
+                      or _pick(("ready",))
+                      or _pick(("pending",)))  # 排队中：也标出下一个待跑节点
+            last_done = done[-1] if done else None
+            # 当前角色：活动节点优先；尚未编译（无节点）为规划阶段；
+            # 其余情况取最近完成节点的角色，保证角色标注连续不跳空
+            if active is not None:
+                role = _node_role(active["type"])
+            elif not nodes:
+                role = "planner"
+            else:
+                role = _node_role((last_done or nodes[-1])["type"])
+            # 耗时预估（④）：同类型历史尝试平均耗时 × 剩余节点（30s 内存缓存）
+            now_ts = time.time()
+            eta_cache = getattr(self, "_eta_avg_cache", None)
+            if not eta_cache or now_ts - eta_cache[0] > 30:
+                avg_rows = conn.execute(
+                    "SELECT n.node_type, AVG((julianday(a.finished_at)-"
+                    "julianday(a.started_at))*86400) FROM attempts a"
+                    " JOIN nodes n ON n.id=a.node_id"
+                    " WHERE a.finished_at IS NOT NULL AND a.started_at IS NOT NULL"
+                    " GROUP BY n.node_type").fetchall()
+                avg = {str(r[0]): float(r[1] or 0) for r in avg_rows
+                       if r[1] and 0 < float(r[1]) < 4 * 3600}
+                self._eta_avg_cache = (now_ts, avg)
+            avg = self._eta_avg_cache[1]
+            global_avg = (sum(avg.values()) / len(avg)) if avg else 0.0
+            remain = [n for n in nodes
+                      if n["status"] not in ("succeeded", "cancelled", "skipped")]
+            eta_seconds = sum(avg.get(n["type"], global_avg) for n in remain)
+            eta_minutes = int(round(eta_seconds / 60)) if eta_seconds >= 60 else 0
+            # 失败建议（③）：failed 任务给出根因→策略提示
+            recovery = ""
+            if str(t.get("summary_status") or "") == "failed":
+                recovery = self._recovery_suggestion(nodes,
+                                                     self._user_lang(self._uid()) == "zh")
+            return {
+                **understanding.ResolvedTask(t).to_summary(),
+                "summary_status": t.get("summary_status"),
+                "run_id": t.get("current_run_id"),
+                "nodes": nodes,
+                "negations": (t.get("slots") or {}).get("negations") or [],
+                "progress": {"done": len(done), "total": len(nodes)},
+                "role": role,
+                "active_node": ({"type": active["type"],
+                                 "label": _node_label(active["type"]),
+                                 "status": active["status"]} if active else None),
+                "last_done": ({"type": last_done["type"],
+                               "label": _node_label(last_done["type"])}
+                              if last_done else None),
+                "eta_minutes": eta_minutes,
+                "recovery_hint": recovery,
+            }
+
         def _read(conn):
             return {
                 "conversation_id": conv_pk,
                 "tasks": [
-                    {**understanding.ResolvedTask(t).to_summary(),
-                     "summary_status": t.get("summary_status"),
-                     "run_id": t.get("current_run_id"),
-                     # 跨任务全部运行取节点：结果后处理续跑会把 current_run 切到
-                     # 只含 gapfill 节点的运行，只看当前运行会让主链步骤全变“等待”
-                     "nodes": [dict(zip(("id", "type", "status", "wait_reason"), r)) for r in conn.execute("SELECT n.id,n.node_type,n.status,n.wait_reason FROM nodes n JOIN runs r ON r.id=n.run_id WHERE r.task_id=? ORDER BY n.rowid", (t["id"],))],
-                     "negations": (t.get("slots") or {}).get("negations") or []}
+                    _task_view(conn, t)
                     for t in t_store.list_tasks(conn, user_id=uid,
                                                 conversation_id=conv_pk,
                                                 limit=limit)
@@ -2220,7 +2454,12 @@ class AppBackend:
                     (task_id,)).fetchone())
                 if not failed:
                     return {"ok": False, "message": "没有可重试的失败节点"}
-                scheduler.retry(failed[0], uid)
+                flag = scheduler.retry(failed[0], uid)
+                if flag == "degraded":
+                    return {"ok": True,
+                            "message": "下一轮模型规模超出部署内存上限，"
+                                       "已跳过该轮并沿用上一轮结果，任务将从断点继续。",
+                            "task_id": task_id}
                 return {"ok": True, "message": "已重新入队失败节点",
                         "task_id": task_id}
             if operation == "priority":
@@ -4979,6 +5218,12 @@ class AppBackend:
                             _head = (f"已提交 {len(submitted)} 个任务，按各自节点与资源额度执行。"
                                      if _zh else
                                      f"{len(submitted)} task(s) submitted; each runs under its own node and resource quotas.")
+                        # 参数推荐注记：新一轮编译若采用了历史最优参数，在气泡中留痕
+                        _pnotes = list(dict.fromkeys(
+                            str(x.get("param_note") or "") for x in submitted
+                            if isinstance(x, dict) and x.get("param_note")))
+                        if _pnotes:
+                            _head += "\n" + "；".join(_pnotes)
                         _note = self._compose_round_note(outcome)
                         if _note:
                             self._stream_notes[cid] = _note

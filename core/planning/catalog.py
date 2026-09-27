@@ -163,6 +163,43 @@ CAPABILITY_TEMPLATES: Dict[str, Dict[str, Any]] = {
 }
 
 
+# ── 节点 → 角色映射（角色可见化：气泡实时进度）──────────────────────
+# 角色是“执行域”的所有者：与 role_hooks 的实际介入点保持一致
+# （ttri 完成后触发的是 Data 角色反思，故 ttri/ttri_check 归 data；
+#  tcr/export 属“训练与温度生成”链，归 train；闭合评价归 eval）。
+NODE_ROLES: Dict[str, str] = {
+    "search_scene": "data", "select_scene": "data", "acquire_asset": "data",
+    "prepare_local": "data", "data_check": "data", "preprocess_split": "data",
+    "prep_check": "data", "ttri": "data", "ttri_check": "data",
+    "gapfill": "data", "rebuild": "data",
+    "rf_round": "train", "train_decision": "train", "promote_best": "train",
+    "tcr": "train", "export": "train",
+    "closure_eval": "eval",
+}
+
+# 角色接力顺序（气泡进度条按此展示；planner 为提交前的规划阶段）
+ROLE_ORDER: Tuple[str, ...] = ("planner", "data", "train", "eval")
+
+# 角色中文显示名（后端兼底；前端 i18n 可用时优先前端）
+ROLE_LABELS: Dict[str, str] = {
+    "planner": "Planner · 规划",
+    "data": "Data · 数据与质检",
+    "train": "Train · 训练与温度生成",
+    "eval": "Eval · 评估与复核",
+}
+
+
+def role_of(node_type: str) -> str:
+    """节点归属的执行角色；未知类型回退 data（所有计算节点都属于某个执行角色）。"""
+    return NODE_ROLES.get(str(node_type or ""), "data")
+
+
+def label_of(node_type: str) -> str:
+    """节点中文标签（与 NODE_TYPES 一致；未知类型回退原样）。"""
+    meta = NODE_TYPES.get(str(node_type or ""))
+    return meta["label"] if meta else str(node_type or "")
+
+
 def validate_step_names(steps) -> Tuple[bool, List[str]]:
     """校验步骤名是否全部在 7 步主链 + 填洞之内（§5.1）。
 

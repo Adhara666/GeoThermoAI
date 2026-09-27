@@ -245,6 +245,113 @@ function pendingInfo(row) {
   }
   return null
 }
+
+// ── 实时任务进度（角色可见化）：气泡流内随执行持续刷新 ──
+// 数据源：会话事件流（snapshot/ledger → kernelTasks）；后端已附
+// progress/role/active_node/last_done，前端保留本地兜底计算（旧数据兼容）。
+const NODE_ROLE_FALLBACK = {
+  search_scene: 'data', select_scene: 'data', acquire_asset: 'data',
+  prepare_local: 'data', data_check: 'data', preprocess_split: 'data',
+  prep_check: 'data', ttri: 'data', ttri_check: 'data',
+  gapfill: 'data', rebuild: 'data',
+  rf_round: 'train', train_decision: 'train', promote_best: 'train',
+  tcr: 'train', export: 'train', closure_eval: 'eval',
+}
+const ROLE_ORDER = ['planner', 'data', 'train', 'eval']
+// 角色头像视觉（Feather 风 SVG，不用 emoji；每角色一色调）
+const ROLE_VISUAL = {
+  planner: {
+    icon: '<circle cx="12" cy="12" r="10"/><polygon points="16.24 7.76 14.12 14.12 7.76 16.24 9.88 9.88 16.24 7.76"/>',
+    color: '#2563eb', bg: '#eaf1ff',
+  },
+  data: {
+    icon: '<ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/>',
+    color: '#0d9488', bg: '#e6f6f3',
+  },
+  train: {
+    icon: '<rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/>',
+    color: '#7c3aed', bg: '#f2ecfe',
+  },
+  eval: {
+    icon: '<path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/>',
+    color: '#d97706', bg: '#fdf3e3',
+  },
+}
+// 仅展示进行中的任务 + 失败任务（失败卡保留显示建议，直至用户处理）
+const LIVE_TASK_STATES = ['queued', 'running', 'awaiting_info', 'paused', 'failed']
+
+function nodeLabelOf(n) {
+  const key = n.type || n.node_type || n.node_key || ''
+  const tr = t(`node.${key}`)
+  return tr !== `node.${key}` ? tr : (n.label || key)
+}
+
+function roleLabelOf(key) {
+  const k = `task.role.${key}`
+  const v = t(k)
+  return v !== k ? v : key
+}
+
+const liveTasks = computed(() => {
+  const out = []
+  for (const id of chat.kernelTasksOrder || []) {
+    const tk = chat.kernelTasks[id]
+    if (!tk || !LIVE_TASK_STATES.includes(tk.summary_status)) continue
+    const nodes = tk.nodes || []
+    const doneNodes = nodes.filter((n) => n.status === 'succeeded')
+    const pick = (...sts) => nodes.find((n) => sts.includes(n.status)) || null
+    const active = tk.active_node
+      || pick('running', 'committing') || pick('waiting_input') || pick('ready')
+    const lastDone = tk.last_done
+      || (doneNodes.length ? doneNodes[doneNodes.length - 1] : null)
+    const role = tk.role
+      || (active ? (NODE_ROLE_FALLBACK[active.type || active.node_type] || 'data')
+        : 'planner')
+    const roleIdx = Math.max(0, ROLE_ORDER.indexOf(role))
+    const total = tk.progress ? tk.progress.total : nodes.length
+    const done = tk.progress ? tk.progress.done : doneNodes.length
+    // 显示推导：仍是“排队中”但已有运行中/提交中节点 → 显示“执行中”
+    //（后端状态推进可能晚一拍或事件错过；此处兜底避免“排队中”误导）
+    let effStatus = tk.summary_status
+    if (effStatus === 'queued'
+        && nodes.some((n) => n.status === 'running' || n.status === 'committing')) {
+      effStatus = 'running'
+    }
+    const statusKey = `task.status.${effStatus}`
+    const statusTr = t(statusKey)
+    out.push({
+      id: tk.task_id,
+      label: tk.label || tk.region || '',
+      statusText: statusTr !== statusKey ? statusTr : (effStatus || ''),
+      cls: effStatus,
+      isFailed: effStatus === 'failed',
+      failedHint: tk.recovery_hint || '',
+      eta: tk.eta_minutes || 0,
+      done, total,
+      pct: total ? Math.round((done / total) * 100) : 0,
+      role,
+      roleName: roleLabelOf(role),
+      roles: ROLE_ORDER.map((k, i) => ({
+        key: k,
+        // 短名与头像：用户一眼认得“谁在干活”
+        short: k.charAt(0).toUpperCase() + k.slice(1),
+        icon: (ROLE_VISUAL[k] || {}).icon || '',
+        color: (ROLE_VISUAL[k] || {}).color || '#2563eb',
+        bg: (ROLE_VISUAL[k] || {}).bg || '#eaf1ff',
+        past: i < roleIdx,
+        state: i < roleIdx ? 'done' : (i === roleIdx ? 'active' : 'wait'),
+        stateText: i < roleIdx ? t('task.live.roleDone')
+          : (i === roleIdx ? t('task.live.working') : t('task.live.roleWaiting')),
+      })),
+      activeLabel: active
+        ? nodeLabelOf(active) + (active.status === 'waiting_input'
+          ? `（${t('task.live.waiting')}）` : '')
+        : '',
+      lastDoneLabel: lastDone ? nodeLabelOf(lastDone) : '',
+    })
+  }
+  return out
+})
 </script>
 
 <template>
@@ -351,6 +458,55 @@ function pendingInfo(row) {
           </div>
         </div>
       </template>
+      <!-- 实时任务进度（角色可见化）：随任务执行刷新；完成后自动撤下，由完成报告接管 -->
+      <div v-if="liveTasks.length" class="task-live">
+        <div v-for="lt in liveTasks" :key="lt.id" class="task-live__card">
+          <div class="task-live__head">
+            <span class="task-live__dot" :class="`task-live__dot--${lt.cls}`"></span>
+            <strong class="task-live__name">{{ lt.label }}</strong>
+            <span class="task-live__status">{{ lt.statusText }}</span>
+          </div>
+          <div class="task-live__agents">
+            <span class="task-live__agents-title">{{ t('task.live.agentsTitle') }}</span>
+            <div class="task-live__agents-row">
+              <div
+                v-for="r in lt.roles" :key="r.key"
+                class="task-live__agent" :class="`task-live__agent--${r.state}`"
+              >
+                <span
+                  class="task-live__avatar"
+                  :style="{ color: r.color, background: r.bg, borderColor: r.color }"
+                >
+                  <svg
+                    width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                    stroke-width="2" stroke-linecap="round" stroke-linejoin="round"
+                    v-html="r.icon"
+                  ></svg>
+                </span>
+                <span class="task-live__agent-name">{{ r.short }}</span>
+                <span class="task-live__agent-state">{{ r.stateText }}</span>
+              </div>
+            </div>
+          </div>
+          <div v-if="lt.isFailed" class="task-live__sentence task-live__sentence--failed">
+            {{ t('task.live.failed') }}<template v-if="lt.failedHint"> —— {{ t('task.live.suggest') }}{{ lt.failedHint }}</template>
+          </div>
+          <div v-else-if="lt.roleName" class="task-live__sentence">
+            {{ t('task.live.workingNow') }}<b>{{ lt.roleName }}</b>
+            <template v-if="lt.activeLabel"> —— {{ t('task.live.currentStep', { step: lt.activeLabel }) }}</template>
+          </div>
+          <div class="task-live__bar">
+            <div class="task-live__bar-fill" :style="{ width: lt.pct + '%' }"></div>
+          </div>
+          <div class="task-live__meta">
+            <span class="task-live__progress">{{ t('task.live.progress', { done: lt.done, total: lt.total }) }}</span>
+            <span v-if="lt.eta && !lt.isFailed" class="task-live__eta">{{ t('task.live.eta', { n: lt.eta }) }}</span>
+          </div>
+          <div v-if="lt.lastDoneLabel" class="task-live__lastDone">
+            {{ t('task.live.lastDone') }}{{ lt.lastDoneLabel }}
+          </div>
+        </div>
+      </div>
     </div>
   </div>
 </template>
@@ -439,4 +595,59 @@ function pendingInfo(row) {
   font-size: 12px; line-height: 1.7; white-space: pre-wrap;
   word-break: break-word; max-height: 320px; overflow-y: auto;
 }
+
+/* ── 实时任务进度（角色可见化）：气泡流内随执行刷新 ── */
+.task-live { display: flex; flex-direction: column; gap: 10px; padding: 4px 0 12px; align-items: flex-start; }
+.task-live__card {
+  min-width: 320px; max-width: min(560px, 78vw);
+  border: 1px solid #dbe3f0; border-left: 3px solid var(--primary, #2563eb);
+  border-radius: 10px; background: #f7faff; padding: 10px 12px;
+  font-size: 12.5px;
+}
+.task-live__head { display: flex; align-items: center; gap: 7px; margin-bottom: 7px; }
+.task-live__dot { width: 8px; height: 8px; border-radius: 50%; background: #9ca3af; flex-shrink: 0; }
+.task-live__dot--running { background: var(--primary, #2563eb); animation: pendingPulse 1.2s ease-in-out infinite; }
+.task-live__dot--queued { background: #f59e0b; }
+.task-live__dot--awaiting_info { background: #f59e0b; animation: pendingPulse 1.2s ease-in-out infinite; }
+.task-live__dot--paused { background: #9ca3af; }
+.task-live__dot--failed { background: #dc2626; }
+.task-live__name { font-size: 12.5px; font-weight: 600; color: #334155; }
+.task-live__status {
+  margin-left: auto; font-size: 11px; color: #6b7280;
+  border: 1px solid #e5e7eb; border-radius: 999px; padding: 1px 8px; background: #fff;
+}
+/* 智能体角色头像接力条（Feather 风 SVG，不用 emoji） */
+.task-live__agents { margin-bottom: 8px; }
+.task-live__agents-title {
+  display: block; font-size: 10.5px; color: #4a5462; margin-bottom: 6px;
+}
+.task-live__agents-row { display: flex; gap: 16px; }
+.task-live__agent { display: flex; flex-direction: column; align-items: center; gap: 3px; min-width: 50px; }
+.task-live__avatar {
+  width: 34px; height: 34px; border-radius: 50%; box-sizing: border-box;
+  display: flex; align-items: center; justify-content: center;
+  border: 1.5px solid currentColor; transition: transform 0.2s, box-shadow 0.2s;
+}
+.task-live__agent-name { font-size: 11px; font-weight: 600; color: #334155; }
+.task-live__agent-state { font-size: 10.5px; color: #b0b7c3; }
+.task-live__agent--done .task-live__avatar { opacity: 0.72; }
+.task-live__agent--done .task-live__agent-state { color: #16a34a; }
+.task-live__agent--active .task-live__avatar {
+  transform: scale(1.12);
+  box-shadow: 0 0 0 3px rgba(15, 23, 42, 0.08);
+}
+.task-live__agent--active .task-live__agent-state {
+  color: #0d9488;
+  font-weight: 600; animation: pendingPulse 1.6s ease-in-out infinite;
+}
+.task-live__agent--wait .task-live__avatar { opacity: 0.42; }
+.task-live__sentence { font-size: 12.5px; color: #4a5462; margin-bottom: 6px; }
+.task-live__sentence--failed { color: #b91c1c; }
+.task-live__eta { color: #9aa1ad; }
+.task-live__sentence b { font-weight: 600; }
+.task-live__bar { height: 4px; border-radius: 999px; background: #e5eaf3; overflow: hidden; margin-bottom: 6px; }
+.task-live__bar-fill { height: 100%; background: var(--primary, #2563eb); border-radius: 999px; transition: width 0.4s ease; }
+.task-live__meta { display: flex; gap: 10px; color: #6b7280; font-size: 12px; flex-wrap: wrap; }
+.task-live__current { color: #4a5462; }
+.task-live__lastDone { margin-top: 3px; color: #9aa1ad; font-size: 11.5px; }
 </style>

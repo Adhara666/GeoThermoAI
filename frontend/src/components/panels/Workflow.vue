@@ -27,8 +27,15 @@ const STATUS_TEXT = {
   awaiting_info: '等待回答', completed: '已完成', failed: '失败',
   cancelled: '已取消', paused: '已暂停',
 }
-function taskStatusText(s) {
+function taskStatusText(task) {
   // 任务卡状态标签随界面语言（英文模式下不再残留中文）
+  let s = task && task.summary_status
+  // 显示推导：queued 但已有运行中/提交中节点 → 执行中（避免“排队中”误导）
+  const nodes = (task && task.nodes) || []
+  if (s === 'queued'
+      && nodes.some((n) => n.status === 'running' || n.status === 'committing')) {
+    s = 'running'
+  }
   const key = `task.status.${s}`
   const v = t(key)
   if (v !== key) return v
@@ -225,10 +232,16 @@ watch(() => project.currentConv, (cid) => {
         <div class="kernel-task__head">
           <span class="kernel-task__num">{{ ti + 1 }}</span>
           <strong>{{ task.label || task.region }}</strong>
-          <span class="tag">{{ taskStatusText(task.summary_status) }}</span>
+          <span class="tag">{{ taskStatusText(task) }}</span>
         </div>
         <div v-if="currentNodeLabel(task)" class="kernel-task__detail">
           {{ currentNodeLabel(task) }}
+        </div>
+        <div v-if="task.eta_minutes && task.summary_status === 'running'" class="kernel-task__detail">
+          {{ t('task.live.eta', { n: task.eta_minutes }) }}
+        </div>
+        <div v-if="task.summary_status === 'failed' && task.recovery_hint" class="kernel-task__detail kernel-task__wait">
+          {{ t('task.live.suggest') }}{{ task.recovery_hint }}
         </div>
         <div v-if="taskQuestion(task.task_id)" class="kernel-task__detail kernel-task__wait">
           {{ t('wf.waitAnswer') }}{{ taskQuestion(task.task_id).prompt }}
