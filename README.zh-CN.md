@@ -62,6 +62,25 @@ docker run -d --name geothermoai -p 7860:7860 \
 
 > 说明：容器内 `/app/data` 是账号、对话、研究区、任务台账与记忆的持久根，必须挂载。部署变量表与迁移说明见 [部署配置说明](docs/部署配置说明_第七阶段.md)。
 
+### 可选：启用「用魔搭账号登录」（本地部署）
+
+本地部署也支持**魔搭账号一键登录**（用户免注册直接进入系统，并自动配置魔搭推理 API）。启用只需 3 步：
+
+1. 登录 [魔搭社区](https://modelscope.cn)，进入 **首页 → 访问控制 → 互联应用 → 我创建的应用**，创建一个应用：
+   - **重定向URL** 填：`http://localhost:7860/`；
+   - **授权范围** 勾选 `profile` 与 `api-inference`（其余可不勾）。
+2. 创建后获得 **Client ID** 与 **Client Secret**，填入本仓库的 `config/settings.json`：
+   ```json
+   "modelscope_oauth": {
+     "client_id": "你的 Client ID",
+     "client_secret": "你的 Client Secret"
+   }
+   ```
+   （也可改用环境变量 `MODELSCOPE_OAUTH_CLIENT_ID` / `MODELSCOPE_OAUTH_CLIENT_SECRET` 注入，优先于配置文件。）
+3. 重新构建并启动后，登录页即出现「用魔搭账号登录」按钮：点击 → 跳转魔搭授权 → 自动登录并配好推理 API。
+
+> 提示：本仓库自带的配置文件中**不包含任何凭据**；请勿将填入真实凭据后的 `config/settings.json` 提交到公开仓库。
+
 ## 📸 功能速览
 
 <div align="center"><img src="image/README/1786613710042.png" alt="1786613710042"></div>

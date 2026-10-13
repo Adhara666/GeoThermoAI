@@ -62,6 +62,25 @@ More entry points:
 
 > Note: `/app/data` inside the container is the persistent root for accounts, conversations, study areas, the task ledger, and memory — it must be mounted. See the [deployment configuration guide](docs/Deployment.md) for the full variable table.
 
+### Optional: enable "Sign in with ModelScope" (local deployment)
+
+Local deployments also support **one-click sign-in with a ModelScope account** (users skip registration and the ModelScope inference API is configured automatically). Three steps:
+
+1. Sign in at [ModelScope](https://modelscope.cn), go to **Home → Access Control → OAuth Apps → My Apps** and create an application:
+   - **Redirect URL**: `http://localhost:7860/`;
+   - **Scopes**: check `profile` and `api-inference` (the rest are optional).
+2. Copy the **Client ID** and **Client Secret** into `config/settings.json` of this repository:
+   ```json
+   "modelscope_oauth": {
+     "client_id": "your Client ID",
+     "client_secret": "your Client Secret"
+   }
+   ```
+   (Alternatively, inject them via the `MODELSCOPE_OAUTH_CLIENT_ID` / `MODELSCOPE_OAUTH_CLIENT_SECRET` environment variables, which take precedence over the file.)
+3. Rebuild and restart — the login page now shows "Sign in with ModelScope": click → authorize on ModelScope → signed in automatically with the inference API configured.
+
+> Note: this repository ships **without any credentials**; do not commit a `config/settings.json` that contains real secrets to a public repository.
+
 ## 📸 Feature Gallery
 
 <div align="center"><img src="image/README/1786613710042.png" alt="1786613710042"></div>
