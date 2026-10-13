@@ -23,7 +23,8 @@ joblib>=1.2
 # 数据处理
 pandas>=1.5
 # 中间产物表统一 Parquet（列式存储 + zstd 压缩，替代 CSV；分块读写见 core/table_io.py）
-pyarrow>=14.0
+# 上限锁 <18：pyarrow 18+ 要求 NumPy 2.0，而本环境必须锁 numpy<2（见上方注释）
+pyarrow>=14.0,<18
 geopandas>=0.12
 shapely>=2.0
 # STAC 数据源
