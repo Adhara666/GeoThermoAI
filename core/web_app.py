@@ -3515,6 +3515,26 @@ class AppBackend:
         return {"ok": True, "message": f"项目已重命名为「{new_name}」",
                 "projects": [p["name"] for p in projects]}
 
+    def apply_modelscope_api(self, uid: str, access_token: str) -> dict:
+        """魔搭 OAuth 登录后：将魔搭推理服务写为该用户的 LLM API 配置。
+
+        只合并 api 段，不动用户设置的其他部分；本地注册/登录流程不受影响。
+        """
+        from core import modelscope_oauth as ms
+        api = ms.build_api_config(access_token)
+        path = self.deployment.users_root / str(uid) / "settings.json"
+        data = {}
+        try:
+            if path.is_file():
+                data = json.loads(path.read_text(encoding="utf-8")) or {}
+        except Exception:  # noqa: BLE001
+            data = {}
+        data["api"] = {**(data.get("api") or {}), **api}
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2),
+                        encoding="utf-8")
+        return api
+
     def rename_conversation(self, cid: str, project: str, new_title: str) -> dict:
         """重命名对话：同步对话 JSON 标题（title 只存于对话文件，即唯一权威源）。
 
@@ -5742,7 +5762,8 @@ app.add_middleware(
 
 # ── 鉴权中间件：/api/* 除白名单外必须携带有效 JWT ──────────────
 # token 来源：Authorization: Bearer <token>，或 SSE/图片等无法带 Header 时用 ?token=
-_AUTH_WHITELIST = {"/api/auth/login", "/api/auth/register", "/api/health", "/api/debug/mem"}
+_AUTH_WHITELIST = {"/api/auth/login", "/api/auth/register", "/api/health", "/api/debug/mem",
+                   "/api/auth/modelscope/url", "/api/auth/modelscope/callback"}
 
 
 @app.middleware("http")
@@ -5816,6 +5837,49 @@ def login(request: Request, payload: dict):
         _login_failures[username] = fails
         return {"ok": False, "message": "账号或密码错误"}
     _login_failures.pop(username, None)
+    token = auth.create_token(user["uid"], user["username"])
+    return {"ok": True, "token": token, "user": auth.public_user(user)}
+
+
+# ── API：魔搭 OAuth 登录（新增接入，不影响本地注册/登录） ─────────
+
+@app.get("/api/auth/modelscope/url")
+def modelscope_auth_url(redirect_uri: str = ""):
+    from core import modelscope_oauth as ms
+    cfg = ms.oauth_config()
+    if not cfg["configured"]:
+        return {"ok": False, "configured": False,
+                "message": "未配置魔搭 OAuth：请在 config/settings.json 的 "
+                           "modelscope_oauth 中填写 client_id / client_secret"}
+    redirect_uri = (redirect_uri or "").strip()
+    if not redirect_uri.startswith(("http://", "https://")):
+        return {"ok": False, "configured": True, "message": "缺少合法的回调地址"}
+    state = ms.issue_state(redirect_uri)
+    return {"ok": True, "configured": True,
+            "url": ms.build_authorize_url(redirect_uri, state), "state": state}
+
+
+@app.post("/api/auth/modelscope/callback")
+def modelscope_callback(payload: dict):
+    from core import modelscope_oauth as ms
+    body = payload or {}
+    code = str(body.get("code") or "").strip()
+    state = str(body.get("state") or "").strip()
+    if not code:
+        return {"ok": False, "message": "缺少授权码"}
+    registered = ms.consume_state(state)
+    if not registered:
+        return {"ok": False, "message": "登录请求已失效，请重新点击「用魔搭账号登录」"}
+    try:
+        access_token = ms.exchange_code(code, registered)
+        info = ms.fetch_userinfo(access_token)
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "message": f"魔搭登录失败：{e}"}
+    user = auth.ensure_oauth_user(info["username"], info["nickname"])
+    try:
+        backend.apply_modelscope_api(str(user["uid"]), access_token)
+    except Exception as e:  # noqa: BLE001
+        print(f"[ms-oauth] API 配置写入失败：{e}")
     token = auth.create_token(user["uid"], user["username"])
     return {"ok": True, "token": token, "user": auth.public_user(user)}
 

@@ -75,6 +75,12 @@ const zh = {
   'login.errFailed': '操作失败',
   'login.showPwd': '显示密码',
   'login.hidePwd': '隐藏密码',
+  'login.msOr': '或',
+  'login.msBtn': '用魔搭账号登录',
+  'login.msLoading': '正在跳转魔搭…',
+  'login.msUnavailable': '未配置魔搭登录（请在 config/settings.json 填写 modelscope_oauth 后重试）',
+  'login.msFailed': '魔搭登录失败，请重试',
+  'login.msSuccess': '已通过魔搭账号登录：{name}',
 
   // 侧边栏
   'sidebar.newProject': '新建项目',
@@ -488,6 +494,12 @@ const en = {
   'login.errFailed': 'Operation failed',
   'login.showPwd': 'Show password',
   'login.hidePwd': 'Hide password',
+  'login.msOr': 'or',
+  'login.msBtn': 'Sign in with ModelScope',
+  'login.msLoading': 'Redirecting to ModelScope…',
+  'login.msUnavailable': 'ModelScope sign-in is not configured (fill modelscope_oauth in config/settings.json)',
+  'login.msFailed': 'ModelScope sign-in failed, please retry',
+  'login.msSuccess': 'Signed in with ModelScope: {name}',
 
   'sidebar.newProject': 'New Project',
   'sidebar.expandCollapse': 'Expand / Collapse',

@@ -1,7 +1,8 @@
 <script setup>
-import { ref } from 'vue'
+import { onMounted, ref } from 'vue'
 import { useAuthStore } from '../stores/auth'
 import { useToast } from '../composables/useToast'
+import { api } from '../api'
 import { t } from '../i18n'
 import LangSwitch from './LangSwitch.vue'
 
@@ -38,6 +39,83 @@ async function submit() {
     busy.value = false
   }
 }
+
+// ── 魔搭（ModelScope）OAuth 登录（新增入口，原有登录/注册不变） ──
+const msBusy = ref(false)
+
+/** 计算 OAuth 回调地址：
+ *  - 优先构建期覆盖（创空间部署可设 VITE_PUBLIC_ORIGIN）
+ *  - 魔搭 Studio 是 iframe 嵌入，location.origin 为 modelscope.cn 不可用于回调，
+ *    从 /studios/{owner}/{name} 自动推导 host 地址 https://{owner}-{name}.ms.show/
+ *  - 其余场景用当前 origin
+ */
+function computeRedirectUri() {
+  const env = String(import.meta.env.VITE_PUBLIC_ORIGIN || '').trim()
+  if (env) return env.replace(/\/+$/, '') + '/'
+  const host = window.location.hostname
+  if (host === 'modelscope.cn' || host.endsWith('.modelscope.cn')) {
+    const m = window.location.pathname.match(/^\/studios\/([^/]+)\/([^/]+)/)
+    if (m) return `https://${(m[1] + '-' + m[2]).toLowerCase()}.ms.show/`
+  }
+  return window.location.origin + '/'
+}
+
+function inIframe() {
+  try { return window.self !== window.top } catch (_) { return true }
+}
+
+async function loginWithModelScope() {
+  if (msBusy.value) return
+  msBusy.value = true
+  try {
+    // 回调地址用前端真实可达地址（本地为 http://localhost:7860/，
+    // 需与魔搭「互联应用」登记的回调地址一致）
+    const redirect = computeRedirectUri()
+    const r = await api.modelscopeAuthUrl(redirect)
+    if (!r || !r.ok) {
+      toast.error(r?.message || t('login.msUnavailable'))
+      return
+    }
+    try { sessionStorage.setItem('ms_oauth_redirect', redirect) } catch (_) {}
+    // Studio iframe 内：授权页可能禁止被嵌入，改开新窗口
+    if (inIframe()) {
+      window.open(r.url, '_blank')
+    } else {
+      window.location.href = r.url
+    }
+  } catch (e) {
+    toast.error(e.message || t('login.msFailed'))
+  } finally {
+    msBusy.value = false
+  }
+}
+
+// 从魔搭授权页返回：URL 携带 ?code=&state= 时自动完成登录
+onMounted(async () => {
+  const q = new URLSearchParams(window.location.search)
+  const code = q.get('code')
+  if (!code) return
+  const state = q.get('state') || ''
+  let redirect = computeRedirectUri()
+  try { redirect = sessionStorage.getItem('ms_oauth_redirect') || redirect } catch (_) {}
+  msBusy.value = true
+  try {
+    const r = await api.modelscopeCallback({ code, state, redirect_uri: redirect })
+    if (r && r.ok) {
+      auth.adoptSession(r.token, r.user)
+      toast.success(t('login.msSuccess', { name: r.user?.nickname || r.user?.username || '' }))
+      emit('authed')
+    } else {
+      toast.error(r?.message || t('login.msFailed'))
+    }
+  } catch (e) {
+    toast.error(e.message || t('login.msFailed'))
+  } finally {
+    msBusy.value = false
+    window.history.replaceState({}, '', window.location.pathname)
+    try { sessionStorage.removeItem('ms_oauth_redirect') } catch (_) {}
+  }
+})
 </script>
 
 <template>
@@ -88,6 +166,17 @@ async function submit() {
           {{ busy ? t('login.pleaseWait') : mode === 'login' ? t('login.loginBtn') : t('login.regBtn') }}
         </button>
       </form>
+
+      <div class="login-divider"><span>{{ t('login.msOr') }}</span></div>
+      <button
+        class="btn btn--block ms-login-btn"
+        type="button"
+        :disabled="msBusy"
+        @click="loginWithModelScope"
+      >
+        <img class="ms-login-btn__logo" src="/modelscope-logo.ico" width="16" height="16" alt="" />
+        {{ msBusy ? t('login.msLoading') : t('login.msBtn') }}
+      </button>
 
       <p class="login-foot">
         {{ mode === 'login' ? t('login.noAccount') : t('login.hasAccount') }}
@@ -145,4 +234,17 @@ async function submit() {
   color: var(--text-muted); cursor: pointer; transition: color 0.15s;
 }
 .pwd-toggle:hover { color: var(--primary); }
+.login-divider {
+  display: flex; align-items: center; gap: 10px;
+  margin: 14px 0 12px; color: var(--text-muted); font-size: 12px;
+}
+.login-divider::before, .login-divider::after {
+  content: ''; flex: 1; height: 1px; background: var(--border);
+}
+.ms-login-btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+  background: #fff; color: var(--text); border: 1px solid var(--border-strong);
+}
+.ms-login-btn__logo { border-radius: 3px; flex-shrink: 0; }
+.ms-login-btn:hover:not(:disabled) { border-color: var(--primary); color: var(--primary); }
 </style>

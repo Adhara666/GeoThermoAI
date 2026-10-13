@@ -179,3 +179,37 @@ def authenticate(username: str, password: str):
     if not verify_password(password or "", user.get("password_hash", "")):
         return None
     return user
+
+
+# ── 魔搭 OAuth 用户（新增接入，不改变本地注册/登录行为） ────────
+
+def ensure_oauth_user(ms_username: str, nickname: str = "") -> dict:
+    """魔搭 OAuth 登录：按魔搭账号创建/更新本地用户。
+
+    uid 采用 ms_ 前缀避免与本地账号冲突；OAuth 用户无本地密码
+    （password_hash 留空，authenticate 对其恒失败——只能用魔搭登录）。
+    """
+    ms_username = (ms_username or "").strip()
+    safe = re.sub(r"[^A-Za-z0-9_-]", "_", ms_username)[:28].strip("_") or "user"
+    uid = f"ms_{safe}"
+    with _REGISTRY_LOCK:
+        users = load_users()
+        for u in users:
+            if u.get("uid") == uid or u.get("ms_username") == ms_username:
+                if nickname and u.get("nickname") != nickname:
+                    u["nickname"] = nickname
+                    _save_users(users)
+                return u
+        user = {
+            "uid": uid,
+            "username": uid,
+            "nickname": (nickname or ms_username).strip() or uid,
+            "password_hash": "",
+            "auth_source": "modelscope",
+            "ms_username": ms_username,
+            "created_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        users.append(user)
+        _save_users(users)
+        (_USERS_ROOT / uid).mkdir(parents=True, exist_ok=True)
+        return user

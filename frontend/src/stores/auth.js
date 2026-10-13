@@ -40,6 +40,12 @@ export const useAuthStore = defineStore('auth', {
       await this.login(username, password)
     },
 
+    /** 外部登录（如魔搭 OAuth）：直接采用服务端已签发的会话 */
+    adoptSession(token, user) {
+      setToken(token || '')
+      this.user = user || null
+    },
+
     logout() {
       setToken('')
       this.user = null

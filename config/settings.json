@@ -10,6 +10,10 @@
     "context_input": 616000,
     "context_output": 384000
   },
+  "modelscope_oauth": {
+    "client_id": "",
+    "client_secret": ""
+  },
   "gee": {},
   "data": {
     "default_output_dir": "",
