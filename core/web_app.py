@@ -703,23 +703,23 @@ class AppBackend:
             print(f"[logs] 历史日志回填失败：{e}")
 
     def _user_lang(self, uid: str) -> str:
-        """用户界面语言（zh/en）：读用户设置 ui_lang，默认 zh。"""
+        """用户界面语言（zh/en）：读用户设置 ui_lang，默认 en。"""
         uid = uid or ""
         if not uid:
-            return "zh"
+            return "en"
         cached = self._user_lang_cache.get(uid)
         if cached:
             return cached
-        lang = "zh"
+        lang = "en"
         try:
             path = self.deployment.users_root / uid / "settings.json"
             if path.is_file():
                 lang = str(json.loads(path.read_text(encoding="utf-8"))
-                           .get("ui_lang") or "zh")
+                           .get("ui_lang") or "en")
                 if lang not in ("zh", "en"):
-                    lang = "zh"
+                    lang = "en"
         except Exception:
-            lang = "zh"
+            lang = "en"
         self._user_lang_cache[uid] = lang
         return lang
 

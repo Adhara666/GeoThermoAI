@@ -1,5 +1,5 @@
 // ── 界面语言（i18n）─────────────────────────────────────────────
-// 全局响应式 lang：zh（默认）| en。切换后：
+// 全局响应式 lang：en（默认）| zh。切换后：
 //  - 全部组件模板/脚本里的静态文本通过 t() 读取，自动重渲染
 //  - 持久化到 localStorage（gtai_lang），刷新后保持
 //  - 后端动态消息（如「项目已存在」「参数已保存」）经 trServer() 在英文态翻译
@@ -7,14 +7,18 @@
 
 import { ref } from 'vue'
 
-const STORAGE_KEY = 'gtai_lang'
+// 存储键加 v2：旧键（gtai_lang）里的历史选择作废，确保“默认英文”对所有浏览器生效
+const STORAGE_KEY = 'gtai_lang_v2'
+const LEGACY_KEY = 'gtai_lang'
 
 function loadLang() {
   try {
+    // 清理上一代存储键（其历史值会覆盖新默认值，导致“打开仍旧中文”）
+    localStorage.removeItem(LEGACY_KEY)
     const v = localStorage.getItem(STORAGE_KEY)
-    return v === 'en' ? 'en' : 'zh'
+    return v === 'zh' ? 'zh' : 'en'
   } catch (_) {
-    return 'zh'
+    return 'en'
   }
 }
 
@@ -44,7 +48,7 @@ applyDocumentMeta(lang.value)
 const zh = {
   'lang.label': '语言',
   'lang.buttonTitle': '切换界面语言',
-  'lang.zhOption': '中文',
+  'lang.zhOption': '简体中文',
   'lang.enOption': 'English',
 
   // 登录页
@@ -458,7 +462,7 @@ const zh = {
 const en = {
   'lang.label': 'Language',
   'lang.buttonTitle': 'Switch interface language',
-  'lang.zhOption': '中文',
+  'lang.zhOption': '简体中文',
   'lang.enOption': 'English',
 
   'login.sub': 'Intelligent High-Resolution Land Surface Temperature Reconstruction System',
