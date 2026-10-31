@@ -5881,8 +5881,9 @@ def modelscope_callback(payload: dict):
         return {"ok": False, "message": "登录请求已失效，请重新点击「用魔搭账号登录」"}
     site = registered.get("site") or ""
     try:
-        access_token = ms.exchange_code(code, registered["redirect_uri"], site)
-        info = ms.fetch_userinfo(access_token, site)
+        tokens = ms.exchange_code_tokens(code, registered["redirect_uri"], site)
+        access_token = tokens["access_token"]
+        info = ms.fetch_userinfo(access_token, site, tokens.get("id_token") or "")
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "message": f"魔搭登录失败：{e}"}
     user = auth.ensure_oauth_user(info["username"], info["nickname"])

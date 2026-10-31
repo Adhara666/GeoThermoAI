@@ -29,6 +29,7 @@
   → 默认 cn
 """
 
+import base64
 import json
 import logging
 import os
@@ -128,8 +129,11 @@ def site_profile(site: str = "") -> dict:
     profile = dict(_SITE_PROFILES[resolve_site(site)])
     cfg = oauth_config()
     if cfg["platform"] and cfg["provider_url"]:
-        # 用平台注入的 provider 地址覆盖端点（兼容未来域名调整）
+        # 用平台注入的 provider 地址覆盖端点（兼容未来域名调整）。
+        # 平台可能注入 http://，强制升级 https，避免令牌在 http 虚拟主机上失效。
         base = cfg["provider_url"].rstrip("/")
+        if base.startswith("http://"):
+            base = "https://" + base[len("http://"):]
         profile.update({
             "authorize_url": base + "/oauth/authorize",
             "token_url": base + "/oauth/token",
@@ -195,8 +199,8 @@ def build_authorize_url(redirect_uri: str, state: str, site: str = "") -> str:
     return site_profile(site)["authorize_url"] + "?" + urlencode(params)
 
 
-def exchange_code(code: str, redirect_uri: str, site: str = "") -> str:
-    """授权码换 access_token。"""
+def exchange_code_tokens(code: str, redirect_uri: str, site: str = "") -> dict:
+    """授权码换令牌，返回 access_token / id_token / scope。"""
     cfg = oauth_config()
     resp = requests.post(site_profile(site)["token_url"], data={
         "grant_type": "authorization_code",
@@ -210,11 +214,36 @@ def exchange_code(code: str, redirect_uri: str, site: str = "") -> str:
     token = str(data.get("access_token") or "")
     if not token:
         raise ValueError(f"未返回 access_token：{str(data)[:200]}")
-    return token
+    # 仅记录 scope 与字段名，绝不打印令牌本身
+    logger.info("[ms-oauth] token scope=%s keys=%s",
+                data.get("scope"), sorted(k for k in data if k != "access_token"))
+    return {"access_token": token,
+            "id_token": str(data.get("id_token") or ""),
+            "scope": str(data.get("scope") or "")}
 
 
-def fetch_userinfo(access_token: str, site: str = "") -> dict:
-    """取魔搭用户信息：优先 OpenAPI（字段更全），降级 OIDC userinfo。"""
+def exchange_code(code: str, redirect_uri: str, site: str = "") -> str:
+    """授权码换 access_token。"""
+    return exchange_code_tokens(code, redirect_uri, site)["access_token"]
+
+
+def _decode_id_token(id_token: str) -> dict:
+    """不验签解析 id_token 载荷：令牌由 token 端点经 TLS 直接返回，仅用于取身份字段。"""
+    try:
+        part = str(id_token or "").split(".")[1]
+        part += "=" * (-len(part) % 4)
+        return json.loads(base64.urlsafe_b64decode(part.encode("ascii")))
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def fetch_userinfo(access_token: str, site: str = "", id_token: str = "") -> dict:
+    """取魔搭用户信息。
+
+    顺序：OpenAPI（字段全）→ id_token 声明（无需再请求）→ OIDC userinfo。
+    内置 OAuth 若未授权 profile，userinfo 可能返回 401，此时用 id_token
+    里的 sub/preferred_username 兜底，保证登录流程不中断。
+    """
     profile = site_profile(site)
     headers = {"Authorization": f"Bearer {access_token}"}
     try:
@@ -225,17 +254,34 @@ def fetch_userinfo(access_token: str, site: str = "") -> dict:
                 return {"username": str(data["username"]),
                         "nickname": str(data.get("nickname") or data["username"]),
                         "avatar": str(data.get("avatar_url") or "")}
+        else:
+            logger.warning("[ms-oauth] OpenAPI 用户信息返回 %s", resp.status_code)
     except Exception as e:  # noqa: BLE001
         logger.warning("[ms-oauth] OpenAPI 用户信息失败，改用 OIDC: %s", e)
-    resp = requests.get(profile["userinfo_url"], headers=headers, timeout=30)
-    resp.raise_for_status()
-    info = resp.json() or {}
-    name = str(info.get("preferred_username") or info.get("name") or info.get("sub") or "")
-    if not name:
-        raise ValueError("魔搭未返回可用的用户名")
-    return {"username": name,
-            "nickname": str(info.get("name") or name),
-            "avatar": str(info.get("picture") or "")}
+
+    claims = _decode_id_token(id_token)
+    name = str(claims.get("preferred_username") or claims.get("name")
+               or claims.get("sub") or "")
+    if name:
+        return {"username": name,
+                "nickname": str(claims.get("name") or name),
+                "avatar": str(claims.get("picture") or "")}
+
+    try:
+        resp = requests.get(profile["userinfo_url"], headers=headers, timeout=30)
+        if resp.status_code == 200:
+            info = resp.json() or {}
+            name = str(info.get("preferred_username") or info.get("name")
+                       or info.get("sub") or "")
+            if name:
+                return {"username": name,
+                        "nickname": str(info.get("name") or name),
+                        "avatar": str(info.get("picture") or "")}
+        logger.warning("[ms-oauth] OIDC userinfo 返回 %s（请确认已授权 openid/profile）",
+                       resp.status_code)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("[ms-oauth] OIDC userinfo 请求失败: %s", e)
+    raise ValueError("魔搭未返回可用的用户名（请确认 OAuth 已勾选 openid 与 profile）")
 
 
 # 推理模型选择：优先查询魔搭可用列表并挑 DeepSeek 系；失败用固定候选链
