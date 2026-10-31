@@ -33,6 +33,7 @@ import base64
 import json
 import logging
 import os
+import re
 import secrets
 import threading
 import time
@@ -284,18 +285,31 @@ def fetch_userinfo(access_token: str, site: str = "", id_token: str = "") -> dic
     raise ValueError("魔搭未返回可用的用户名（请确认 OAuth 已勾选 openid 与 profile）")
 
 
-# 推理模型选择：优先 DeepSeek Flash（用户默认），再按版本降级。
-# 注意国际站列表里没有 V4-Flash-0731，且 Pro 排在最前，不能只按顺序取。
+# 推理模型选择：优先 DeepSeek Flash（用户默认），版本/日期越新越优先。
+# 国内站最新 Flash 为 V4.1-Flash-1017；国际站没有 V4-Flash-0731 且 Pro 排最前，
+# 不能只按列表顺序取。
 _PREFERRED_HINTS = ("deepseek-v4", "deepseek-v3", "deepseek-r1")
-_MODEL_FALLBACKS = ("deepseek-ai/DeepSeek-V3.2", "deepseek-ai/DeepSeek-R1-0528",
-                    "deepseek-ai/DeepSeek-V3")
+_MODEL_FALLBACKS = ("deepseek-ai/DeepSeek-V4.1-Flash-1017",
+                    "deepseek-ai/DeepSeek-V3.2",
+                    "deepseek-ai/DeepSeek-R1-0528")
+
+
+def _flash_sort_key(model_id: str) -> tuple:
+    """从 DeepSeek Flash 模型 ID 提取 (版本元组, 日期)，用于选最新。"""
+    s = model_id.lower()
+    m = re.search(r"v(\d+(?:\.\d+)*)-flash(?:-(\d{4}))?", s)
+    if not m:
+        return ((0,), 0)
+    version = tuple(int(x) for x in m.group(1).split("."))
+    date = int(m.group(2)) if m.group(2) else 0
+    return (version, date)
 
 
 def _choose_model(ids: list) -> str:
     ds = [i for i in ids if i and i.lower().startswith("deepseek")]
     flash = [i for i in ds if "flash" in i.lower()]
     if flash:
-        return flash[0]
+        return max(flash, key=_flash_sort_key)
     for hint in _PREFERRED_HINTS:
         for i in ds:
             if hint in i.lower():
