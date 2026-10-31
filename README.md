@@ -81,6 +81,12 @@ Local deployments also support **one-click sign-in with a ModelScope account** (
 
 > Note: this repository ships **without any credentials**; do not commit a `config/settings.json` that contains real secrets to a public repository.
 
+**Deploying to ModelScope International (modelscope.ai)?** The China site (modelscope.cn) and the international site are **separate account and OAuth app systems** — a China-site Client ID/Secret does not work on the international site.
+
+The recommended way is the **built-in Studio OAuth** (no credentials to copy): open the Studio **Settings → Adjust deployment settings**, enable **OAuth settings**, select the `openid`, `profile`, and `api-inference` scopes, save, and redeploy. The platform then injects `OAUTH_CLIENT_ID`, `OAUTH_CLIENT_SECRET`, `OAUTH_SCOPES`, `OPENID_PROVIDER_URL`, and `STUDIO_HOST` at runtime, and this app detects the international site from the provider URL, uses `https://{STUDIO_HOST}/auth/callback` as the registered callback, and switches to `api-inference.modelscope.ai`.
+
+If you prefer a manually created OAuth app instead, create it while signed in at [modelscope.ai](https://modelscope.ai) (Access Tokens → Connected Applications → My Created Applications), register the Studio host `https://{owner}-{name}.ms.fun/` as the redirect URL (international sites use `.ms.fun`; China sites use `.ms.show`), and inject `MODELSCOPE_OAUTH_CLIENT_ID` / `MODELSCOPE_OAUTH_CLIENT_SECRET` into that Studio. Use `MODELSCOPE_OAUTH_SITE=ai` only if you need to force the international endpoints.
+
 ## 📸 Feature Gallery
 
 <div align="center"><img src="image/README/1786613710042.png" alt="1786613710042"></div>

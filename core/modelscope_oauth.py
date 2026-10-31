@@ -1,18 +1,32 @@
 # -*- coding: utf-8 -*-
 """ModelScope（魔搭）OAuth 2.0 / OIDC 登录支持。
 
+支持中国站（modelscope.cn）与国际站（modelscope.ai）两套 OAuth / 推理域名：
+两个站点是独立的账号与 OAuth 应用体系，client_id / client_secret 不能混用。
+
 授权码模式流程：
-  1. 前端跳转 https://www.modelscope.cn/oauth/authorize?client_id=..&redirect_uri=..
-     &response_type=code&scope=openid profile&state=..
+  1. 前端跳转 {site}/oauth/authorize?client_id=..&redirect_uri=..
+     &response_type=code&scope=openid profile api-inference&state=..
   2. 授权后魔搭回调 redirect_uri?code=..&state=..
-  3. 后端 POST /oauth/token 用 code 换 access_token
-  4. GET /oauth/userinfo（OIDC）或 /openapi/v1/users/me 取用户信息
+  3. 后端 POST {site}/oauth/token 用 code 换 access_token
+  4. GET {site}/oauth/userinfo（OIDC）或 {site}/openapi/v1/users/me 取用户信息
   5. 建/更本地账号；access_token 直接用于魔搭推理服务（OpenAI 兼容），
      自动写入该用户的 LLM API 配置
 
-配置（优先环境变量，便于创空间部署）：
-  MODELSCOPE_OAUTH_CLIENT_ID / MODELSCOPE_OAUTH_CLIENT_SECRET
-  或 config/settings.json 的 modelscope_oauth 段
+凭据来源（优先级从高到低）：
+  1. 手动注入：MODELSCOPE_OAUTH_CLIENT_ID / MODELSCOPE_OAUTH_CLIENT_SECRET
+     （或 config/settings.json 的 modelscope_oauth 段）
+  2. 创空间内置 OAuth：在 Studio「Settings → Adjust deployment settings」中开启
+     OAuth settings 后，平台自动创建应用并注入
+     OAUTH_CLIENT_ID / OAUTH_CLIENT_SECRET / OPENID_PROVIDER_URL /
+     STUDIO_HOST / OAUTH_SCOPES，无需手动填任何凭据
+
+站点选择（优先级从高到低）：
+  MODELSCOPE_OAUTH_SITE 环境变量（cn / ai）
+  → 内置 OAuth 的 OPENID_PROVIDER_URL 域名（www.modelscope.ai → ai）
+  → 前端按当前页面域名传入的 site（modelscope.ai → ai）
+  → config/settings.json 的 modelscope_oauth.site
+  → 默认 cn
 """
 
 import json
@@ -28,78 +42,162 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-AUTHORIZE_URL = "https://www.modelscope.cn/oauth/authorize"
-TOKEN_URL = "https://www.modelscope.cn/oauth/token"
-USERINFO_URL = "https://www.modelscope.cn/oauth/userinfo"
-OPENAPI_ME_URL = "https://modelscope.cn/openapi/v1/users/me"
-MODELS_URL = "https://api-inference.modelscope.cn/v1/models"
+_SITE_PROFILES = {
+    "cn": {
+        "authorize_url": "https://www.modelscope.cn/oauth/authorize",
+        "token_url": "https://www.modelscope.cn/oauth/token",
+        "userinfo_url": "https://www.modelscope.cn/oauth/userinfo",
+        "openapi_me_url": "https://modelscope.cn/openapi/v1/users/me",
+        "models_url": "https://api-inference.modelscope.cn/v1/models",
+        "api_base_url": "https://api-inference.modelscope.cn/v1",
+    },
+    "ai": {
+        "authorize_url": "https://www.modelscope.ai/oauth/authorize",
+        "token_url": "https://www.modelscope.ai/oauth/token",
+        "userinfo_url": "https://www.modelscope.ai/oauth/userinfo",
+        "openapi_me_url": "https://www.modelscope.ai/openapi/v1/users/me",
+        "models_url": "https://api-inference.modelscope.ai/v1/models",
+        "api_base_url": "https://api-inference.modelscope.ai/v1",
+    },
+}
 
 ROOT = Path(__file__).resolve().parent.parent
 _SETTINGS_PATH = ROOT / "config" / "settings.json"
 
-# 状态防伪：state → (redirect_uri, 生成时间)，5 分钟有效，一次性消费
+# 状态防伪：state → {redirect_uri, site, ts}，5 分钟有效，一次性消费
 _STATE_TTL = 300
 _states = {}
 _states_lock = threading.Lock()
 
 
+def normalize_site(site: str) -> str:
+    """把各种写法（含 URL）归一到 cn / ai；无法识别时返回 cn。"""
+    v = str(site or "").strip().lower()
+    if v in ("ai", "intl", "international") or "modelscope.ai" in v:
+        return "ai"
+    return "cn"
+
+
+def _settings_segment() -> dict:
+    try:
+        data = json.loads(_SETTINGS_PATH.read_text(encoding="utf-8")) or {}
+        return data.get("modelscope_oauth") or {}
+    except Exception:  # noqa: BLE001 — 配置缺失按空处理
+        return {}
+
+
 def oauth_config() -> dict:
-    """魔搭 OAuth 应用凭据（env 优先，其次 config/settings.json）。"""
+    """魔搭 OAuth 应用凭据。
+
+    手动凭据（env / 配置文件）优先；否则使用创空间内置 OAuth 注入的
+    OAUTH_CLIENT_ID / OAUTH_CLIENT_SECRET（platform=True）。
+    """
     cid = os.environ.get("MODELSCOPE_OAUTH_CLIENT_ID", "").strip()
     sec = os.environ.get("MODELSCOPE_OAUTH_CLIENT_SECRET", "").strip()
+    platform = False
     if not (cid and sec):
-        try:
-            data = json.loads(_SETTINGS_PATH.read_text(encoding="utf-8")) or {}
-            seg = data.get("modelscope_oauth") or {}
-            cid = cid or str(seg.get("client_id") or "").strip()
-            sec = sec or str(seg.get("client_secret") or "").strip()
-        except Exception:  # noqa: BLE001 — 配置缺失按未配置处理
-            pass
+        pcid = os.environ.get("OAUTH_CLIENT_ID", "").strip()
+        psec = os.environ.get("OAUTH_CLIENT_SECRET", "").strip()
+        if pcid and psec:
+            cid, sec, platform = pcid, psec, True
+    if not (cid and sec):
+        seg = _settings_segment()
+        cid = cid or str(seg.get("client_id") or "").strip()
+        sec = sec or str(seg.get("client_secret") or "").strip()
     return {"client_id": cid, "client_secret": sec,
-            "configured": bool(cid and sec)}
+            "configured": bool(cid and sec),
+            "platform": platform,
+            "provider_url": os.environ.get("OPENID_PROVIDER_URL", "").strip(),
+            "studio_host": os.environ.get("STUDIO_HOST", "").strip()}
 
 
-def issue_state(redirect_uri: str) -> str:
-    """签发一次性 state 并登记其回调地址（防伪造回调）。"""
+def resolve_site(site: str = "") -> str:
+    env = os.environ.get("MODELSCOPE_OAUTH_SITE", "").strip()
+    if env:
+        return normalize_site(env)
+    cfg = oauth_config()
+    if cfg["platform"] and cfg["provider_url"]:
+        # 内置 OAuth：以平台注入的 OIDC provider 域名作为权威站点
+        return normalize_site(cfg["provider_url"])
+    if str(site or "").strip():
+        return normalize_site(site)
+    return normalize_site(_settings_segment().get("site") or "cn")
+
+
+def site_profile(site: str = "") -> dict:
+    profile = dict(_SITE_PROFILES[resolve_site(site)])
+    cfg = oauth_config()
+    if cfg["platform"] and cfg["provider_url"]:
+        # 用平台注入的 provider 地址覆盖端点（兼容未来域名调整）
+        base = cfg["provider_url"].rstrip("/")
+        profile.update({
+            "authorize_url": base + "/oauth/authorize",
+            "token_url": base + "/oauth/token",
+            "userinfo_url": base + "/oauth/userinfo",
+            "openapi_me_url": base + "/openapi/v1/users/me",
+        })
+    return profile
+
+
+def effective_redirect_uri(frontend_uri: str, cfg: dict = None) -> str:
+    """确定回调地址。
+
+    内置 OAuth 时平台会预登记创空间 host 的 /auth/callback，
+    必须使用它；手动凭据时沿用前端计算/用户登记的回调地址。
+    """
+    cfg = cfg or oauth_config()
+    host = str(cfg.get("studio_host") or "").strip()
+    if cfg.get("platform") and host:
+        return f"https://{host}/auth/callback"
+    return frontend_uri
+
+
+def issue_state(redirect_uri: str, site: str = "") -> str:
+    """签发一次性 state 并登记其回调地址与站点（防伪造回调/跨站混用）。"""
     state = secrets.token_urlsafe(24)
     now = time.time()
     with _states_lock:
-        for k in [k for k, v in _states.items() if now - v[1] > _STATE_TTL]:
+        for k in [k for k, v in _states.items() if now - v["ts"] > _STATE_TTL]:
             _states.pop(k, None)
-        _states[state] = (redirect_uri, now)
+        _states[state] = {"redirect_uri": redirect_uri,
+                          "site": resolve_site(site), "ts": now}
     return state
 
 
 def consume_state(state: str):
-    """一次性消费 state；返回登记的 redirect_uri（无效/过期/重放 → None）。"""
+    """一次性消费 state；返回 {redirect_uri, site}（无效/过期/重放 → None）。"""
     now = time.time()
     with _states_lock:
         item = _states.pop(state or "", None)
     if not item:
         return None
-    uri, ts = item
-    if now - ts > _STATE_TTL:
+    if now - item["ts"] > _STATE_TTL:
         return None
-    return uri
+    return {"redirect_uri": item["redirect_uri"], "site": item["site"]}
 
 
-def build_authorize_url(redirect_uri: str, state: str) -> str:
+def build_authorize_url(redirect_uri: str, state: str, site: str = "") -> str:
     cfg = oauth_config()
+    # api-inference：授权令牌用于调用魔搭推理服务（LLM 调用必需）。
+    # 创空间内置 OAuth 时以平台注入的 OAUTH_SCOPES 为准（须在 Studio
+    # OAuth settings 中勾选 api-inference，否则推理调用会 401）。
+    scope = "openid profile api-inference"
+    if cfg["platform"]:
+        scope = os.environ.get("OAUTH_SCOPES", "").strip() or scope
     params = {
         "client_id": cfg["client_id"],
         "redirect_uri": redirect_uri,
         "response_type": "code",
-        # api-inference：授权令牌用于调用魔搭推理服务（LLM 调用必需）
-        "scope": "openid profile api-inference",
+        "scope": scope,
         "state": state,
     }
-    return AUTHORIZE_URL + "?" + urlencode(params)
+    return site_profile(site)["authorize_url"] + "?" + urlencode(params)
 
 
-def exchange_code(code: str, redirect_uri: str) -> str:
+def exchange_code(code: str, redirect_uri: str, site: str = "") -> str:
     """授权码换 access_token。"""
     cfg = oauth_config()
-    resp = requests.post(TOKEN_URL, data={
+    resp = requests.post(site_profile(site)["token_url"], data={
         "grant_type": "authorization_code",
         "client_id": cfg["client_id"],
         "client_secret": cfg["client_secret"],
@@ -114,11 +212,12 @@ def exchange_code(code: str, redirect_uri: str) -> str:
     return token
 
 
-def fetch_userinfo(access_token: str) -> dict:
+def fetch_userinfo(access_token: str, site: str = "") -> dict:
     """取魔搭用户信息：优先 OpenAPI（字段更全），降级 OIDC userinfo。"""
+    profile = site_profile(site)
     headers = {"Authorization": f"Bearer {access_token}"}
     try:
-        resp = requests.get(OPENAPI_ME_URL, headers=headers, timeout=30)
+        resp = requests.get(profile["openapi_me_url"], headers=headers, timeout=30)
         if resp.status_code == 200:
             data = (resp.json() or {}).get("data") or {}
             if data.get("username"):
@@ -127,7 +226,7 @@ def fetch_userinfo(access_token: str) -> dict:
                         "avatar": str(data.get("avatar_url") or "")}
     except Exception as e:  # noqa: BLE001
         logger.warning("[ms-oauth] OpenAPI 用户信息失败，改用 OIDC: %s", e)
-    resp = requests.get(USERINFO_URL, headers=headers, timeout=30)
+    resp = requests.get(profile["userinfo_url"], headers=headers, timeout=30)
     resp.raise_for_status()
     info = resp.json() or {}
     name = str(info.get("preferred_username") or info.get("name") or info.get("sub") or "")
@@ -144,32 +243,51 @@ _MODEL_FALLBACKS = ("deepseek-ai/DeepSeek-V3.2", "deepseek-ai/DeepSeek-R1-0528",
                     "deepseek-ai/DeepSeek-V3")
 
 
-def pick_inference_model(access_token: str) -> str:
-    try:
-        resp = requests.get(MODELS_URL,
-                            headers={"Authorization": f"Bearer {access_token}"},
-                            timeout=20)
-        if resp.status_code == 200:
-            items = (resp.json() or {}).get("data") or []
-            ids = [str(i.get("id") or "") for i in items if isinstance(i, dict)]
-            ds = [i for i in ids if i.lower().startswith("deepseek")]
-            for hint in _PREFERRED_HINTS:
-                for i in ds:
-                    if hint in i.lower():
-                        return i
-            if ds:
-                return ds[0]
-    except Exception as e:  # noqa: BLE001
-        logger.warning("[ms-oauth] 模型列表获取失败，使用兜底候选: %s", e)
-    return _MODEL_FALLBACKS[0]
+def _inference_candidates(site: str = "") -> list:
+    """推理服务候选地址：本站优先，另一站兜底。
+
+    国际站文档里 api-inference 的示例仍写作 modelscope.cn，实际两个域名
+    都可能可用，因此登录时用 token 探测一次，择可用者写入用户配置。
+    """
+    primary = site_profile(site)["api_base_url"]
+    other = ("https://api-inference.modelscope.cn/v1"
+             if primary.startswith("https://api-inference.modelscope.ai")
+             else "https://api-inference.modelscope.ai/v1")
+    return [primary, other]
 
 
-def build_api_config(access_token: str) -> dict:
+def pick_inference(access_token: str, site: str = "") -> tuple:
+    """返回 (model_id, api_base_url)。"""
+    candidates = _inference_candidates(site)
+    for base in candidates:
+        try:
+            resp = requests.get(base + "/models",
+                                headers={"Authorization": f"Bearer {access_token}"},
+                                timeout=20)
+            if resp.status_code == 200:
+                items = (resp.json() or {}).get("data") or []
+                ids = [str(i.get("id") or "") for i in items if isinstance(i, dict)]
+                ds = [i for i in ids if i.lower().startswith("deepseek")]
+                model = ""
+                for hint in _PREFERRED_HINTS:
+                    for i in ds:
+                        if hint in i.lower():
+                            model = i
+                            break
+                    if model:
+                        break
+                return (model or (ds[0] if ds else _MODEL_FALLBACKS[0]), base)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[ms-oauth] 推理地址 %s 不可用: %s", base, e)
+    return _MODEL_FALLBACKS[0], candidates[0]
+
+
+def build_api_config(access_token: str, site: str = "") -> dict:
     """组装要写入用户设置的 api 段（魔搭推理服务，OpenAI 兼容）。"""
-    model_id = pick_inference_model(access_token)
+    model_id, api_base = pick_inference(access_token, site)
     return {
         "api_format": "openai",
-        "api_base_url": "https://api-inference.modelscope.cn/v1",
+        "api_base_url": api_base,
         "model_id": model_id,
         "api_key": access_token,
         "model_type": "modelscope",

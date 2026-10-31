@@ -43,19 +43,37 @@ async function submit() {
 // ── 魔搭（ModelScope）OAuth 登录（新增入口，原有登录/注册不变） ──
 const msBusy = ref(false)
 
+/** 当前所在的魔搭站点：国际站（modelscope.ai）用 ai，其余用 cn。
+ *  中国站与国际站是两套 OAuth 应用/推理域名，client_id 与回调地址都要对应。
+ */
+function msSite() {
+  const env = String(import.meta.env.VITE_MODELSCOPE_SITE || '').trim().toLowerCase()
+  if (env === 'ai' || env === 'cn') return env
+  const host = window.location.hostname
+  if (host === 'modelscope.ai' || host.endsWith('.modelscope.ai')) return 'ai'
+  return 'cn'
+}
+
 /** 计算 OAuth 回调地址：
  *  - 优先构建期覆盖（创空间部署可设 VITE_PUBLIC_ORIGIN）
- *  - 魔搭 Studio 是 iframe 嵌入，location.origin 为 modelscope.cn 不可用于回调，
- *    从 /studios/{owner}/{name} 自动推导 host 地址 https://{owner}-{name}.ms.show/
+ *  - 魔搭 Studio 是 iframe 嵌入，location.origin 为 modelscope.cn / modelscope.ai
+ *    不可用于回调，从 /studios/{owner}/{name} 自动推导 host 地址：
+ *      中国站 → https://{owner}-{name}.ms.show/
+ *      国际站 → https://{owner}-{name}.ms.fun/
  *  - 其余场景用当前 origin
  */
 function computeRedirectUri() {
   const env = String(import.meta.env.VITE_PUBLIC_ORIGIN || '').trim()
   if (env) return env.replace(/\/+$/, '') + '/'
   const host = window.location.hostname
-  if (host === 'modelscope.cn' || host.endsWith('.modelscope.cn')) {
+  const isCn = host === 'modelscope.cn' || host.endsWith('.modelscope.cn')
+  const isAi = host === 'modelscope.ai' || host.endsWith('.modelscope.ai')
+  if (isCn || isAi) {
     const m = window.location.pathname.match(/^\/studios\/([^/]+)\/([^/]+)/)
-    if (m) return `https://${(m[1] + '-' + m[2]).toLowerCase()}.ms.show/`
+    if (m) {
+      const tld = isAi ? 'ms.fun' : 'ms.show'
+      return `https://${(m[1] + '-' + m[2]).toLowerCase()}.${tld}/`
+    }
   }
   return window.location.origin + '/'
 }
@@ -71,7 +89,7 @@ async function loginWithModelScope() {
     // 回调地址用前端真实可达地址（本地为 http://localhost:7860/，
     // 需与魔搭「互联应用」登记的回调地址一致）
     const redirect = computeRedirectUri()
-    const r = await api.modelscopeAuthUrl(redirect)
+    const r = await api.modelscopeAuthUrl(redirect, msSite())
     if (!r || !r.ok) {
       toast.error(r?.message || t('login.msUnavailable'))
       return

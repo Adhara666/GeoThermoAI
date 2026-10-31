@@ -3515,13 +3515,15 @@ class AppBackend:
         return {"ok": True, "message": f"项目已重命名为「{new_name}」",
                 "projects": [p["name"] for p in projects]}
 
-    def apply_modelscope_api(self, uid: str, access_token: str) -> dict:
+    def apply_modelscope_api(self, uid: str, access_token: str,
+                             site: str = "") -> dict:
         """魔搭 OAuth 登录后：将魔搭推理服务写为该用户的 LLM API 配置。
 
         只合并 api 段，不动用户设置的其他部分；本地注册/登录流程不受影响。
+        中国站/国际站的推理域名不同，site 决定 api_base_url。
         """
         from core import modelscope_oauth as ms
-        api = ms.build_api_config(access_token)
+        api = ms.build_api_config(access_token, site)
         path = self.deployment.users_root / str(uid) / "settings.json"
         data = {}
         try:
@@ -5792,7 +5794,7 @@ async def no_cache_spa_html(request, call_next):
     """SPA 入口 HTML 禁止缓存，避免旧 index.html 引用已删除的哈希资源导致白屏"""
     response = await call_next(request)
     path = request.url.path
-    if path.endswith(".html") or path in ("/", ""):
+    if path.endswith(".html") or path in ("/", "", "/auth/callback"):
         response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
         response.headers["Pragma"] = "no-cache"
     return response
@@ -5844,19 +5846,26 @@ def login(request: Request, payload: dict):
 # ── API：魔搭 OAuth 登录（新增接入，不影响本地注册/登录） ─────────
 
 @app.get("/api/auth/modelscope/url")
-def modelscope_auth_url(redirect_uri: str = ""):
+def modelscope_auth_url(redirect_uri: str = "", site: str = ""):
     from core import modelscope_oauth as ms
     cfg = ms.oauth_config()
     if not cfg["configured"]:
         return {"ok": False, "configured": False,
-                "message": "未配置魔搭 OAuth：请在 config/settings.json 的 "
-                           "modelscope_oauth 中填写 client_id / client_secret"}
+                "message": "未配置魔搭 OAuth：请在创空间「Settings → Adjust "
+                           "deployment settings」中开启 OAuth settings，或配置 "
+                           "环境变量 / config/settings.json 的 "
+                           "modelscope_oauth（client_id / client_secret）"}
     redirect_uri = (redirect_uri or "").strip()
     if not redirect_uri.startswith(("http://", "https://")):
         return {"ok": False, "configured": True, "message": "缺少合法的回调地址"}
-    state = ms.issue_state(redirect_uri)
-    return {"ok": True, "configured": True,
-            "url": ms.build_authorize_url(redirect_uri, state), "state": state}
+    resolved_site = ms.resolve_site(site)
+    # 创空间内置 OAuth 时使用平台预登记的 host/auth/callback
+    effective_redirect = ms.effective_redirect_uri(redirect_uri, cfg)
+    state = ms.issue_state(effective_redirect, resolved_site)
+    return {"ok": True, "configured": True, "site": resolved_site,
+            "redirect_uri": effective_redirect,
+            "url": ms.build_authorize_url(effective_redirect, state, resolved_site),
+            "state": state}
 
 
 @app.post("/api/auth/modelscope/callback")
@@ -5870,14 +5879,15 @@ def modelscope_callback(payload: dict):
     registered = ms.consume_state(state)
     if not registered:
         return {"ok": False, "message": "登录请求已失效，请重新点击「用魔搭账号登录」"}
+    site = registered.get("site") or ""
     try:
-        access_token = ms.exchange_code(code, registered)
-        info = ms.fetch_userinfo(access_token)
+        access_token = ms.exchange_code(code, registered["redirect_uri"], site)
+        info = ms.fetch_userinfo(access_token, site)
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "message": f"魔搭登录失败：{e}"}
     user = auth.ensure_oauth_user(info["username"], info["nickname"])
     try:
-        backend.apply_modelscope_api(str(user["uid"]), access_token)
+        backend.apply_modelscope_api(str(user["uid"]), access_token, site)
     except Exception as e:  # noqa: BLE001
         print(f"[ms-oauth] API 配置写入失败：{e}")
     token = auth.create_token(user["uid"], user["username"])
@@ -6646,6 +6656,12 @@ def debug_mem():
 
 _DIST = _ROOT / "dist"
 if _DIST.exists():
+    # 创空间内置 OAuth 的平台预登记回调路径：返回 SPA 入口，
+    # 由前端读取 ?code=&state= 后调用后端完成登录。
+    @app.get("/auth/callback", include_in_schema=False)
+    def _ms_oauth_callback_page():
+        return FileResponse(str(_DIST / "index.html"))
+
     # 静态资源一律不缓存（no-cache）：前端每次构建产物 hash 变化，
     # 但 index.html 不带 hash，浏览器按启发式缓存会一直加载旧页面导致
     # 部署后看不到更新，必须强制每次重新校验。

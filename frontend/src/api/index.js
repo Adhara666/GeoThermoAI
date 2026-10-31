@@ -78,8 +78,9 @@ export const api = {
   register: (username, password, nickname) => req('POST', '/api/auth/register', { username, password, nickname }),
   me: () => req('GET', '/api/auth/me'),
   // 魔搭（ModelScope）OAuth 登录（新增入口，不影响账号登录/注册）
-  modelscopeAuthUrl: (redirectUri) => req('GET',
-    `/api/auth/modelscope/url?redirect_uri=${encodeURIComponent(redirectUri || '')}`),
+  modelscopeAuthUrl: (redirectUri, site) => req('GET',
+    `/api/auth/modelscope/url?redirect_uri=${encodeURIComponent(redirectUri || '')}`
+    + `&site=${encodeURIComponent(site || '')}`),
   modelscopeCallback: (payload) => req('POST', '/api/auth/modelscope/callback', payload),
 
   async uploadStudyArea(files) {
