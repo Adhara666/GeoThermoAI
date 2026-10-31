@@ -6656,7 +6656,7 @@ def debug_mem():
 
 _DIST = _ROOT / "dist"
 if _DIST.exists():
-    # 创空间内置 OAuth 的平台预登记回调路径：返回 SPA 入口，
+    # 兼容手动 OAuth 应用可选的 /auth/callback 回调：返回 SPA 入口，
     # 由前端读取 ?code=&state= 后调用后端完成登录。
     @app.get("/auth/callback", include_in_schema=False)
     def _ms_oauth_callback_page():

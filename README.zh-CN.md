@@ -83,7 +83,7 @@ docker run -d --name geothermoai -p 7860:7860 \
 
 **部署到魔搭国际站（modelscope.ai）？** 中国站（modelscope.cn）与国际站是**两套独立的账号与 OAuth 应用体系**，中国站创建的 Client ID/Secret 在国际站不可用。
 
-推荐直接用**创空间内置 OAuth**（无需复制任何凭据）：打开创空间 **Settings → Adjust deployment settings**，启用 **OAuth settings**，勾选 `openid`、`profile`、`api-inference` 三个授权范围，保存后重新部署。平台会在运行时注入 `OAUTH_CLIENT_ID`、`OAUTH_CLIENT_SECRET`、`OAUTH_SCOPES`、`OPENID_PROVIDER_URL`、`STUDIO_HOST`；应用会依据 provider 域名识别国际站，自动使用 `https://{STUDIO_HOST}/auth/callback` 作为已登记回调地址，并切换到 `api-inference.modelscope.ai`。
+推荐直接用**创空间内置 OAuth**（无需复制任何凭据）：打开创空间 **Settings → Adjust deployment settings**，启用 **OAuth settings**，勾选 `openid`、`profile`、`api-inference` 三个授权范围，保存后重新部署。平台会在运行时注入 `OAUTH_CLIENT_ID`、`OAUTH_CLIENT_SECRET`、`OAUTH_SCOPES`、`OPENID_PROVIDER_URL`、`STUDIO_HOST`；应用会依据 provider 域名识别国际站，自动使用创空间 host 根地址 `https://{STUDIO_HOST}/`（与平台登记的 `OAuthCallbackUrls` 一致）作为回调地址，并切换到 `api-inference.modelscope.ai`。
 
 若坚持手动创建 OAuth 应用：请在 [modelscope.ai](https://modelscope.ai) 登录后进入「访问令牌 → 互联应用 → 我创建的应用」创建应用，把创空间 host `https://{owner}-{name}.ms.fun/` 登记为回调地址（国际站是 `.ms.fun`，中国站是 `.ms.show`），并在该创空间注入 `MODELSCOPE_OAUTH_CLIENT_ID` / `MODELSCOPE_OAUTH_CLIENT_SECRET`。仅在需要强制指定国际站接口时使用 `MODELSCOPE_OAUTH_SITE=ai`。
 

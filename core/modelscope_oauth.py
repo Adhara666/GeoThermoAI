@@ -142,13 +142,14 @@ def site_profile(site: str = "") -> dict:
 def effective_redirect_uri(frontend_uri: str, cfg: dict = None) -> str:
     """确定回调地址。
 
-    内置 OAuth 时平台会预登记创空间 host 的 /auth/callback，
-    必须使用它；手动凭据时沿用前端计算/用户登记的回调地址。
+    内置 OAuth 时平台预登记的是创空间 host 根地址
+    （OAuthCallbackUrls 即 https://{STUDIO_HOST}/），必须与登记值完全一致；
+    手动凭据时沿用前端计算/用户登记的回调地址。
     """
     cfg = cfg or oauth_config()
     host = str(cfg.get("studio_host") or "").strip()
     if cfg.get("platform") and host:
-        return f"https://{host}/auth/callback"
+        return f"https://{host}/"
     return frontend_uri
 
 
