@@ -284,10 +284,23 @@ def fetch_userinfo(access_token: str, site: str = "", id_token: str = "") -> dic
     raise ValueError("魔搭未返回可用的用户名（请确认 OAuth 已勾选 openid 与 profile）")
 
 
-# 推理模型选择：优先查询魔搭可用列表并挑 DeepSeek 系；失败用固定候选链
+# 推理模型选择：优先 DeepSeek Flash（用户默认），再按版本降级。
+# 注意国际站列表里没有 V4-Flash-0731，且 Pro 排在最前，不能只按顺序取。
 _PREFERRED_HINTS = ("deepseek-v4", "deepseek-v3", "deepseek-r1")
 _MODEL_FALLBACKS = ("deepseek-ai/DeepSeek-V3.2", "deepseek-ai/DeepSeek-R1-0528",
                     "deepseek-ai/DeepSeek-V3")
+
+
+def _choose_model(ids: list) -> str:
+    ds = [i for i in ids if i and i.lower().startswith("deepseek")]
+    flash = [i for i in ds if "flash" in i.lower()]
+    if flash:
+        return flash[0]
+    for hint in _PREFERRED_HINTS:
+        for i in ds:
+            if hint in i.lower():
+                return i
+    return ds[0] if ds else ""
 
 
 def _inference_candidates(site: str = "") -> list:
@@ -314,16 +327,7 @@ def pick_inference(access_token: str, site: str = "") -> tuple:
             if resp.status_code == 200:
                 items = (resp.json() or {}).get("data") or []
                 ids = [str(i.get("id") or "") for i in items if isinstance(i, dict)]
-                ds = [i for i in ids if i.lower().startswith("deepseek")]
-                model = ""
-                for hint in _PREFERRED_HINTS:
-                    for i in ds:
-                        if hint in i.lower():
-                            model = i
-                            break
-                    if model:
-                        break
-                return (model or (ds[0] if ds else _MODEL_FALLBACKS[0]), base)
+                return (_choose_model(ids) or _MODEL_FALLBACKS[0], base)
         except Exception as e:  # noqa: BLE001
             logger.warning("[ms-oauth] 推理地址 %s 不可用: %s", base, e)
     return _MODEL_FALLBACKS[0], candidates[0]
