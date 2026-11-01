@@ -1,7 +1,7 @@
 **[English](README.md)** | **[简体中文](README.zh-CN.md)**
 
 <div align="center">
-  <img src="image/README/1786697477692.png" alt="GeoThermoAI" width="760">
+  <img src="image/README/geothermoai-poster-zh.png" alt="GeoThermoAI——智能高分辨率地表温度重建" width="900">
   <h1>GeoThermoAI</h1>
   <p><b>一句话生成 10 米高分辨率地表温度产品</b> —— 多角色智能体驱动的地表温度空间降尺度系统</p>
   <p>
@@ -89,20 +89,14 @@ docker run -d --name geothermoai -p 7860:7860 \
 
 ## 📸 功能速览
 
-<div align="center"><img src="image/README/1786613710042.png" alt="1786613710042"></div>
-<div align="center"><b>Chat / Work 双模式：只读问答与完整执行边界清晰</b></div>
+<div align="center"><img src="image/README/ui-map-zh.png" alt="GeoThermoAI 中文界面展示武汉任务结果和交互式地表温度地图"></div>
+<div align="center"><b>武汉任务完成后，30 m 输入、10 m 结果与地图图层控制保持同步</b></div>
 
-<div align="center"><img src="image/README/1786613837347.png" alt="1786613837347"></div>
-<div align="center"><b>由我批准 / 完全执行：关键节点是否等待人工确认</b></div>
+<div align="center"><img src="image/README/ui-accuracy-zh.png" alt="GeoThermoAI 中文精度面板展示武汉案例指标"></div>
+<div align="center"><b>最终精度：空间留出测试指标、样本数、偏差以及 30 m / 10 m 温度范围</b></div>
 
-<div align="center"><img src="image/README/1786634168921.png" alt="1786634168921"></div>
-<div align="center"><b>当需求缺少关键信息（如处理方式）时，系统主动提问</b></div>
-
-<div align="center"><img src="image/README/1786599051833.png" alt="1786599051833" width="560"></div>
-<div align="center"><b>地图像元级温度查询：10m 结果与 30m 参考均可逐像元读取</b></div>
-
-<div align="center"><img src="image/README/1786635056513.png" alt="1786635056513" width="560"></div>
-<div align="center"><b>精度面板：测试区精度、样本数与温度值域一目了然</b></div>
+<div align="center"><img src="image/README/ui-download-zh.png" alt="GeoThermoAI 中文下载面板列出 GeoTIFF 和评估产物"></div>
+<div align="center"><b>按任务归档最终 GeoTIFF 与评估产物，可直接下载用于后续 GIS 分析</b></div>
 
 ## 🧠 工作原理
 
@@ -130,9 +124,6 @@ docker run -d --name geothermoai -p 7860:7860 \
 | [docs/部署配置说明_第七阶段.md](docs/部署配置说明_第七阶段.md) | 部署变量表与迁移说明 |
 
 ## 🛰️ 效果示例
-
-<div align="center"><img src="image/README/1786634710546.png" alt="1786634710546"></div>
-<div align="center"><b>武汉市 2024-07-22：10m 地表温度产品（左）与 30m Landsat 参考（右）对比</b></div>
 
 与 30m 参考相比，10m 产品清晰呈现了街道、路网与建筑地块间的温度细节。本案例数据与产品已上传 [ModelScope 数据集](https://modelscope.cn/datasets/Adhara/Wuhan_10m_LST_20240722) 供查阅。
 

@@ -1,7 +1,7 @@
 **[English](README.md)** | **[简体中文](README.zh-CN.md)**
 
 <div align="center">
-  <img src="image/README/1786697477692.png" alt="GeoThermoAI" width="760">
+  <img src="image/README/geothermoai-poster-en.png" alt="GeoThermoAI — intelligent 10 m land surface temperature reconstruction" width="900">
   <h1>GeoThermoAI</h1>
   <p><b>One sentence in, a 10 m land surface temperature product out</b> — a multi-agent system for land surface temperature (LST) spatial downscaling</p>
   <p>
@@ -89,20 +89,14 @@ If you prefer a manually created OAuth app instead, create it while signed in at
 
 ## 📸 Feature Gallery
 
-<div align="center"><img src="image/README/1786613710042.png" alt="1786613710042"></div>
-<div align="center"><b>Chat / Work dual mode: clean boundary between Q&A and execution</b></div>
+<div align="center"><img src="image/README/ui-map-en.png" alt="GeoThermoAI English interface showing the completed Wuhan task and interactive LST map"></div>
+<div align="center"><b>A completed Wuhan run with synchronized 30 m inputs, 10 m outputs, and map-layer controls</b></div>
 
-<div align="center"><img src="image/README/1786613837347.png" alt="1786613837347"></div>
-<div align="center"><b>Approve myself / Full auto: whether key steps wait for your confirmation</b></div>
+<div align="center"><img src="image/README/ui-accuracy-en.png" alt="GeoThermoAI English accuracy panel with the Wuhan case metrics"></div>
+<div align="center"><b>Final accuracy: spatially held-out metrics, sample count, bias, and 30 m / 10 m temperature ranges</b></div>
 
-<div align="center"><img src="image/README/1786634168921.png" alt="1786634168921"></div>
-<div align="center"><b>When key information is missing (e.g. processing mode), the system asks proactively</b></div>
-
-<div align="center"><img src="image/README/1786599051833.png" alt="1786599051833" width="560"></div>
-<div align="center"><b>Pixel-level temperature query: both 10 m results and 30 m reference are readable pixel by pixel</b></div>
-
-<div align="center"><img src="image/README/1786635056513.png" alt="1786635056513" width="560"></div>
-<div align="center"><b>Accuracy panel: test-area metrics, sample counts, and temperature ranges at a glance</b></div>
+<div align="center"><img src="image/README/ui-download-en.png" alt="GeoThermoAI English download panel listing GeoTIFF and evaluation artifacts"></div>
+<div align="center"><b>Task-scoped downloads keep final GeoTIFFs and evaluation artifacts together</b></div>
 
 ## 🧠 How It Works
 
@@ -130,9 +124,6 @@ Technical details: [Algorithm Principles](docs/Algorithm.md); for setup and usag
 | [docs/Deployment.md](docs/Deployment.md) | Deployment variable table and migration notes |
 
 ## 🛰️ Example Result
-
-<div align="center"><img src="image/README/1786634710546.png" alt="1786634710546"></div>
-<div align="center"><b>Wuhan, 2024-07-22: 10 m LST product (left) vs. 30 m Landsat reference (right)</b></div>
 
 Compared with the 30 m reference, the 10 m product clearly resolves temperature detail along streets, road networks, and building blocks. The dataset and product for this case are available on [ModelScope](https://modelscope.cn/datasets/Adhara/Wuhan_10m_LST_20240722).
 
